@@ -52,7 +52,12 @@ operations through JSON-string functions and a `WasmMessageIndex` class. The
 facade checks JSON byte lengths before parsing, returns stable content-free
 error codes, and uses the same shared protocol vectors as the native core
 tests. `npm run test:wasm` builds the wasm-bindgen artifact and exercises it in
-Chromium. The web application's messaging flow does not yet call this binding.
+Chromium. The browser app builds and loads this binding before enabling
+messaging. Hub packets and direct-peer packets pass through the Rust structural
+validators at their inbound boundaries, and outbound messages and join packets
+are checked before sending. If the module cannot initialize, connection, send,
+and peer actions remain disabled. The binding does not supply authentication,
+encryption, persistence, or synchronization behavior.
 
 The core has no persistent index, resumable peer cursor, synchronization
 packet type, or wire compatibility contract. The caller is responsible for

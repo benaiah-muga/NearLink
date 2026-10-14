@@ -7,8 +7,12 @@
     "packages/protocol"
   ],
   "scripts": {
+    "predev": "npm run build:wasm",
     "dev": "npm run dev --workspace @nearlink/web",
+    "prebuild": "npm run build:wasm",
     "build": "npm run build --workspace @nearlink/web",
+    "build:wasm": "node scripts/build-protocol-wasm.mjs",
+    "pretest:unit": "npm run build:wasm",
     "test:unit": "node scripts/run-unit-tests.mjs",
     "test:e2e": "npm run build && playwright test",
     "test:wasm": "node scripts/test-protocol-wasm.mjs",

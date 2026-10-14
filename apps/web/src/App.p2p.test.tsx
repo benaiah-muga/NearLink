@@ -8,6 +8,32 @@ const storageGate = vi.hoisted(() => ({ packetId: null as string | null, body: n
 const offerGate = vi.hoisted(() => ({ blockNext: false, release: null as null | (() => void) }));
 const constructorGate = vi.hoisted(() => ({ throwNext: false }));
 const socketMock = vi.hoisted(() => ({ constructions: 0 }));
+const wasmValidationCalls = vi.hoisted(() => ({ values: [] as Array<{ validator: string; value: unknown }> }));
+
+vi.mock("./lib/wasmProtocol", async () => {
+  const protocol = await import("@nearlink/protocol");
+  return {
+    MAX_PROTOCOL_ENVELOPE_BYTES: 18 * 1024,
+    initializeWasmProtocol: async () => true,
+    validateJsonWithWasm: (validator: string, json: string) => {
+      if (json.length > 18 * 1024) return false;
+      try {
+        const value: unknown = JSON.parse(json);
+        if (validator === "client") return protocol.isClientPacket(value);
+        if (validator === "message") return protocol.isMessagePacket(value);
+        return protocol.isServerPacket(value);
+      } catch { return false; }
+    },
+    validateWithWasm: (validator: string, value: unknown) => {
+      wasmValidationCalls.values.push({ validator, value });
+      if (validator === "client") return protocol.isClientPacket(value);
+      if (validator === "message") return protocol.isMessagePacket(value);
+      if (validator === "server") return protocol.isServerPacket(value);
+      if (validator === "room") return protocol.isProtocolRoom(value);
+      return protocol.isProtocolIdentifier(value);
+    },
+  };
+});
 
 vi.mock("./lib/storage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/storage")>();
@@ -97,6 +123,7 @@ async function resetDatabase(): Promise<void> {
 }
 
 beforeEach(async () => {
+  wasmValidationCalls.values = [];
   peerMock.instances.length = 0;
   socketMock.constructions = 0;
   storageGate.packetId = null;
@@ -203,6 +230,7 @@ describe("direct peer app flow", () => {
     });
     await screen.findByText(inbound.body);
     await waitFor(async () => expect((await loadMessages(ROOM)).some((item) => item.packet.id === inbound.id && item.transport === "direct" && item.direction === "incoming")).toBe(true));
+    expect(wasmValidationCalls.values.some(({ validator, value }) => validator === "message" && (value as { id?: string }).id === inbound.id)).toBe(true);
     expect(screen.getByText(inbound.body).closest(".message-row")?.classList.contains("message-incoming")).toBe(true);
     await waitFor(() => expect(transport.sent.map((entry: string) => JSON.parse(entry)).filter((packet: { type: string; id: string }) => packet.type === "ack" && packet.id === inbound.id)).toHaveLength(2));
     const countBeforeDuplicate = transport.sent.length;

@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
-import { isMessagePacket, isProtocolRoom, isServerPacket, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
+import { PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
 import { loadIdentity, loadMessages, requestStoragePersistence, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
+import { initializeWasmProtocol, MAX_PROTOCOL_ENVELOPE_BYTES, validateJsonWithWasm, validateWithWasm } from "./lib/wasmProtocol";
 
 type LinkState = "offline" | "connecting" | "linking" | "online" | "retrying" | "error";
 const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8000/ws`;
 const HUB_KEY = "nearlink.hub";
 const ROOM_KEY = "nearlink.room";
 const HUB_REPLAY_FAILURE_NOTICE = "A hub message could not be saved or checked on this device. It was not accepted and can be retried after reconnecting.";
+const WASM_PROTOCOL_FAILURE_NOTICE = "Protocol checks could not start. NearLink will not connect, send messages, or accept peer packets. Reload the page. If this continues, update the browser and report this error.";
 
 function readLocalSetting(key: string): string | null {
   try { return localStorage.getItem(key); }
@@ -36,7 +38,7 @@ function normalizeFingerprint(value: string): string | null {
 }
 
 function isValidCallSign(value: string): boolean {
-  return isMessagePacket({
+  return validateWithWasm("message", {
     version: PROTOCOL_VERSION,
     type: "message",
     id: "profile-check",
@@ -96,6 +98,8 @@ function App() {
   const [notice, setNotice] = useState("");
   const [storageReady, setStorageReady] = useState(false);
   const [storagePersistence, setStoragePersistence] = useState<StoragePersistenceResult | "checking">("checking");
+  const [wasmReady, setWasmReady] = useState(false);
+  const [wasmFailed, setWasmFailed] = useState(false);
   const [conversationReady, setConversationReady] = useState(false);
   const [loadedRoom, setLoadedRoom] = useState<string | null>(null);
   const [isInstallable, setIsInstallable] = useState(false);
@@ -144,6 +148,25 @@ function App() {
     setFingerprintConfirmed(false);
     setLocalSignal("");
   }
+
+  useEffect(() => {
+    let active = true;
+    void initializeWasmProtocol().then((ready) => {
+      if (!active) return;
+      setWasmReady(ready);
+      setWasmFailed(!ready);
+      if (!ready) {
+        shouldReconnectRef.current = false;
+        setLinkRequested(false);
+        setLinkState("error");
+        setNotice(WASM_PROTOCOL_FAILURE_NOTICE);
+        socketRef.current?.close();
+        socketRef.current = null;
+        closeDirectTransport();
+      }
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -220,7 +243,7 @@ function App() {
   }, [messages.length]);
 
   useEffect(() => {
-    if (!linkRequested || !storageReady || !conversationReady || !identity || !room.trim()) return;
+    if (!linkRequested || !wasmReady || !storageReady || !conversationReady || !identity || !room.trim()) return;
     shouldReconnectRef.current = true;
     let cancelled = false;
     let retryTimer: number | undefined;
@@ -245,14 +268,24 @@ function App() {
         attemptRef.current = 0;
         setLinkState("linking");
         const joinPacket: ClientPacket = { version: PROTOCOL_VERSION, type: "join", room: room.trim(), sender: identity.sender, senderName: identity.senderName };
+        if (!validateWithWasm("client", joinPacket)) {
+          shouldReconnectRef.current = false;
+          setLinkRequested(false);
+          setLinkState("error");
+          setNotice("The room request did not pass protocol checks and was not sent. Check your saved call sign and room code.");
+          socket.close();
+          return;
+        }
         try { socket.send(JSON.stringify(joinPacket)); }
         catch { setNotice("Could not reach the hub. The radio will retry."); socket.close(); }
       };
       socket.onmessage = async (event) => {
         if (socketRef.current !== socket) return;
+        const rawPacket = String(event.data);
+        if (!validateJsonWithWasm("server", rawPacket)) { setNotice("The hub sent an invalid or oversized packet. It was ignored."); return; }
         let packet: unknown;
-        try { packet = JSON.parse(String(event.data)); } catch { setNotice("The hub sent unreadable data. It was ignored."); return; }
-        if (!isServerPacket(packet)) { setNotice("The hub sent an invalid packet. It was ignored."); return; }
+        try { packet = JSON.parse(rawPacket); } catch { setNotice("The hub sent unreadable data. It was ignored."); return; }
+        if (!validateWithWasm("server", packet)) { setNotice("The hub sent an invalid packet. It was ignored."); return; }
         if (packet.type === "joined") {
           if (packet.room !== room.trim()) { setNotice("The hub confirmed a different room. Check the room code."); return; }
           setPeers(packet.peers);
@@ -263,6 +296,7 @@ function App() {
           for (const item of messagesRef.current) {
             const messageKey = `${item.packet.room}\u0000${item.packet.id}`;
             if (item.direction === "outgoing" && item.delivery === "queued" && (item.transport ?? "hub") === "hub" && !conflictedHubMessageKeysRef.current.has(messageKey)) {
+              if (!validateWithWasm("message", item.packet)) { setNotice("A saved message did not pass protocol checks and was not sent."); continue; }
               try { socket.send(JSON.stringify(item.packet)); }
               catch { setNotice("Your queued messages are saved. The radio will retry."); socket.close(); break; }
             }
@@ -380,19 +414,19 @@ function App() {
       socketRef.current = null;
       attemptRef.current = 0;
     };
-  }, [linkRequested, storageReady, conversationReady, identity, room, hubUrl]);
+  }, [linkRequested, wasmReady, storageReady, conversationReady, identity, room, hubUrl]);
 
   const sortedMessages = useMemo(() => loadedRoom === room.trim() ? [...messages].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)) : [], [loadedRoom, messages, room]);
   const normalizedName = displayName.trim();
   const composerReady = storageReady && conversationReady && loadedRoom === room.trim();
-  const profileReady = Boolean(profileSaved && identity?.senderName.trim() && identity.senderName.trim() === normalizedName && isValidCallSign(identity.senderName) && isProtocolRoom(room.trim()));
+  const profileReady = Boolean(wasmReady && profileSaved && identity?.senderName.trim() && identity.senderName.trim() === normalizedName && validateWithWasm("identifier", identity.sender) && isValidCallSign(identity.senderName) && validateWithWasm("room", room.trim()));
   const canJoin = Boolean(profileReady && room.trim() && hubUrl.trim());
-  const canSaveProfile = Boolean(identity && isValidCallSign(normalizedName) && isProtocolRoom(room.trim()) && (sendTransport === "direct" || hubUrl.trim()));
+  const canSaveProfile = Boolean(wasmReady && identity && validateWithWasm("identifier", identity.sender) && isValidCallSign(normalizedName) && validateWithWasm("room", room.trim()) && (sendTransport === "direct" || hubUrl.trim()));
   const linkLabel = linkState === "online" ? "On frequency" : linkState === "linking" ? "Calling station" : linkState === "connecting" || linkState === "retrying" ? "Finding signal" : linkState === "error" ? "Check settings" : "Standby";
 
   async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!identity || !isValidCallSign(normalizedName) || !isProtocolRoom(room.trim())) return;
+    if (!wasmReady || !identity || !validateWithWasm("identifier", identity.sender) || !isValidCallSign(normalizedName) || !validateWithWasm("room", room.trim())) return;
     const nextIdentity = { ...identity, senderName: normalizedName };
     setIdentity(nextIdentity);
     let identitySaved = true;
@@ -438,9 +472,13 @@ function App() {
 
   async function processDirectData(transport: DirectWebRtcTransport, connectionRoom: string, data: unknown) {
     if (directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || typeof data !== "string") return;
+    if (data.length > MAX_PROTOCOL_ENVELOPE_BYTES || (!validateJsonWithWasm("server", data) && !validateJsonWithWasm("message", data))) {
+      setNotice("The direct peer sent an invalid or oversized packet. It was ignored.");
+      return;
+    }
     let packet: unknown;
     try { packet = JSON.parse(data); } catch { setNotice("The direct peer sent unreadable data. It was ignored."); return; }
-    if (isServerPacket(packet) && packet.type === "ack") {
+    if (validateWithWasm("server", packet) && packet.type === "ack") {
       const key = `${connectionRoom}\u0000${packet.id}`;
       if (!directInFlightRef.current.has(key)) return;
       const persisted = await loadMessages(connectionRoom).catch(() => null);
@@ -457,7 +495,7 @@ function App() {
       }
       return;
     }
-    if (!isMessagePacket(packet) || packet.room !== connectionRoom) return;
+    if (!validateWithWasm("message", packet) || packet.room !== connectionRoom) return;
     const messageKey = `${packet.room}\u0000${packet.id}`;
     const previous = directInboundOperationsRef.current.get(messageKey) ?? Promise.resolve();
     const operation = previous.catch(() => undefined).then(async () => {
@@ -476,6 +514,7 @@ function App() {
         messageKeysRef.current.add(messageKey);
         if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
           const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
+          if (!validateWithWasm("server", ack)) return;
           try { transport.send(JSON.stringify(ack)); } catch { setNotice("The saved duplicate could not be acknowledged. It remains saved on this device."); }
         }
         return;
@@ -492,6 +531,7 @@ function App() {
       setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id) ? current : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
       if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
         const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
+        if (!validateWithWasm("server", ack)) return;
         try { transport.send(JSON.stringify(ack)); }
         catch { setNotice("The message was saved, but the peer acknowledgment could not be sent."); }
       }
@@ -502,6 +542,7 @@ function App() {
   }
 
   async function createDirectOffer() {
+    if (!wasmReady) return;
     setDirectBusy(true);
     setLocalSignal("");
     const connectionRoom = room.trim();
@@ -521,6 +562,7 @@ function App() {
   }
 
   async function acceptDirectOffer() {
+    if (!wasmReady) return;
     setDirectBusy(true);
     setLocalSignal("");
     const connectionRoom = room.trim();
@@ -542,6 +584,7 @@ function App() {
   }
 
   async function acceptDirectAnswer() {
+    if (!wasmReady) return;
     const transport = directRef.current;
     if (!transport) { setNotice("Create a direct offer before accepting an answer."); return; }
     const connectionRoom = room.trim();
@@ -577,6 +620,10 @@ function App() {
   }
 
   function sendDirectMessage(item: StoredMessage): boolean {
+    if (!wasmReady || !validateWithWasm("message", item.packet)) {
+      setNotice("The saved message did not pass protocol checks and was not sent.");
+      return false;
+    }
     const transport = directRef.current;
     const key = `${item.packet.room}\u0000${item.packet.id}`;
     if (!transport || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || currentRoomRef.current !== item.packet.room || directInFlightRef.current.has(key)) return false;
@@ -603,6 +650,10 @@ function App() {
   }
 
   async function retryMessage(message: StoredMessage) {
+    if (!wasmReady || !validateWithWasm("message", message.packet)) {
+      setNotice("The saved message did not pass protocol checks and could not be retried.");
+      return;
+    }
     const messageKey = `${message.packet.room}\u0000${message.packet.id}`;
     if (retryingMessageKeysRef.current.has(messageKey)) return;
     retryingMessageKeysRef.current.add(messageKey);
@@ -627,6 +678,10 @@ function App() {
       if (message.transport === "direct") {
         sendDirectMessage(message);
       } else if ((message.transport ?? "hub") === "hub" && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
+        if (!validateWithWasm("message", message.packet)) {
+          setNotice("The saved message did not pass protocol checks and was not sent.");
+          return;
+        }
         try { socketRef.current.send(JSON.stringify(message.packet)); }
         catch {
           setNotice("The message is queued on this device. The radio will reconnect and retry it.");
@@ -639,7 +694,7 @@ function App() {
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const body = draft.trim();
-    if (!storageReady || !conversationReady || loadedRoom !== room.trim() || pendingSendRef.current || !profileReady || !identity || !body || !room.trim()) return;
+    if (!wasmReady || !storageReady || !conversationReady || loadedRoom !== room.trim() || pendingSendRef.current || !profileReady || !identity || !body || !room.trim()) return;
     pendingSendRef.current = true;
     const submittedDraft = draft;
     const messageRoom = room.trim();
@@ -653,7 +708,7 @@ function App() {
       createdAt: new Date().toISOString(),
       body,
     };
-    if (!isMessagePacket(packet)) {
+    if (!validateWithWasm("message", packet)) {
       setNotice("Check your saved call sign, room code, and message text. This message was not queued.");
       pendingSendRef.current = false;
       return;
@@ -685,6 +740,7 @@ function App() {
   }
 
   function toggleLink() {
+    if (!wasmReady) return;
     if (linkRequested) {
       setLinkRequested(false);
       setLinkState("offline");
@@ -742,9 +798,9 @@ function App() {
           <div className="section-label"><span>02</span><h2 id="direct-title">Direct peer link</h2></div>
           <p className="direct-description">Create an offer on one device, exchange the complete JSON, then accept it on the other device. Compare the fingerprint in person or through an authenticated channel different from the SDP exchange. Otherwise, an intermediary could replace both the signaling data and fingerprint. This host-only connection may require both devices to share a reachable local network. No public STUN or TURN server is configured.</p>
           <div className="direct-actions">
-            <button type="button" onClick={() => void createDirectOffer()} disabled={!composerReady || !profileReady || directBusy}>Create offer</button>
-            <button type="button" onClick={() => void acceptDirectOffer()} disabled={!composerReady || !profileReady || directBusy || !signalInput.trim()}>Accept offer</button>
-            <button type="button" onClick={() => void acceptDirectAnswer()} disabled={!composerReady || !profileReady || directBusy || !signalInput.trim() || !directRef.current}>Accept answer</button>
+            <button type="button" onClick={() => void createDirectOffer()} disabled={!wasmReady || !composerReady || !profileReady || directBusy}>Create offer</button>
+            <button type="button" onClick={() => void acceptDirectOffer()} disabled={!wasmReady || !composerReady || !profileReady || directBusy || !signalInput.trim()}>Accept offer</button>
+            <button type="button" onClick={() => void acceptDirectAnswer()} disabled={!wasmReady || !composerReady || !profileReady || directBusy || !signalInput.trim() || !directRef.current}>Accept answer</button>
           </div>
           <label htmlFor="direct-signal-input">Paste peer offer or answer JSON</label>
           <textarea id="direct-signal-input" value={signalInput} onChange={(event) => setSignalInput(event.target.value)} rows={3} spellCheck={false} />
@@ -795,6 +851,7 @@ function App() {
           </div>
         </header>
 
+        {wasmFailed && <div className="notice-banner" role="alert"><span aria-hidden="true">!</span>{WASM_PROTOCOL_FAILURE_NOTICE}</div>}
         <div className="notice-banner" role="status" aria-live="polite"><span aria-hidden="true">!</span>{storagePersistence === "checking"
           ? "Checking this browser's storage retention setting."
           : storagePersistence === "granted"

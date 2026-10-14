@@ -15,6 +15,32 @@ const messageReadGate = vi.hoisted(() => ({
   deliveryUpdateStarted: false,
   deliveryUpdateReject: false,
 }));
+const wasmGate = vi.hoisted(() => ({ fail: false }));
+
+vi.mock("./lib/wasmProtocol", async () => {
+  const protocol = await import("@nearlink/protocol");
+  return {
+    MAX_PROTOCOL_ENVELOPE_BYTES: 18 * 1024,
+    initializeWasmProtocol: async () => !wasmGate.fail,
+    validateJsonWithWasm: (validator: string, json: string) => {
+      if (wasmGate.fail || json.length > 18 * 1024) return false;
+      try {
+        const value: unknown = JSON.parse(json);
+        if (validator === "client") return protocol.isClientPacket(value);
+        if (validator === "message") return protocol.isMessagePacket(value);
+        return protocol.isServerPacket(value);
+      } catch { return false; }
+    },
+    validateWithWasm: (validator: string, value: unknown) => {
+      if (wasmGate.fail) return false;
+      if (validator === "client") return protocol.isClientPacket(value);
+      if (validator === "message") return protocol.isMessagePacket(value);
+      if (validator === "server") return protocol.isServerPacket(value);
+      if (validator === "room") return protocol.isProtocolRoom(value);
+      return protocol.isProtocolIdentifier(value);
+    },
+  };
+});
 
 vi.mock("./lib/storage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/storage")>();
@@ -131,6 +157,7 @@ async function resetDatabase(): Promise<void> {
 }
 
 beforeEach(async () => {
+  wasmGate.fail = false;
   MockWebSocket.instances = [];
   messageReadGate.room = null;
   messageReadGate.pending = null;
@@ -224,6 +251,19 @@ describe("browser storage retention feedback", () => {
 });
 
 describe("browser app messaging flow", () => {
+  it("fails closed with an accessible action when Rust protocol checks cannot load", async () => {
+    wasmGate.fail = true;
+    render(<App />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/will not connect, send messages, or accept peer packets/i);
+    expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Create offer" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Save and join room" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(0));
+    expect(await loadMessages(ROOM)).toHaveLength(0);
+  });
+
   it("persists offline messages, replays the same id, records acknowledgments, and deduplicates inbound messages", async () => {
     render(<App />);
 
