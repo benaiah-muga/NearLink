@@ -17,7 +17,7 @@ install the documented dependencies:
 ```sh
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.lock
 uvicorn main:app --host 127.0.0.1 --port 8000 --ws-max-size 32768
 ```
 

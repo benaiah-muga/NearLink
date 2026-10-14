@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a user need or improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: What are you trying to do, and what currently gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful behavior that would solve the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Offline, privacy, and accessibility considerations
+      description: Note relevant constraints or leave blank if none are known.

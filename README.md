@@ -12,7 +12,7 @@ The first local messaging slice provides a browser client and an optional local 
 
 ## Development
 
-Requirements: Node.js 20.19 or newer, npm, Python 3.11 or newer, and a browser with IndexedDB and WebSocket support.
+Requirements: Node.js 20 or newer, npm, Python 3.11 or newer, and a browser with IndexedDB and WebSocket support.
 
 ```sh
 npm ci
@@ -20,6 +20,17 @@ npm run dev
 ```
 
 Create a production web bundle with `npm run build`.
+
+Run the complete local verification after installing the Python test dependencies:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r services/local-hub/requirements-dev.lock
+npm run verify:foundation
+```
+
+The foundation checks build the web client, run the local hub tests, and check tracked and non-ignored project files for em dash characters. See [local verification](docs/engineering/verification.md) for setup details.
 
 Run the local hub in a second terminal:
 

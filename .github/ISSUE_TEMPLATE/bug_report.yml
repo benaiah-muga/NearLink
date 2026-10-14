@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible problem in NearLink.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include message contents, private keys, personal data, or security vulnerabilities in a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Include the release version or commit hash.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Browser, operating system, device, and network type.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest set of steps that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true

@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "dev": "npm run dev --workspace @nearlink/web",
-    "build": "npm run build --workspace @nearlink/web"
+    "build": "npm run build --workspace @nearlink/web",
+    "verify:foundation": "node scripts/verify-foundation.mjs"
   }
 }
