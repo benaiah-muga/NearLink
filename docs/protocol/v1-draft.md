@@ -19,9 +19,15 @@ The hub responds with `joined` and `presence` packets. A message uses this shape
 
 The client creates a stable message identifier before sending. Retries must reuse that identifier. Clients deduplicate by `(room, id)`. Timestamps are presentation hints and do not establish authoritative ordering.
 
+Identifiers use 1 to 128 ASCII letters, digits, periods, underscores, colons, or hyphens. Room codes use 1 to 64 ASCII letters, digits, underscores, or hyphens. Display names are limited to 64 characters. Message bodies are limited to 16 KiB of UTF-8 data by the local hub. Implementations validate timezone-aware ISO timestamps.
+
 ## Acknowledgment
 
 The hub returns an `ack` packet containing the message identifier after it has accepted the message for relay. This means hub acceptance only. It does not prove that a recipient stored or read the message.
+
+An `error` packet may include the rejected message identifier when the hub can safely identify it. Clients should mark that message as failed and offer a retry where appropriate. A retry keeps the same message identifier.
+
+The initial hub limits a room to 32 active clients, the process to 64 rooms or 256 active connections, and each connection to 120 messages per minute. These limits are implementation settings, not negotiated protocol capabilities.
 
 ## Validation
 

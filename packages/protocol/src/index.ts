@@ -1,4 +1,9 @@
 export const PROTOCOL_VERSION = 1 as const;
+export const IDENTIFIER_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+export function isProtocolIdentifier(value: unknown): value is string {
+  return typeof value === "string" && IDENTIFIER_PATTERN.test(value);
+}
 
 export interface JoinPacket {
   version: typeof PROTOCOL_VERSION;
@@ -41,8 +46,14 @@ export interface PresencePacket {
 export interface ErrorPacket {
   version: typeof PROTOCOL_VERSION;
   type: "error";
-  code: "invalid_packet" | "room_required" | "message_too_large";
+  code:
+    | "invalid_packet"
+    | "room_required"
+    | "message_too_large"
+    | "capacity_reached"
+    | "rate_limited";
   message: string;
+  id?: string;
 }
 
 export type ClientPacket = JoinPacket | MessagePacket;

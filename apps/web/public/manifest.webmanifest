@@ -1,0 +1,10 @@
+{
+  "name": "NearLink Local Station",
+  "short_name": "NearLink",
+  "description": "A local messaging station",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f2f0e8",
+  "theme_color": "#12201b",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
