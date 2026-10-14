@@ -7,6 +7,44 @@ against `mls-rs` commit `d4c5b19f4bbf8a931face27fc9e30f2db33ce83e` and OpenMLS
 commit `be2368a21ec5e0380abd568821addc57b79013ea`. No MLS dependency or version
 has been selected.
 
+## Upstream and toolchain revalidation
+
+Rechecked on 2026-10-14 against the official upstream repositories and their
+GitHub API metadata. The default branch heads remain `mls-rs`
+`d4c5b19f4bbf8a931face27fc9e30f2db33ce83e` and OpenMLS
+`be2368a21ec5e0380abd568821addc57b79013ea`. The highest `mls-rs` Git tag
+reported by the repository API is `0.56.0`, at
+[`8f1b43f447a792ff9307f1c2c7f54da63914870e`](https://github.com/awslabs/mls-rs/tree/8f1b43f447a792ff9307f1c2c7f54da63914870e).
+The latest OpenMLS GitHub release is `openmls-v0.9.0`, dated 2026-08-25; the
+current main workspace also declares package version `0.9.0`.
+
+The current `mls-rs` README still lists WebCrypto as experimental for cipher
+suites 2, 5, and 7, with X.509 unsupported. It also says the library has not
+received a full third-party security audit. The current OpenMLS README still
+classifies `wasm32-unknown-unknown` as unsupported, even though CI builds it.
+The current OpenMLS workspace declares Rust 1.94.0 as its minimum version.
+This project environment has Rust 1.84.1 and only the
+`x86_64-unknown-linux-gnu` target installed. These local facts rule out a
+meaningful local OpenMLS build check and do not establish browser or mobile
+compatibility for either candidate.
+
+Decision: permit only a narrow, isolated, non-production compatibility spike
+using pinned `mls-rs` `0.56.0` as a candidate. The spike may check compilation
+and basic browser-to-native interoperability for one cipher suite, but must
+not add MLS to product flows, promise security, or be treated as a selection.
+Its WebCrypto experimental status and the library's unaudited status remain
+selection blockers. If the exact supported targets, provider, and same-suite
+interoperability gate cannot be demonstrated, defer integration and return to
+candidate evaluation. OpenMLS is not a viable immediate candidate for this
+project's current environment, given its documented support and the available
+toolchain.
+
+Evidence links: [mls-rs repository and provider/security status](https://github.com/awslabs/mls-rs/tree/d4c5b19f4bbf8a931face27fc9e30f2db33ce83e),
+[mls-rs 0.56.0 tag](https://github.com/awslabs/mls-rs/tree/0.56.0),
+[OpenMLS current README](https://github.com/openmls/openmls/blob/be2368a21ec5e0380abd568821addc57b79013ea/README.md),
+[OpenMLS current workspace manifest](https://github.com/openmls/openmls/blob/be2368a21ec5e0380abd568821addc57b79013ea/Cargo.toml),
+and [OpenMLS 0.9.0 release](https://github.com/openmls/openmls/releases/tag/openmls-v0.9.0).
+
 ## Protocol direction
 
 NearLink is evaluating the IETF Messaging Layer Security (MLS) protocol from

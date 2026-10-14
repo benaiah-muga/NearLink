@@ -1,15 +1,15 @@
 # Architecture overview
 
-NearLink uses a browser client and an optional local coordination hub. The browser owns user identity, conversation history, and the interface. The hub provides WebSocket room coordination and relays protocol envelopes. The hub is not required by the long-term architecture, but the first local messaging slice uses it.
+NearLink currently uses a browser client and an optional local coordination hub. The browser stores a locally generated sender ID, display name, and conversation history. It can exchange messages through the hub over WebSockets or through a manually signaled WebRTC DataChannel. The hub provides room coordination and bounded SQLite room-history replay. The hub is not required by the long-term architecture, but the local group messaging path uses it.
 
 ## Initial boundaries
 
-- React components use a typed application service and do not access browser storage directly.
+- React components currently call browser storage helpers from the application layer. A service boundary remains a desired refactor, not a completed boundary.
 - The protocol envelope is transport-independent.
-- The WebSocket adapter owns connection lifecycle, not conversation state.
-- The local hub does not own client identity secrets.
+- WebSocket and WebRTC adapters own connection lifecycle, not conversation state.
+- The local hub does not own client identity secrets. It does receive and store plaintext hub messages.
 - Browser persistence is replaceable behind a storage interface.
 
 ## Current limitations
 
-The initial slice uses a room code as a convenience for joining a shared local conversation. It is not an authentication credential. Messages pass through the hub as readable JSON. WebRTC, Rust/WASM, cryptographic identity, and multi-device synchronization are future work and must not be implied by the current UI.
+Room codes are convenience values for joining a shared local conversation, not authentication credentials. Hub messages pass through the service as readable JSON and are retained in bounded local history. Hub acknowledgment means hub acceptance, not recipient delivery. WebRTC uses a manually exchanged offer and answer and requires a fingerprint comparison over a separate trusted channel before the app allows sends. The fingerprint identifies only the current DTLS connection, not a lasting device or human identity. The application has no MLS or other reviewed application-level E2EE protocol, cryptographic identity, Rust/WASM core, multi-device identity, or native application. These must not be implied by the UI.
