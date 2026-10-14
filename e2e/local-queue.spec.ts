@@ -1,4 +1,18 @@
 import { expect, test } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
+
+const accessibilityTags = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
+
+async function expectAccessible(page: import("@playwright/test").Page, state: string) {
+  const result = await new AxeBuilder({ page }).withTags(accessibilityTags).analyze();
+  const violations = result.violations.map((violation) => ({
+    id: violation.id,
+    impact: violation.impact,
+    help: violation.help,
+    elements: violation.nodes.map((node) => ({ target: node.target, summary: node.failureSummary })),
+  }));
+  expect(violations, `Accessibility violations on ${state}: ${JSON.stringify(violations, null, 2)}`).toEqual([]);
+}
 
 test("saves a station profile and keeps a message queued through reload without a hub", async ({ page }) => {
   const hubAttempts: string[] = [];
@@ -10,6 +24,7 @@ test("saves a station profile and keeps a message queued through reload without 
 
   await page.goto("/");
   await expect(page.getByText("Messages save locally until a hub is connected")).toBeVisible();
+  await expectAccessible(page, "the loaded station screen");
   await page.getByLabel("Your call sign").fill("Test Station");
   await page.getByLabel("Room frequency").fill("chromium-queue-check");
   await page.getByLabel("Hub address").fill("ws://127.0.0.1:1/ws");
@@ -26,6 +41,7 @@ test("saves a station profile and keeps a message queued through reload without 
   const messageLog = page.getByRole("log", { name: "Messages in chromium-queue-check" });
   await expect(messageLog.getByText(message)).toBeVisible();
   await expect(messageLog.getByText("Queued on this device")).toBeVisible();
+  await expectAccessible(page, "the queued message screen");
 
   await page.reload();
 

@@ -19,7 +19,8 @@ python -m pip install -r services/local-hub/requirements-dev.lock
 The foundation command builds the web client, runs the web unit and FastAPI hub
 test suites, and scans tracked and non-ignored untracked project files for the
 em dash character. The end-to-end command builds the production client, starts
-Vite preview, and runs the Chromium local-message journey. Install the
+Vite preview, and runs the Chromium local-message journey. It scans the initial
+and queued-message screens for WCAG 2.1 A/AA and WCAG 2.2 AA issues with axe. Install the
 Playwright Chromium build with:
 
 ```sh
