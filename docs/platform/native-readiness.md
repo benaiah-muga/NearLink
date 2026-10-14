@@ -9,11 +9,15 @@
 The repository contains a React and TypeScript browser application in
 `apps/web`, a protocol package in `packages/protocol`, and Rust crates in
 `crates/protocol-core` and `crates/protocol-wasm`. The core validates protocol
-v1 JSON structures and has a bounded, in-memory message reconciliation
-primitive. The WASM facade exposes validation and reconciliation APIs to
-JavaScript. Generated browser bindings are built by the checked-in script, and
-the browser app uses the validator at packet boundaries. The app does not yet
-use the reconciliation API for persistent synchronization. Neither crate
+v1 JSON structures, bounded in-memory message reconciliation, and synchronization
+inventory/request state. The WASM facade exposes these APIs to JavaScript.
+Generated browser bindings are built by the checked-in script. The browser uses
+Rust/WASM for packet validation, bounded inventory sequence acceptance, and
+bounded request/completion validation and tracking. TypeScript retains
+pending-request bookkeeping and owns IndexedDB access, accepted message
+snapshots, missing-ID selection and batching, transport sends,
+persist-before-completion verification, rate budgets, and UI state. The Rust
+`MessageIndex` is in-memory and is not persistent browser storage. Neither crate
 implements identity or encryption. There is no Tauri configuration, Tauri
 dependency, native UI, platform adapter, or Android project in the repository.
 
@@ -100,6 +104,10 @@ limitations must be tested on the actual target.
 
 - Identify the message and synchronization behavior that belongs in the
   portable core, then implement it with documented input and output contracts.
+  The browser's current Rust/WASM synchronization state covers bounded
+  inventory sequencing and bounded request/completion validation; TypeScript
+  also retains pending-request bookkeeping. This does not move persistence or
+  transport I/O into Rust.
 - Keep native storage, UI, permissions, background lifecycle, and transport I/O
   behind explicit adapters.
 - Run the same protocol vectors and state-transition cases through the browser
@@ -140,8 +148,9 @@ reliability from a native build, an emulator run, or a shared portable core.
 ## Current decision
 
 Native readiness is **not established**. The repository has a Rust protocol
-validator, bounded in-memory reconciliation primitive, tested WebAssembly
-binding, and an existing browser prototype, but no native application or
+validator, bounded in-memory reconciliation and synchronization-state APIs, a
+tested WebAssembly binding used by the browser, and an existing browser
+prototype, but no native application or
 platform adapters. Android SDK pieces are present on this host, but the NDK,
 Android Rust targets, environment configuration, and connected device are
 missing. Linux Tauri webview dependencies were not found by the checks above.

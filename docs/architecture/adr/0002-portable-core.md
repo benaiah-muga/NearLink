@@ -5,7 +5,7 @@
 
 ## Context
 
-NearLink targets browser and native clients and requires consistent protocol behavior across platforms. Reimplementing protocol state independently in each UI risks incompatible behavior. The web application and its protocol rules are currently implemented in TypeScript. A small Rust crate now validates protocol v1 JSON structure against shared vectors, but it has no browser binding and does not yet implement message state transitions, synchronization, storage, or cryptography.
+NearLink targets browser and future native clients and requires consistent protocol behavior across platforms. Reimplementing protocol state independently in each UI risks incompatible behavior. The Rust core validates protocol v1 JSON structure and provides bounded in-memory message reconciliation. Its WebAssembly facade is used by the browser for packet validation and inventory sequence acceptance. Rust/WASM also validates and tracks bounded request/completion relationships. TypeScript retains pending-request maps and coordinates IndexedDB access, accepted-message snapshots, transport I/O, persistence checks, rate budgets, and UI state. The Rust message index is in-memory and is not the browser's persistent source of truth.
 
 ## Options considered
 
@@ -15,9 +15,9 @@ NearLink targets browser and native clients and requires consistent protocol beh
 
 ## Decision
 
-Use a small Rust core for platform-neutral protocol processing, message state transitions, synchronization, and cryptographic integration. Keep storage, UI, permissions, and transport I/O behind explicit adapters. Expose the core to the web client through a narrow WebAssembly interface only after dependency target support and bundle size are verified.
+Use a small Rust core for platform-neutral protocol processing and bounded synchronization state, with future message and cryptographic behavior added only after concrete requirements and review. Keep storage, UI, permissions, rate budgets, and transport I/O behind explicit adapters. Expose the core to the web client through a narrow WebAssembly interface after dependency target support and bundle size are verified.
 
-The Rust validator and bounded in-memory reconciliation primitive are early portability slices, not a portable messaging core. The TypeScript implementation remains the product path until the Rust core has concrete behavior parity and interoperability tests.
+The Rust validator, bounded in-memory reconciliation primitive, and browser synchronization state wrappers are incremental portability slices, not a complete portable messaging core. The browser uses Rust/WASM for bounded inventory sequencing and request/completion validation. TypeScript retains app-side pending-request bookkeeping and remains responsible for persistent message snapshots, message storage, transport interaction, persistence verification, rate budgets, and presentation. No native application currently integrates the core.
 
 ## Rationale
 
@@ -32,6 +32,6 @@ Rust provides strong data modeling and can target native platforms and WebAssemb
 ## Consequences
 
 - Future core behavior changes require Rust unit tests and browser/native interoperability tests.
-- The Rust crate validates messages and can produce bounded in-memory missing-message pages. It is tested on the native Linux target and CI cross-compiles it for WebAssembly. It still has no JavaScript binding or browser runtime test. Native application integration remains unverified.
+- The Rust crate validates messages, maintains bounded in-memory synchronization state, and can produce bounded in-memory missing-message pages. Its JavaScript facade is exercised in browser tests. The `MessageIndex` is not persistent browser storage. Native application integration remains unverified, and no native app exists in the repository.
 - No unsafe Rust is expected in the portable core without a documented exception.
 - Platform-specific features remain outside the core.
