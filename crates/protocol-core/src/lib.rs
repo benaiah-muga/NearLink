@@ -2,8 +2,12 @@
 //!
 //! This crate performs structural validation only. It does not provide
 //! authentication, encryption, canonical serialization, or transport logic.
+//! The [`sync`] module adds bounded, in-memory reconciliation over validated
+//! message packets. It does not add persistence or trust guarantees.
 
 use serde_json::Value;
+
+pub mod sync;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024;

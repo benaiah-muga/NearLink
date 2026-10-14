@@ -7,12 +7,12 @@
 ## Current project state
 
 The repository contains a React and TypeScript browser application in
-`apps/web`, a protocol package in `packages/protocol`, and a small Rust crate
-in `crates/protocol-core`. The Rust crate validates protocol v1 JSON
-structures. It does not implement message storage, synchronization, transport,
-identity, or encryption. There is no Tauri configuration, Tauri dependency,
-native UI, platform adapter, WebAssembly binding, or Android project in the
-repository.
+`apps/web`, a protocol package in `packages/protocol`, and a Rust crate in
+`crates/protocol-core`. The Rust crate validates protocol v1 JSON structures
+and has a bounded, in-memory message reconciliation primitive. It does not
+implement persistent synchronization, transport, identity, or encryption.
+There is no Tauri configuration, Tauri dependency, native UI, platform
+adapter, WebAssembly binding, or Android project in the repository.
 
 The browser UI currently uses browser facilities directly. For example,
 `apps/web/src/App.tsx` reads and writes `localStorage`, and the storage and

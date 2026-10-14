@@ -17,7 +17,7 @@ NearLink targets browser and native clients and requires consistent protocol beh
 
 Use a small Rust core for platform-neutral protocol processing, message state transitions, synchronization, and cryptographic integration. Keep storage, UI, permissions, and transport I/O behind explicit adapters. Expose the core to the web client through a narrow WebAssembly interface only after dependency target support and bundle size are verified.
 
-The Rust validator is a first portability slice, not a portable messaging core. The TypeScript implementation remains the product path until the Rust core has concrete behavior parity and interoperability tests.
+The Rust validator and bounded in-memory reconciliation primitive are early portability slices, not a portable messaging core. The TypeScript implementation remains the product path until the Rust core has concrete behavior parity and interoperability tests.
 
 ## Rationale
 
@@ -32,6 +32,6 @@ Rust provides strong data modeling and can target native platforms and WebAssemb
 ## Consequences
 
 - Future core behavior changes require Rust unit tests and browser/native interoperability tests.
-- The Rust crate is tested on the native Linux target and CI cross-compiles it for WebAssembly. It still has no JavaScript binding or browser runtime test. Native application integration remains unverified.
+- The Rust crate validates messages and can produce bounded in-memory missing-message pages. It is tested on the native Linux target and CI cross-compiles it for WebAssembly. It still has no JavaScript binding or browser runtime test. Native application integration remains unverified.
 - No unsafe Rust is expected in the portable core without a documented exception.
 - Platform-specific features remain outside the core.

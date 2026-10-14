@@ -9,7 +9,7 @@ The current prototype provides browser messaging through an optional local hub a
 - `apps/web`: React and TypeScript browser application.
 - `services/local-hub`: FastAPI WebSocket hub.
 - `packages/protocol`: shared TypeScript packet validation.
-- `crates/protocol-core`: native Rust protocol v1 JSON validator with shared test vectors. It is not integrated into the browser and does not provide a WASM binding.
+- `crates/protocol-core`: Rust protocol v1 JSON validator with shared test vectors and a bounded in-memory message reconciliation primitive. It is not integrated into the browser and does not provide a WASM binding. See the [synchronization draft](docs/protocol/synchronization-v1-draft.md).
 - `docs`: architecture, protocol, security, and contributor documentation.
 
 ## Development
