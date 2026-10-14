@@ -1,0 +1,13 @@
+{
+  "name": "nearlink",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/web",
+    "packages/protocol"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @nearlink/web",
+    "build": "npm run build --workspace @nearlink/web"
+  }
+}
