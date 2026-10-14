@@ -270,7 +270,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
   margin: 0;
   padding: 0.8rem 1.1rem;
   border-bottom: 1px solid var(--line);
-  color: var(--muted);
+  color: #53574d;
   font-size: 0.86rem;
 }
 
