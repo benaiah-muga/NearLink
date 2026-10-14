@@ -9,6 +9,7 @@ if (!npmCli) {
 
 const checks = [
   [process.execPath, [npmCli, "run", "build"]],
+  [process.execPath, [npmCli, "run", "test:unit"]],
   [python, ["-m", "pytest", "-q", "services/local-hub/tests"]],
   ["node", ["scripts/check-em-dash.mjs"]],
 ];
@@ -26,3 +27,4 @@ for (const [command, args] of checks) {
 }
 
 console.log("\nNEARLINK_FOUNDATION_VERIFY_OK");
+console.log("NEARLINK_FULL_VERIFY_OK");

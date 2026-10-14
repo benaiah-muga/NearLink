@@ -99,7 +99,13 @@ def valid_identifier(value: Any, limit: int = MAX_ID_LENGTH) -> bool:
 
 
 def valid_text(value: Any, limit: int) -> bool:
-    return isinstance(value, str) and 0 < len(value.strip()) <= limit
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return 0 < len(value.strip()) <= limit
 
 
 def valid_timestamp(value: Any) -> bool:
@@ -141,7 +147,11 @@ def validate_message(packet: Any, client: Client) -> tuple[dict[str, Any] | None
         return None, "invalid_packet"
     if not isinstance(body, str) or not body.strip():
         return None, "invalid_packet"
-    if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+    try:
+        body_size = len(body.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None, "invalid_packet"
+    if body_size > MAX_BODY_BYTES:
         return None, "message_too_large"
     if room != client.room or sender != client.sender or sender_name.strip() != client.sender_name:
         return None, "invalid_packet"

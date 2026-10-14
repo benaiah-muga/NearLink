@@ -22,4 +22,4 @@ jobs:
           python-version: "3.12"
       - run: npm ci
       - run: python -m pip install -r services/local-hub/requirements-dev.lock
-      - run: npm run verify:foundation
+      - run: npm run verify:all

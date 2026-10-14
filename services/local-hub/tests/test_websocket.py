@@ -55,6 +55,7 @@ def message_packet(
         {"version": 1, "type": "join", "room": "bad room", "sender": "s", "senderName": "Name"},
         {"version": 1, "type": "join", "room": "room", "sender": "bad sender!", "senderName": "Name"},
         {"version": 1, "type": "join", "room": "room", "sender": "s", "senderName": "  "},
+        {"version": 1, "type": "join", "room": "room", "sender": "s", "senderName": "\ud800"},
     ],
 )
 def test_invalid_join_packets_are_rejected_and_closed(packet):
@@ -90,6 +91,46 @@ def test_malformed_input_gets_error_then_connection_can_continue():
             assert rejected["type"] == "error"
             assert rejected["code"] == "invalid_packet"
             assert rejected["id"] == "message-1"
+
+    assert hub.rooms == {}
+    assert hub.active_connections == 0
+
+
+def test_text_whitespace_and_unicode_scalar_rules_match_protocol_vectors():
+    python_whitespace = [
+        *(chr(point) for point in range(0x09, 0x0E)),
+        *(chr(point) for point in range(0x1C, 0x20)),
+        *(chr(point) for point in [0x20, 0x85, 0xA0, 0x1680]),
+        *(chr(point) for point in range(0x2000, 0x200B)),
+        *(chr(point) for point in [0x2028, 0x2029, 0x202F, 0x205F, 0x3000]),
+    ]
+    for whitespace in python_whitespace:
+        assert not hub.valid_text(whitespace, hub.MAX_NAME_LENGTH)
+        assert hub.valid_text(f"{whitespace}Amina{whitespace}", hub.MAX_NAME_LENGTH)
+
+    for value in ["\ufeff", "\u180e", "\u001b"]:
+        assert hub.valid_text(value, hub.MAX_NAME_LENGTH)
+
+    assert not hub.valid_text("\ud800", hub.MAX_NAME_LENGTH)
+
+
+def test_message_with_lone_surrogate_is_rejected_without_ending_connection():
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            websocket.receive_json()
+
+            malformed = message_packet()
+            malformed["body"] = "\ud800"
+            websocket.send_text(json.dumps(malformed, ensure_ascii=True))
+            rejected = websocket.receive_json()
+            assert rejected["type"] == "error"
+            assert rejected["code"] == "invalid_packet"
+            assert rejected["id"] == "message-1"
+
+            websocket.send_json(message_packet(message_id="valid-after-surrogate"))
+            assert websocket.receive_json() == {"version": 1, "type": "ack", "id": "valid-after-surrogate"}
 
     assert hub.rooms == {}
     assert hub.active_connections == 0
