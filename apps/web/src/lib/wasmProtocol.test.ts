@@ -44,6 +44,46 @@ describe("WASM protocol validator bridge", () => {
     expect(await bridge.initializeWasmProtocol()).toBe(false);
     expect(bridge.isWasmProtocolReady()).toBe(false);
     expect(bridge.validateWithWasm("server", { type: "message" })).toBe(false);
+    expect(bridge.isWasmSyncStateReady()).toBe(false);
+    expect(() => bridge.createWasmSyncRequestBook()).toThrow("WASM synchronization state is unavailable.");
     expect(validateJson).not.toHaveBeenCalled();
+  });
+
+  it("wraps the WASM inventory and request state APIs with typed, fail-closed results", async () => {
+    const initialize = vi.fn(async () => undefined);
+    const inventoryFree = vi.fn();
+    const requestFree = vi.fn();
+    const acceptPage = vi.fn()
+      .mockReturnValueOnce(JSON.stringify({ ok: true, outcome: "accepted", ids: ["a"], complete: true, limitReached: false }))
+      .mockReturnValueOnce(JSON.stringify({ ok: false, code: "inventory_conflict" }));
+    class WasmSyncInventoryReceiver {
+      accept_page_json = acceptPage;
+      free = inventoryFree;
+    }
+    class WasmSyncRequestBook {
+      register_request_json = vi.fn(() => JSON.stringify({ ok: true, outcome: "accepted" }));
+      accept_completion_json = vi.fn(() => JSON.stringify({ ok: true, outcome: "duplicate" }));
+      free = requestFree;
+    }
+    vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({
+      default: initialize,
+      validate_json: () => JSON.stringify({ ok: true, valid: true }),
+      WasmSyncInventoryReceiver,
+      WasmSyncRequestBook,
+    }));
+    const bridge = await import("./wasmProtocol");
+
+    expect(await bridge.initializeWasmProtocol()).toBe(true);
+    expect(bridge.isWasmSyncStateReady()).toBe(true);
+    const inventory = bridge.createWasmSyncInventoryReceiver();
+    expect(inventory.acceptPage({ type: "sync_inventory_page" } as never)).toEqual({ outcome: "accepted", ids: ["a"], complete: true, limitReached: false });
+    expect(() => inventory.acceptPage({ type: "sync_inventory_page" } as never)).toThrow("WASM rejected synchronization inventory state.");
+    inventory.free();
+    const requests = bridge.createWasmSyncRequestBook();
+    expect(requests.registerRequest({ type: "sync_missing_request" } as never)).toBe("accepted");
+    expect(requests.acceptCompletion({ type: "sync_page_complete" } as never)).toBe("duplicate");
+    requests.free();
+    expect(inventoryFree).toHaveBeenCalledOnce();
+    expect(requestFree).toHaveBeenCalledOnce();
   });
 });

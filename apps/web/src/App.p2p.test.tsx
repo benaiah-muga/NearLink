@@ -41,6 +41,22 @@ vi.mock("./lib/wasmProtocol", async () => {
       if (validator === "room") return protocol.isProtocolRoom(value);
       return protocol.isProtocolIdentifier(value);
     },
+    isWasmSyncStateReady: () => true,
+    createWasmSyncInventoryReceiver: () => {
+      const ids: string[] = [];
+      return {
+        acceptPage: (packet: import("@nearlink/protocol").SyncInventoryPagePacket) => {
+          ids.push(...packet.messageIds);
+          return { outcome: "accepted" as const, ids: [...ids], complete: !packet.hasMore, limitReached: !packet.hasMore && packet.limitReached };
+        },
+        free: () => undefined,
+      };
+    },
+    createWasmSyncRequestBook: () => ({
+      registerRequest: () => "accepted" as const,
+      acceptCompletion: () => "accepted" as const,
+      free: () => undefined,
+    }),
   };
 });
 

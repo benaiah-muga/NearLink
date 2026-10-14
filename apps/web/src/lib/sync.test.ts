@@ -1,7 +1,87 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket, SyncPacket } from "@nearlink/protocol";
 import { SyncCoordinator, type SyncState } from "./sync";
+import { initializeWasmProtocol } from "./wasmProtocol";
 import type { StoredMessage } from "./storage";
+
+const wasmState = vi.hoisted(() => ({ ready: true, frees: 0, acceptAfterFree: 0, registeredRequests: [] as string[] }));
+
+vi.mock("./wasmProtocol", async () => {
+  const protocol = await import("@nearlink/protocol");
+  return {
+    initializeWasmProtocol: async () => true,
+    isWasmSyncStateReady: () => wasmState.ready,
+    createWasmSyncInventoryReceiver: () => {
+      const pages = new Map<string, string>();
+      const ids: string[] = [];
+      let expectedCursor: string | null = null;
+      let identity = "";
+      let complete = false;
+      let limitReached = false;
+      let freed = false;
+      return {
+        acceptPage(packet: import("@nearlink/protocol").SyncInventoryPagePacket) {
+          if (freed) wasmState.acceptAfterFree += 1;
+          const pageKey = packet.cursor ?? "";
+          const encoded = JSON.stringify(packet);
+          const prior = pages.get(pageKey);
+          if (prior !== undefined) {
+            if (prior !== encoded) throw new Error("conflicting page");
+            return { outcome: "duplicate" as const, ids: [...ids], complete, limitReached };
+          }
+          if (!protocol.isSyncInventoryPagePacket(packet) || complete || packet.cursor !== expectedCursor
+            || (identity !== "" && identity !== `${packet.room}\u0000${packet.syncId}\u0000${packet.sender}`)
+            || ids.length + packet.messageIds.length > 4096
+            || packet.messageIds.some((id, index) => (index > 0 && packet.messageIds[index - 1] >= id) || (ids.length > 0 && index === 0 && ids.at(-1)! >= id))) {
+            throw new Error("invalid page");
+          }
+          identity = `${packet.room}\u0000${packet.syncId}\u0000${packet.sender}`;
+          pages.set(pageKey, encoded);
+          ids.push(...packet.messageIds);
+          complete = !packet.hasMore;
+          expectedCursor = packet.hasMore ? packet.nextCursor : null;
+          limitReached = complete && packet.limitReached;
+          return { outcome: "accepted" as const, ids: [...ids], complete, limitReached };
+        },
+        free: () => { freed = true; wasmState.frees += 1; },
+      };
+    },
+    createWasmSyncRequestBook: () => {
+      const requests = new Map<string, { packet: import("@nearlink/protocol").SyncMissingRequestPacket; completion?: import("@nearlink/protocol").SyncPageCompletePacket }>();
+      let identity = "";
+      return {
+        registerRequest(packet: import("@nearlink/protocol").SyncMissingRequestPacket) {
+          wasmState.registeredRequests.push(packet.requestId);
+          if (!protocol.isSyncMissingRequestPacket(packet)) throw new Error("invalid request");
+          const nextIdentity = `${packet.room}\u0000${packet.syncId}\u0000${packet.sender}\u0000${packet.targetSender}`;
+          if (identity !== "" && identity !== nextIdentity) throw new Error("request identity changed");
+          const existing = requests.get(packet.requestId);
+          if (existing) {
+            if (JSON.stringify(existing.packet) !== JSON.stringify(packet)) throw new Error("request conflict");
+            return "duplicate" as const;
+          }
+          identity = nextIdentity;
+          requests.set(packet.requestId, { packet });
+          return "accepted" as const;
+        },
+        acceptCompletion(packet: import("@nearlink/protocol").SyncPageCompletePacket) {
+          if (!protocol.isSyncPageCompletePacket(packet)) throw new Error("invalid completion");
+          const entry = requests.get(packet.requestId);
+          if (!entry) throw new Error("unknown request");
+          if (entry.completion) {
+            if (JSON.stringify(entry.completion) !== JSON.stringify(packet)) throw new Error("completion conflict");
+            return "duplicate" as const;
+          }
+          if (packet.room !== entry.packet.room || packet.syncId !== entry.packet.syncId || packet.sender !== entry.packet.targetSender || packet.targetSender !== entry.packet.sender
+            || packet.messageIds.some((id) => !entry.packet.messageIds.includes(id))) throw new Error("completion mismatch");
+          entry.completion = packet;
+          return "accepted" as const;
+        },
+        free: () => { wasmState.frees += 1; },
+      };
+    },
+  };
+});
 
 const room = "sync-room";
 
@@ -13,7 +93,177 @@ function stored(id: string, sender: string, delivery: "sent" | "queued" | "faile
   return { packet: packet(id, sender), direction: sender === "local-a" ? "outgoing" : "incoming", delivery, transport: "hub" };
 }
 
+function uncompletedInventoryPages(sender: string, sessionCount = 5, pagesPerSession = 39): SyncPacket[] {
+  const packets: SyncPacket[] = [];
+  for (let session = 0; session < sessionCount; session += 1) {
+    const syncId = `peer-${session}`;
+    for (let index = 0; index < pagesPerSession; index += 1) {
+      const id = `${syncId}-${String(index).padStart(3, "0")}`;
+      packets.push({
+        version: 1,
+        type: "sync_inventory_page",
+        room,
+        syncId,
+        sender,
+        cursor: index === 0 ? null : `${syncId}-${String(index - 1).padStart(3, "0")}`,
+        messageIds: [id],
+        nextCursor: id,
+        hasMore: true,
+        limitReached: false,
+      });
+    }
+  }
+  return packets;
+}
+
 describe("SyncCoordinator", () => {
+  beforeEach(async () => {
+    expect(await initializeWasmProtocol()).toBe(true);
+    wasmState.ready = true;
+    wasmState.frees = 0;
+    wasmState.acceptAfterFree = 0;
+    wasmState.registeredRequests = [];
+  });
+
+  it("fails closed when the WASM synchronization state is unavailable", async () => {
+    wasmState.ready = false;
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local", send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true, onState: (next) => { state = next; } });
+    await coordinator.start();
+    expect(state).toBe("error");
+    expect(sent).toEqual([]);
+    coordinator.stop();
+  });
+
+  it("releases a blocked sender inventory and request state", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true, onState: (next) => { state = next; } });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "peer-session", sender: "local-b", cursor: null, messageIds: [], nextCursor: null, hasMore: false, limitReached: false });
+    for (let index = 0; index < 193; index += 1) {
+      await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: `blocked-${index}`, sender: "local-b", targetSender: "local-a", messageIds: ["saved"] });
+    }
+    expect(state).toBe("partial");
+    expect(wasmState.frees).toBe(2);
+    coordinator.stop();
+  });
+
+  it("abandons a response when its sender is blocked during storage loading", async () => {
+    const rows = [stored("saved", "local-a")];
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let loads = 0;
+    let releaseResponse!: (value: StoredMessage[]) => void;
+    const responseSnapshot = new Promise<StoredMessage[]>((resolve) => { releaseResponse = resolve; });
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: () => "local-session",
+      send: (value) => sent.push(value),
+      loadAccepted: () => { loads += 1; return loads === 1 ? Promise.resolve(rows) : responseSnapshot; },
+      validateMessage: () => true,
+      onState: (next) => { state = next; },
+    });
+    await coordinator.start();
+    const response = coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "pending-response", sender: "local-b", targetSender: "local-a", messageIds: ["saved"] });
+    await vi.waitFor(() => expect(loads).toBe(2));
+    for (const page of uncompletedInventoryPages("local-b")) await coordinator.receive(page);
+    releaseResponse(rows);
+    await response;
+    expect(state).toBe("partial");
+    expect(sent.some((value) => value.type === "sync_page_complete" && value.requestId === "pending-response")).toBe(false);
+    expect(sent.some((value) => value.type === "message" && value.id === "saved")).toBe(false);
+    coordinator.stop();
+  });
+
+  it("cancels a paced response when its sender is blocked", async () => {
+    const rows = [stored("alpha", "local-a"), stored("bravo", "local-a")];
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, messageIntervalMs: 10_000, onState: (next) => { state = next; } });
+    await coordinator.start();
+    const response = coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "paced-response", sender: "local-b", targetSender: "local-a", messageIds: ["alpha", "bravo"] });
+    await vi.waitFor(() => expect(sent.some((value) => value.type === "message" && value.id === "alpha")).toBe(true));
+    for (const page of uncompletedInventoryPages("local-b")) await coordinator.receive(page);
+    await response;
+    expect(state).toBe("partial");
+    expect(sent.filter((value) => value.type === "message")).toHaveLength(1);
+    expect(sent.some((value) => value.type === "sync_page_complete" && value.requestId === "paced-response")).toBe(false);
+    coordinator.stop();
+  });
+
+  it("does not send a missing request after its inventory session is blocked during storage loading", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let loads = 0;
+    let releaseCheck!: (value: StoredMessage[]) => void;
+    const pendingCheck = new Promise<StoredMessage[]>((resolve) => { releaseCheck = resolve; });
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: () => "local-session",
+      send: (value) => sent.push(value),
+      loadAccepted: () => { loads += 1; return loads === 1 ? Promise.resolve([]) : pendingCheck; },
+      validateMessage: () => true,
+      onState: (next) => { state = next; },
+    });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "initial-peer", sender: "local-b", cursor: null, messageIds: ["missing"], nextCursor: "missing", hasMore: false, limitReached: false });
+    await vi.waitFor(() => expect(loads).toBe(2));
+    for (const page of uncompletedInventoryPages("local-b")) await coordinator.receive(page);
+    releaseCheck([]);
+    await vi.waitFor(() => expect(state).toBe("partial"));
+    expect(sent.some((value) => value.type === "sync_missing_request")).toBe(false);
+    coordinator.stop();
+  });
+
+  it("discards exchange state on stop and creates fresh state after restart", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let sequence = 0;
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => `local-${++sequence}`, send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true });
+    const remoteInventory: SyncPacket = { version: 1, type: "sync_inventory_page", room, syncId: "remote-session", sender: "local-b", cursor: null, messageIds: ["remote-message"], nextCursor: "remote-message", hasMore: false, limitReached: false };
+    await coordinator.start();
+    await coordinator.receive(remoteInventory);
+    await vi.waitFor(() => expect(sent.filter((value) => value.type === "sync_missing_request")).toHaveLength(1));
+    coordinator.stop();
+    expect(wasmState.frees).toBe(2);
+
+    await coordinator.start();
+    await coordinator.receive(remoteInventory);
+    await vi.waitFor(() => expect(sent.filter((value) => value.type === "sync_missing_request")).toHaveLength(2));
+    expect([...new Set(sent.filter((value) => value.type === "sync_inventory_page").map((value) => value.type === "sync_inventory_page" ? value.syncId : ""))]).toEqual(["local-1", "local-3"]);
+    coordinator.stop();
+  });
+
+  it("ignores an old storage snapshot that resolves after stop and restart", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    const pending: Array<(rows: StoredMessage[]) => void> = [];
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: (() => { let id = 0; return () => `epoch-${++id}`; })(),
+      send: (value) => sent.push(value),
+      loadAccepted: () => new Promise<StoredMessage[]>((resolve) => { pending.push(resolve); }),
+      validateMessage: () => true,
+    });
+    const staleStart = coordinator.start();
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    coordinator.stop();
+    const currentStart = coordinator.start();
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    pending[1]([stored("current-snapshot", "local-a")]);
+    await currentStart;
+    pending[0]([stored("stale-snapshot", "local-a")]);
+    await staleStart;
+
+    const inventories = sent.filter((value) => value.type === "sync_inventory_page");
+    expect(inventories).toHaveLength(1);
+    expect(inventories[0]).toMatchObject({ syncId: "epoch-1", messageIds: ["current-snapshot"] });
+    coordinator.stop();
+  });
+
   it("exchanges only accepted messages and verifies transferred packets after durable storage", async () => {
     const aRows = [stored("only-a", "local-a"), stored("queued-a", "local-a", "queued")];
     const bRows = [stored("only-b", "local-b")];
@@ -111,6 +361,60 @@ describe("SyncCoordinator", () => {
     await coordinator.receive(request);
     expect(sent.filter((value) => value.type === "message" && value.id === "local-saved")).toHaveLength(1);
     expect(sent.filter((value) => value.type === "sync_page_complete" && value.requestId === "duplicate-request")).toHaveLength(1);
+    expect(wasmState.registeredRequests.filter((id) => id === "duplicate-request")).toHaveLength(2);
+    coordinator.stop();
+  });
+
+  it("routes a conflicting reused request ID through WASM before TypeScript dedupe", async () => {
+    const rows = [stored("local-saved", "local-a")];
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next) => { state = next; } });
+    await coordinator.start();
+    const request: SyncPacket = { version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "reused-request", sender: "local-b", targetSender: "local-a", messageIds: ["local-saved"] };
+    await coordinator.receive(request);
+    await coordinator.receive({ ...request, messageIds: ["different-message"] });
+    expect(wasmState.registeredRequests.filter((id) => id === "reused-request")).toHaveLength(2);
+    expect(state).toBe("error");
+    expect(sent.filter((value) => value.type === "sync_page_complete" && value.requestId === "reused-request")).toHaveLength(1);
+    coordinator.stop();
+  });
+
+  it("isolates equal request IDs from unrelated peers", async () => {
+    const rows = [stored("shared-message", "local-a")];
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next) => { state = next; } });
+    await coordinator.start();
+    const request = (sender: string): SyncPacket => ({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "same-opaque-id", sender, targetSender: "local-a", messageIds: ["shared-message"] });
+    await coordinator.receive(request("local-b"));
+    await coordinator.receive(request("local-c"));
+    expect(sent.filter((value) => value.type === "sync_page_complete" && value.requestId === "same-opaque-id").map((value) => value.type === "sync_page_complete" ? value.targetSender : "")).toEqual(["local-b", "local-c"]);
+    expect(state).not.toBe("error");
+    coordinator.stop();
+  });
+
+  it("does not use an inventory receiver after rebroadcast stops the coordinator", async () => {
+    let advertCount = 0;
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: () => "local-session",
+      send: (value) => {
+        if (value.type !== "sync_inventory_page") return;
+        advertCount += 1;
+        if (advertCount === 2) throw new Error("Simulated transport send failure.");
+      },
+      loadAccepted: async () => [],
+      validateMessage: () => true,
+      onState: (next) => { state = next; },
+    });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: ["alpha"], nextCursor: "alpha", hasMore: false, limitReached: false });
+    expect(state).toBe("error");
+    expect(wasmState.acceptAfterFree).toBe(0);
+    expect(wasmState.frees).toBe(1);
     coordinator.stop();
   });
 

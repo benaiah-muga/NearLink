@@ -11,6 +11,13 @@ import {
   type SyncPacket,
   type SyncPageCompletePacket,
 } from "@nearlink/protocol";
+import {
+  createWasmSyncInventoryReceiver,
+  createWasmSyncRequestBook,
+  isWasmSyncStateReady,
+  type SyncInventoryState,
+  type SyncRequestState,
+} from "./wasmProtocol";
 import type { StoredMessage } from "./storage";
 
 export type SyncState = "idle" | "syncing" | "partial" | "complete" | "error";
@@ -30,7 +37,6 @@ export interface SyncCoordinatorOptions {
 interface InventorySession {
   sender: string;
   syncId: string;
-  pages: Map<string, SyncInventoryPagePacket>;
   ids: string[];
   nextCursor: string | null;
   done: boolean;
@@ -38,6 +44,7 @@ interface InventorySession {
   missingIds: string[];
   nextRequestOffset: number;
   activeRequestId: string | null;
+  inventoryState: SyncInventoryState;
 }
 
 interface PendingRequest {
@@ -61,8 +68,8 @@ function key(sender: string, syncId: string): string {
   return `${sender}\u0000${syncId}`;
 }
 
-function sortedUnique(values: string[]): boolean {
-  return values.every((value, index) => index === 0 || values[index - 1] < value);
+function handledRequestKey(sender: string, syncId: string, requestId: string): string {
+  return `${sender}\u0000${syncId}\u0000${requestId}`;
 }
 
 export class SyncCoordinator {
@@ -72,6 +79,8 @@ export class SyncCoordinator {
   private localIds = new Set<string>();
   private remote = new Map<string, InventorySession>();
   private requests = new Map<string, PendingRequest>();
+  private wasmInventoryReceivers = new Set<SyncInventoryState>();
+  private wasmRequestBooks = new Map<string, SyncRequestState>();
   private handledRequests = new Map<string, SyncMissingRequestPacket>();
   private retainedControlBytes = 0;
   private retainedControlCount = 0;
@@ -84,7 +93,7 @@ export class SyncCoordinator {
   private localLimitReached = false;
   private nextMessageAt = 0;
   private messageSendQueue: Promise<void> = Promise.resolve();
-  private pendingMessageWait: { timer: ReturnType<typeof setTimeout>; resolve: () => void } | null = null;
+  private pendingMessageWait: { timer: ReturnType<typeof setTimeout>; resolve: () => void; recipient: string } | null = null;
   private epoch = 0;
   private messageSendBlocked = false;
   private localSnapshotReady: Promise<void> = Promise.resolve();
@@ -97,11 +106,13 @@ export class SyncCoordinator {
   async start(): Promise<void> {
     this.reset();
     this.stopped = false;
+    const startEpoch = this.epoch;
     this.localSnapshotReady = new Promise<void>((resolve) => { this.resolveLocalSnapshotReady = resolve; });
     this.options.onState?.("syncing", "Exchanging bounded local message inventories.");
     try {
+      if (!isWasmSyncStateReady()) throw new Error("WASM synchronization state is unavailable.");
       const stored = await this.options.loadAccepted();
-      if (this.stopped) return;
+      if (!this.isRunActive(startEpoch)) return;
       const accepted = stored.filter((item) => item.packet.room === this.options.room
         && item.delivery === "sent"
         && item.failure === undefined
@@ -120,7 +131,7 @@ export class SyncCoordinator {
         this.options.onState?.("partial", "The local inventory exceeded 4,096 IDs. This exchange can only report partial synchronization.");
       }
     } catch {
-      this.fail("Local storage could not provide an accepted-message snapshot. Reconnect to restart synchronization.");
+      if (this.isRunActive(startEpoch)) this.fail("Local storage could not provide an accepted-message snapshot. Reconnect to restart synchronization.");
     }
   }
 
@@ -130,6 +141,10 @@ export class SyncCoordinator {
     this.markLocalSnapshotReady();
     this.remote.clear();
     this.requests.clear();
+    for (const receiver of this.wasmInventoryReceivers) receiver.free();
+    this.wasmInventoryReceivers.clear();
+    for (const book of this.wasmRequestBooks.values()) book.free();
+    this.wasmRequestBooks.clear();
     this.handledRequests.clear();
     this.retainedControlBytes = 0;
     this.retainedControlCount = 0;
@@ -210,20 +225,38 @@ export class SyncCoordinator {
       this.acceptInventory(packet);
     } else if (packet.type === "sync_missing_request") {
       if (!isSyncMissingRequestPacket(packet)) return this.fail("A peer sent an invalid missing-message request. Reconnect to start over.");
+      const receiveEpoch = this.epoch;
       await this.localSnapshotReady;
-      if (this.stopped || this.failed || !this.localSyncId || packet.targetSender !== this.options.sender || packet.syncId !== this.localSyncId) return;
-      const prior = this.handledRequests.get(packet.requestId);
+      if (!this.isRunActive(receiveEpoch) || !this.localSyncId || packet.targetSender !== this.options.sender || packet.syncId !== this.localSyncId) return;
+      const bookKey = `in:${key(packet.sender, packet.syncId)}`;
+      let book = this.wasmRequestBooks.get(bookKey);
+      const newBook = !book;
+      if (newBook && !this.retainControl(packet)) return;
+      try {
+        if (!book) {
+          book = createWasmSyncRequestBook();
+          this.wasmRequestBooks.set(bookKey, book);
+        }
+        const outcome = book.registerRequest(packet);
+        if (outcome === "duplicate") return;
+      } catch {
+        this.fail("WASM could not verify synchronization request state. Reconnect to start over.");
+        return;
+      }
+      const requestKey = handledRequestKey(packet.sender, packet.syncId, packet.requestId);
+      const prior = this.handledRequests.get(requestKey);
       if (prior) {
         if (!sameJson(prior, packet)) this.fail("A request ID was reused with different contents. Reconnect to start over.");
         return;
       }
-      if (!this.retainControl(packet)) return;
-      this.handledRequests.set(packet.requestId, packet);
-      await this.respond(packet);
+      if (!newBook && !this.retainControl(packet)) return;
+      this.handledRequests.set(requestKey, packet);
+      await this.respond(packet, receiveEpoch);
     } else if (packet.type === "sync_page_complete") {
       if (!isSyncPageCompletePacket(packet)) return this.fail("A peer sent an invalid synchronization completion. Reconnect to start over.");
+      const receiveEpoch = this.epoch;
       await this.localSnapshotReady;
-      if (this.stopped || this.failed) return;
+      if (!this.isRunActive(receiveEpoch)) return;
       await this.complete(packet);
     }
   }
@@ -255,44 +288,61 @@ export class SyncCoordinator {
       this.retainedControlCount -= budget.count;
       this.senderControlBudgets.delete(sender);
     }
-    for (const [sessionKey, session] of this.remote) if (session.sender === sender) this.remote.delete(sessionKey);
+    for (const [sessionKey, session] of this.remote) {
+      if (session.sender !== sender) continue;
+      session.inventoryState.free();
+      this.wasmInventoryReceivers.delete(session.inventoryState);
+      this.remote.delete(sessionKey);
+    }
+    for (const [bookKey, book] of this.wasmRequestBooks) {
+      if (!bookKey.startsWith(`in:${sender}\u0000`) && !bookKey.startsWith(`out:${sender}\u0000`)) continue;
+      book.free();
+      this.wasmRequestBooks.delete(bookKey);
+    }
     for (const [requestId, request] of this.requests) if (request.sender === sender) this.requests.delete(requestId);
     for (const [requestId, request] of this.handledRequests) if (request.sender === sender) this.handledRequests.delete(requestId);
+    if (this.pendingMessageWait?.recipient === sender) {
+      clearTimeout(this.pendingMessageWait.timer);
+      this.pendingMessageWait.resolve();
+      this.pendingMessageWait = null;
+    }
     this.options.onState?.("partial", "A peer exceeded the bounded synchronization control budget. That peer is incomplete; reconnect to retry from saved messages while other peer exchanges may continue.");
   }
 
   private acceptInventory(packet: SyncInventoryPagePacket): void {
+    const inventoryEpoch = this.epoch;
     const sessionKey = key(packet.sender, packet.syncId);
     let session = this.remote.get(sessionKey);
     if (!session) {
       if (this.remote.size >= 32) return this.fail("Too many peer inventory sessions arrived. Reconnect to start over.");
-      session = { sender: packet.sender, syncId: packet.syncId, pages: new Map(), ids: [], nextCursor: null, done: false, limitReached: false, missingIds: [], nextRequestOffset: 0, activeRequestId: null };
+      let inventoryState: SyncInventoryState;
+      try {
+        inventoryState = createWasmSyncInventoryReceiver();
+      } catch {
+        return this.fail("WASM could not start synchronization inventory state. Reconnect to retry.");
+      }
+      this.wasmInventoryReceivers.add(inventoryState);
+      session = { sender: packet.sender, syncId: packet.syncId, ids: [], nextCursor: null, done: false, limitReached: false, missingIds: [], nextRequestOffset: 0, activeRequestId: null, inventoryState };
       this.remote.set(sessionKey, session);
       if (this.options.rebroadcastOnPeerInventory !== false) {
         if (this.localSyncId) this.rebroadcastInventoryOnce();
         else this.inventoryRebroadcastPending = true;
       }
+      if (!this.isRunActive(inventoryEpoch)) return;
     }
-    const pageKey = packet.cursor ?? "";
-    const known = session.pages.get(pageKey);
-    if (known) {
-      if (!sameJson(known, packet)) this.fail("A peer changed an inventory page after sending it. Reconnect to start over.");
+    let accepted: ReturnType<SyncInventoryState["acceptPage"]>;
+    try {
+      accepted = session.inventoryState.acceptPage(packet);
+    } catch {
+      this.fail("A peer sent an invalid or conflicting inventory sequence. Reconnect to start over.");
       return;
     }
-    if (session.done || packet.cursor !== session.nextCursor || (session.ids.length === 0 && packet.cursor !== null)
-      || (session.ids.length > 0 && packet.cursor === null)
-      || session.ids.length + packet.messageIds.length > MAX_SYNC_INVENTORY_IDS
-      || !sortedUnique(packet.messageIds)
-      || (session.ids.length > 0 && packet.messageIds.length > 0 && session.ids.at(-1)! >= packet.messageIds[0])) {
-      this.fail("Inventory pages had a gap, duplicate, or limit violation. Reconnect to start over.");
-      return;
-    }
+    if (accepted.outcome === "duplicate") return;
     if (!this.retainControl(packet)) return;
-    session.pages.set(pageKey, packet);
-    session.ids.push(...packet.messageIds);
+    session.ids = accepted.ids;
     session.nextCursor = packet.nextCursor;
-    session.done = !packet.hasMore;
-    session.limitReached = packet.limitReached;
+    session.done = accepted.complete;
+    session.limitReached = accepted.limitReached;
     if (packet.limitReached) this.partial = true;
     if (!session.done) return;
     void this.requestMissing(session);
@@ -333,11 +383,12 @@ export class SyncCoordinator {
   }
 
   private async requestMissing(session: InventorySession): Promise<void> {
+    const requestEpoch = this.epoch;
     try {
       await this.localSnapshotReady;
-      if (this.stopped || this.failed) return;
+      if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
       const current = await this.options.loadAccepted();
-      if (this.stopped || this.failed) return;
+      if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
       const currentIds = new Set(current.filter((item) => item.packet.room === this.options.room
         && item.delivery === "sent" && item.failure === undefined && this.options.validateMessage(item.packet)).map((item) => item.packet.id));
       session.missingIds = session.ids.filter((id) => !currentIds.has(id));
@@ -349,20 +400,21 @@ export class SyncCoordinator {
       }
       this.sendNextRequest(session);
     } catch {
-      this.fail("The local storage check failed. Reconnect to restart synchronization from fresh inventories.");
+      if (this.isRunActive(requestEpoch) && this.isSessionActive(session)) this.fail("The local storage check failed. Reconnect to restart synchronization from fresh inventories.");
     }
   }
 
   private sendNextRequest(session?: InventorySession): void {
     if (this.stopped || this.failed) return;
-    if ([...this.remote.values()].some((entry) => entry.activeRequestId !== null)) return;
-    if (!session) session = [...this.remote.values()].find((entry) => entry.nextRequestOffset < entry.missingIds.length);
+    if ([...this.remote.values()].some((entry) => !this.blockedSenders.has(entry.sender) && entry.activeRequestId !== null)) return;
+    if (!session) session = [...this.remote.values()].find((entry) => !this.blockedSenders.has(entry.sender) && entry.nextRequestOffset < entry.missingIds.length);
     if (!session) {
       this.options.onState?.(this.partial ? "partial" : "complete", this.partial
         ? "Requested pages were verified, but an inventory or page was incomplete. This exchange is partial."
         : "Requested message pages were received and verified in local storage.");
       return;
     }
+    if (!this.isSessionActive(session)) return;
     if (session.activeRequestId) return;
     if (session.nextRequestOffset >= session.missingIds.length) {
       return this.sendNextRequest();
@@ -380,21 +432,33 @@ export class SyncCoordinator {
       targetSender: session.sender,
       messageIds: ids,
     };
+    const bookKey = `out:${key(session.sender, session.syncId)}`;
+    let book = this.wasmRequestBooks.get(bookKey);
+    try {
+      if (!book) {
+        book = createWasmSyncRequestBook();
+        this.wasmRequestBooks.set(bookKey, book);
+      }
+      book.registerRequest(request);
+    } catch {
+      this.fail("WASM could not register synchronization request state. Reconnect to start over.");
+      return;
+    }
     this.requests.set(requestId, { sender: session.sender, syncId: session.syncId, ids, received: new Map() });
     session.activeRequestId = requestId;
     try { this.options.send(request); }
     catch { this.fail("A missing-message request could not be sent. Reconnect to restart synchronization."); }
   }
 
-  private async respond(request: SyncMissingRequestPacket): Promise<void> {
+  private async respond(request: SyncMissingRequestPacket, responseEpoch: number): Promise<void> {
     await this.localSnapshotReady;
-    if (this.stopped || this.failed) return;
+    if (!this.isResponseActive(request, responseEpoch)) return;
     if (request.targetSender !== this.options.sender || request.syncId !== this.localSyncId || this.localSyncId === "") return;
-    const prior = this.handledRequests.get(request.requestId);
+    const prior = this.handledRequests.get(handledRequestKey(request.sender, request.syncId, request.requestId));
     if (prior && !sameJson(prior, request)) return this.fail("A request ID was reused with different contents. Reconnect to start over.");
     try {
       const current = await this.options.loadAccepted();
-      if (this.stopped || this.failed || request.syncId !== this.localSyncId) return;
+      if (!this.isResponseActive(request, responseEpoch)) return;
       const available = new Map(current.filter((item) => item.packet.room === this.options.room
         && item.delivery === "sent" && item.failure === undefined && request.messageIds.includes(item.packet.id)
         && this.localIds.has(item.packet.id)
@@ -403,8 +467,8 @@ export class SyncCoordinator {
       for (const id of request.messageIds) {
         const message = available.get(id);
         if (!message) continue;
-        const sent = await this.sendMessage(message);
-        if (this.stopped || this.failed) return;
+        const sent = await this.sendMessage(message, request.sender);
+        if (!this.isResponseActive(request, responseEpoch)) return;
         if (!sent) break;
         emitted.push(id);
       }
@@ -418,16 +482,26 @@ export class SyncCoordinator {
         targetSender: request.sender,
         messageIds: emitted,
       };
+      if (!this.isResponseActive(request, responseEpoch)) return;
+      const book = this.wasmRequestBooks.get(`in:${key(request.sender, request.syncId)}`);
+      if (!book) return;
+      try {
+        book.acceptCompletion(completion);
+      } catch {
+        if (this.isResponseActive(request, responseEpoch)) this.fail("WASM could not verify the outgoing synchronization completion. Reconnect to start over.");
+        return;
+      }
+      if (!this.isResponseActive(request, responseEpoch)) return;
       this.options.send(completion);
     } catch {
-      this.fail("The requested message snapshot could not be checked. Reconnect to restart synchronization.");
+      if (this.isResponseActive(request, responseEpoch)) this.fail("The requested message snapshot could not be checked. Reconnect to restart synchronization.");
     }
   }
 
-  private sendMessage(packet: MessagePacket): Promise<boolean> {
+  private sendMessage(packet: MessagePacket, recipient: string): Promise<boolean> {
     const epoch = this.epoch;
     const operation = this.messageSendQueue.catch(() => undefined).then(async () => {
-      if (this.stopped || this.failed || epoch !== this.epoch || this.messageSendBlocked) return false;
+      if (this.stopped || this.failed || epoch !== this.epoch || this.messageSendBlocked || this.blockedSenders.has(recipient)) return false;
       const interval = Math.max(0, this.options.messageIntervalMs ?? 0);
       if (interval > 0) {
         const now = Date.now();
@@ -439,10 +513,10 @@ export class SyncCoordinator {
             this.pendingMessageWait = null;
             resolve();
           }, waitMs);
-          this.pendingMessageWait = { timer, resolve };
+          this.pendingMessageWait = { timer, resolve, recipient };
         });
       }
-      if (this.stopped || this.failed || epoch !== this.epoch || this.messageSendBlocked) return false;
+      if (this.stopped || this.failed || epoch !== this.epoch || this.messageSendBlocked || this.blockedSenders.has(recipient)) return false;
       this.options.send(packet);
       return true;
     });
@@ -454,6 +528,17 @@ export class SyncCoordinator {
     if (packet.targetSender !== this.options.sender) return;
     const request = this.requests.get(packet.requestId);
     if (!request || request.sender !== packet.sender || request.syncId !== packet.syncId) return;
+    const completeEpoch = this.epoch;
+    const book = this.wasmRequestBooks.get(`out:${key(packet.sender, packet.syncId)}`);
+    if (!book) return this.fail("WASM synchronization request state was lost. Reconnect to start over.");
+    let outcome: "accepted" | "duplicate";
+    try {
+      outcome = book.acceptCompletion(packet);
+    } catch {
+      this.fail("WASM could not verify synchronization completion state. Reconnect to start over.");
+      return;
+    }
+    if (outcome === "duplicate") return;
     if (request.completion) {
       if (!sameJson(request.completion, packet)) this.fail("A completed request ID was reused with different contents. Reconnect to start over.");
       return;
@@ -471,7 +556,7 @@ export class SyncCoordinator {
     const incompletePage = completedIds.length < request.ids.length || observedIds.length < completedIds.length;
     try {
       const stored = await this.options.loadAccepted();
-      if (this.stopped || this.failed || this.requests.get(packet.requestId) !== request) return;
+      if (!this.isRunActive(completeEpoch) || this.requests.get(packet.requestId) !== request) return;
       const byId = new Map(stored.filter((item) => item.packet.room === this.options.room && item.delivery === "sent" && item.failure === undefined).map((item) => [item.packet.id, item.packet]));
       for (const id of observedIds) {
         const expected = request.received.get(id);
@@ -490,7 +575,7 @@ export class SyncCoordinator {
       if (incompletePage) this.options.onState?.("partial", "The peer completed only part of a requested page. Available messages were saved; the exchange is partial.");
       this.sendNextRequest();
     } catch {
-      this.fail("Local storage could not verify the received page. Reconnect to restart synchronization from fresh inventories.");
+      if (this.isRunActive(completeEpoch) && this.requests.get(packet.requestId) === request) this.fail("Local storage could not verify the received page. Reconnect to restart synchronization from fresh inventories.");
     }
   }
 
@@ -505,6 +590,19 @@ export class SyncCoordinator {
     if (!this.resolveLocalSnapshotReady) return;
     this.resolveLocalSnapshotReady();
     this.resolveLocalSnapshotReady = null;
+  }
+
+  private isRunActive(epoch: number): boolean {
+    return !this.stopped && !this.failed && this.epoch === epoch;
+  }
+
+  private isSessionActive(session: InventorySession): boolean {
+    return this.remote.get(key(session.sender, session.syncId)) === session && !this.blockedSenders.has(session.sender);
+  }
+
+  private isResponseActive(request: SyncMissingRequestPacket, epoch: number): boolean {
+    return this.isRunActive(epoch) && !this.blockedSenders.has(request.sender)
+      && request.targetSender === this.options.sender && request.syncId === this.localSyncId;
   }
 
   private fail(detail: string): void {
