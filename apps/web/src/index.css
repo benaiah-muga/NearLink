@@ -119,6 +119,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .signal-mark.is-active i { background: #748e69; }
 .message-scroll { flex: 1; padding: 25px max(44px, calc((100% - 760px) / 2)); overflow-y: auto; scroll-behavior: smooth; }
 .message-scroll:focus-visible { outline: 3px solid #a47e2f; outline-offset: -4px; }
+.history-controls { display: grid; justify-items: center; gap: 7px; margin: 0 auto 22px; color: #67665f; text-align: center; }
+.history-controls p { margin: 0; font-size: 0.82rem; line-height: 1.45; }
+.history-controls button { border: 1px solid #c9c5b7; border-radius: 999px; background: #fbfaf6; color: #343a33; padding: 9px 17px; font: inherit; font-size: 0.84rem; cursor: pointer; }
+.history-controls button:hover:not(:disabled) { border-color: #92712f; background: #f5f0e3; }
+.history-controls button:disabled { cursor: not-allowed; opacity: 0.58; }
+.history-controls .history-retention-gap { color: #765b22; }
 .notice-banner { display: flex; align-items: center; gap: 9px; margin: 0 auto 20px; padding: 10px 12px; border: 1px solid #dbcfaa; border-radius: 3px; color: #5d533a; background: #f6f0da; font-size: 10px; line-height: 1.5; }
 .notice-banner:focus { outline: 2px solid #8b6a29; outline-offset: 2px; }
 .notice-banner > span { display: grid; flex: 0 0 17px; width: 17px; height: 17px; place-items: center; border-radius: 50%; color: white; background: #a58643; font-family: Georgia, serif; }

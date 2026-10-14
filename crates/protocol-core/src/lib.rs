@@ -11,6 +11,9 @@ pub mod sync;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_PROTOCOL_ENVELOPE_BYTES: usize = 18 * 1024;
+pub const MAX_HISTORY_PAGE_MESSAGES: u64 = 100;
+pub const MAX_HISTORY_PAGE_BYTES: u64 = 512 * 1024;
 
 const HUB_WHITESPACE: &[char] = &[
     '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{001c}', '\u{001d}', '\u{001e}',
@@ -37,6 +40,10 @@ fn has_v1(value: &Value) -> bool {
 
 fn has_type(value: &Value, expected: &str) -> bool {
     text_field(value, "type") == Some(expected)
+}
+
+fn is_envelope_within_limit(value: &Value) -> bool {
+    serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= MAX_PROTOCOL_ENVELOPE_BYTES)
 }
 
 pub fn is_protocol_identifier(value: &str) -> bool {
@@ -166,6 +173,7 @@ pub fn is_protocol_timestamp(value: &str) -> bool {
 
 pub fn is_join_packet(value: &Value) -> bool {
     record(value)
+        && is_envelope_within_limit(value)
         && has_v1(value)
         && has_type(value, "join")
         && text_field(value, "room").is_some_and(is_protocol_room)
@@ -175,6 +183,7 @@ pub fn is_join_packet(value: &Value) -> bool {
 
 pub fn is_message_packet(value: &Value) -> bool {
     record(value)
+        && is_envelope_within_limit(value)
         && has_v1(value)
         && has_type(value, "message")
         && text_field(value, "id").is_some_and(is_protocol_identifier)
@@ -187,6 +196,83 @@ pub fn is_message_packet(value: &Value) -> bool {
         })
 }
 
+pub fn is_history_request_packet(value: &Value) -> bool {
+    record(value)
+        && is_envelope_within_limit(value)
+        && has_v1(value)
+        && has_type(value, "history_request")
+        && text_field(value, "requestId").is_some_and(is_protocol_identifier)
+        && text_field(value, "room").is_some_and(is_protocol_room)
+        && field(value, "cursor").is_some_and(|cursor| {
+            cursor.is_null() || cursor.as_str().is_some_and(is_protocol_identifier)
+        })
+        && field(value, "limit")
+            .and_then(Value::as_f64)
+            .is_some_and(|limit| {
+                limit.is_finite()
+                    && limit.fract() == 0.0
+                    && (1.0..=MAX_HISTORY_PAGE_MESSAGES as f64).contains(&limit)
+            })
+}
+
+pub fn is_history_page_complete_packet(value: &Value) -> bool {
+    if !record(value)
+        || !is_envelope_within_limit(value)
+        || !has_v1(value)
+        || !has_type(value, "history_page_complete")
+        || !text_field(value, "requestId").is_some_and(is_protocol_identifier)
+        || !text_field(value, "room").is_some_and(is_protocol_room)
+    {
+        return false;
+    }
+
+    let Some(message_ids) = field(value, "messageIds").and_then(Value::as_array) else {
+        return false;
+    };
+    if message_ids.len() > MAX_HISTORY_PAGE_MESSAGES as usize {
+        return false;
+    }
+    let mut unique_ids = std::collections::BTreeSet::new();
+    if !message_ids.iter().all(|id| {
+        id.as_str()
+            .is_some_and(|id| is_protocol_identifier(id) && unique_ids.insert(id))
+    }) {
+        return false;
+    }
+
+    let Some(page_bytes) = field(value, "pageBytes").and_then(Value::as_f64) else {
+        return false;
+    };
+    if !page_bytes.is_finite()
+        || page_bytes.fract() != 0.0
+        || !(0.0..=MAX_HISTORY_PAGE_BYTES as f64).contains(&page_bytes)
+        || (message_ids.is_empty() != (page_bytes == 0.0))
+    {
+        return false;
+    }
+
+    let Some(next_cursor) = field(value, "nextCursor") else {
+        return false;
+    };
+    if !next_cursor.is_null() && !next_cursor.as_str().is_some_and(is_protocol_identifier) {
+        return false;
+    }
+    let Some(has_more) = field(value, "hasMore").and_then(Value::as_bool) else {
+        return false;
+    };
+    let Some(history_truncated) = field(value, "historyTruncated").and_then(Value::as_bool) else {
+        return false;
+    };
+    let _ = history_truncated;
+
+    if has_more {
+        !message_ids.is_empty()
+            && message_ids.last().and_then(Value::as_str) == next_cursor.as_str()
+    } else {
+        next_cursor.is_null()
+    }
+}
+
 fn nonnegative_integer(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_f64)
@@ -194,11 +280,12 @@ fn nonnegative_integer(value: Option<&Value>) -> bool {
 }
 
 pub fn is_server_packet(value: &Value) -> bool {
-    if !record(value) || !has_v1(value) {
+    if !record(value) || !is_envelope_within_limit(value) || !has_v1(value) {
         return false;
     }
 
     match text_field(value, "type") {
+        Some("history_page_complete") => is_history_page_complete_packet(value),
         Some("joined") => {
             text_field(value, "room").is_some_and(is_protocol_room)
                 && nonnegative_integer(field(value, "peers"))
@@ -219,6 +306,10 @@ pub fn is_server_packet(value: &Value) -> bool {
                         | "rate_limited"
                         | "message_conflict"
                         | "storage_unavailable"
+                        | "not_joined"
+                        | "invalid_cursor"
+                        | "history_packet_too_large"
+                        | "history_page_too_large"
                 )
             ) && text_field(value, "message").is_some()
                 && field(value, "id")
@@ -229,7 +320,7 @@ pub fn is_server_packet(value: &Value) -> bool {
 }
 
 pub fn is_client_packet(value: &Value) -> bool {
-    is_join_packet(value) || is_message_packet(value)
+    is_join_packet(value) || is_message_packet(value) || is_history_request_packet(value)
 }
 
 #[cfg(test)]
@@ -250,7 +341,9 @@ mod tests {
                 "client" => is_client_packet(value),
                 "join" => is_join_packet(value),
                 "message" => is_message_packet(value),
+                "history_request" => is_history_request_packet(value),
                 "server" => is_server_packet(value),
+                "history_page_complete" => is_history_page_complete_packet(value),
                 "timestamp" => value.as_str().is_some_and(is_protocol_timestamp),
                 "identifier" => value.as_str().is_some_and(is_protocol_identifier),
                 "room" => value.as_str().is_some_and(is_protocol_room),
@@ -283,5 +376,21 @@ mod tests {
             packet["body"] = Value::String(body);
             assert_eq!(is_message_packet(&packet), expected);
         }
+    }
+
+    #[test]
+    fn compact_envelope_limit_counts_json_escaping() {
+        let value = serde_json::json!({
+            "version": 1,
+            "type": "message",
+            "id": "m1",
+            "room": "room1",
+            "sender": "device1",
+            "senderName": "Amina",
+            "createdAt": "2026-10-14T12:00:00Z",
+            "body": "\u{1}".repeat(4_000)
+        });
+        assert!(serde_json::to_vec(&value).unwrap().len() > MAX_PROTOCOL_ENVELOPE_BYTES);
+        assert!(!is_message_packet(&value));
     }
 }

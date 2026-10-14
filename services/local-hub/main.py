@@ -30,8 +30,13 @@ MAX_ROOMS = 64
 MAX_ROOM_MEMBERS = 32
 MAX_TOTAL_CLIENTS = 256
 MAX_MESSAGES_PER_MINUTE = 120
+MAX_HISTORY_REQUESTS_PER_MINUTE = 30
 SEND_TIMEOUT_SECONDS = 2
 MAX_REPLAY_MESSAGES = 100
+MAX_HISTORY_PAGE_MESSAGES = 100
+MAX_HISTORY_PAGE_BYTES = 512 * 1024
+MAX_PROTOCOL_PACKET_BYTES = 18 * 1024
+MAX_HISTORY_PAGE_SEND_SECONDS = 5
 MAX_MESSAGES_PER_ROOM = 200
 MAX_TOTAL_STORED_MESSAGES = 2_000
 MAX_TRACKED_ROOMS = MAX_TOTAL_STORED_MESSAGES + MAX_ROOMS
@@ -59,6 +64,8 @@ class Client:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     message_window_started: float = field(default_factory=monotonic)
     messages_in_window: int = 0
+    history_window_started: float = field(default_factory=monotonic)
+    history_requests_in_window: int = 0
 
     def consume_message(self) -> bool:
         now = monotonic()
@@ -68,6 +75,16 @@ class Client:
         if self.messages_in_window >= MAX_MESSAGES_PER_MINUTE:
             return False
         self.messages_in_window += 1
+        return True
+
+    def consume_history_request(self) -> bool:
+        now = monotonic()
+        if now - self.history_window_started >= 60:
+            self.history_window_started = now
+            self.history_requests_in_window = 0
+        if self.history_requests_in_window >= MAX_HISTORY_REQUESTS_PER_MINUTE:
+            return False
+        self.history_requests_in_window += 1
         return True
 
 
@@ -203,6 +220,26 @@ class MessageStore:
             connection.executemany("DELETE FROM room_state WHERE room = ?", [(row["room"],) for row in removed])
             connection.execute("UPDATE store_state SET marker_overflow = 1 WHERE id = 1")
 
+    @staticmethod
+    def _prune_unpageable_messages(connection: sqlite3.Connection, room: str) -> None:
+        rows = connection.execute(
+            "SELECT sequence, packet FROM messages WHERE room = ?", (room,)
+        ).fetchall()
+        invalid_sequences = []
+        for row in rows:
+            try:
+                packet = json.loads(row["packet"])
+            except (json.JSONDecodeError, ValueError):
+                packet = None
+            if not valid_stored_message(packet, room):
+                invalid_sequences.append(row["sequence"])
+        if invalid_sequences:
+            connection.executemany(
+                "DELETE FROM messages WHERE sequence = ?",
+                [(sequence,) for sequence in invalid_sequences],
+            )
+            MessageStore._touch_room(connection, room, truncated=True)
+
     def store(self, packet: dict[str, Any]) -> str:
         encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
         try:
@@ -292,6 +329,86 @@ class MessageStore:
         connection.execute("PRAGMA incremental_vacuum(16)")
         self._secure_sidecars()
 
+    def history_page(
+        self, room: str, cursor: str | None, limit: int
+    ) -> tuple[list[dict[str, Any]], int, str | None, bool, bool, str | None]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cutoff = time() - MESSAGE_RETENTION_SECONDS
+            expired_rooms = connection.execute(
+                "SELECT DISTINCT room FROM messages WHERE stored_at < ?", (cutoff,)
+            ).fetchall()
+            connection.execute("DELETE FROM messages WHERE stored_at < ?", (cutoff,))
+            for expired_room in expired_rooms:
+                self._touch_room(connection, expired_room["room"], truncated=True)
+            self._trim_room_markers(connection)
+            self._prune_unpageable_messages(connection, room)
+            if cursor is None:
+                rows = connection.execute(
+                    """SELECT sequence, message_id, packet FROM messages WHERE room = ?
+                       ORDER BY sequence DESC LIMIT ?""",
+                    (room, limit),
+                ).fetchall()
+            else:
+                anchor = connection.execute(
+                    "SELECT sequence FROM messages WHERE room = ? AND message_id = ?",
+                    (room, cursor),
+                ).fetchone()
+                if anchor is None:
+                    state = connection.execute(
+                        "SELECT history_truncated FROM room_state WHERE room = ?", (room,)
+                    ).fetchone()
+                    marker_overflow = connection.execute(
+                        "SELECT marker_overflow FROM store_state WHERE id = 1"
+                    ).fetchone()[0]
+                    connection.commit()
+                    return [], 0, None, False, bool(
+                        (state is not None and state["history_truncated"]) or marker_overflow
+                    ), "invalid_cursor"
+                rows = connection.execute(
+                    """SELECT sequence, message_id, packet FROM messages
+                       WHERE room = ? AND sequence < ? ORDER BY sequence DESC LIMIT ?""",
+                    (room, anchor["sequence"], limit),
+                ).fetchall()
+            state = connection.execute(
+                "SELECT history_truncated FROM room_state WHERE room = ?", (room,)
+            ).fetchone()
+            marker_overflow = connection.execute(
+                "SELECT marker_overflow FROM store_state WHERE id = 1"
+            ).fetchone()[0]
+            packets: list[dict[str, Any]] = []
+            page_bytes = 0
+            last_sequence: int | None = None
+            last_id: str | None = None
+            for row in rows:
+                packet = json.loads(row["packet"])
+                packet_bytes = len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                if packet_bytes > MAX_PROTOCOL_PACKET_BYTES:
+                    connection.commit()
+                    return [], 0, None, False, False, "history_packet_too_large"
+                if page_bytes + packet_bytes > MAX_HISTORY_PAGE_BYTES:
+                    break
+                packets.append(packet)
+                page_bytes += packet_bytes
+                last_sequence = row["sequence"]
+                last_id = row["message_id"]
+
+            has_more = False
+            if last_sequence is not None:
+                has_more = connection.execute(
+                    "SELECT 1 FROM messages WHERE room = ? AND sequence < ? LIMIT 1",
+                    (room, last_sequence),
+                ).fetchone() is not None
+            truncated = (state is not None and bool(state["history_truncated"])) or bool(marker_overflow)
+            connection.commit()
+            return packets, page_bytes, last_id if has_more else None, has_more, truncated, None
+        except sqlite3.Error:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def recent(self, room: str) -> tuple[list[dict[str, Any]], bool]:
         connection = self._connect()
         try:
@@ -304,9 +421,7 @@ class MessageStore:
             for expired_room in expired_rooms:
                 self._touch_room(connection, expired_room["room"], truncated=True)
             self._trim_room_markers(connection)
-            count = connection.execute(
-                "SELECT COUNT(*) FROM messages WHERE room = ?", (room,)
-            ).fetchone()[0]
+            self._prune_unpageable_messages(connection, room)
             state = connection.execute(
                 "SELECT history_truncated FROM room_state WHERE room = ?", (room,)
             ).fetchone()
@@ -318,11 +433,7 @@ class MessageStore:
                    ORDER BY sequence DESC LIMIT ?""",
                 (room, self.replay_limit),
             ).fetchall()
-            truncated = (
-                count > self.replay_limit
-                or (state is not None and bool(state["history_truncated"]))
-                or bool(marker_overflow)
-            )
+            truncated = (state is not None and bool(state["history_truncated"])) or bool(marker_overflow)
             connection.commit()
             return [json.loads(row["packet"]) for row in reversed(rows)], truncated
         except sqlite3.Error:
@@ -397,6 +508,39 @@ def valid_timestamp(value: Any) -> bool:
     return parsed.tzinfo is not None
 
 
+def compact_json_bytes(value: Any) -> bytes | None:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+
+
+def valid_stored_message(packet: Any, room: str) -> bool:
+    if not isinstance(packet, dict) or not valid_version(packet) or packet.get("type") != "message":
+        return False
+    message_id = packet.get("id")
+    sender = packet.get("sender")
+    sender_name = packet.get("senderName")
+    created_at = packet.get("createdAt")
+    body = packet.get("body")
+    if (
+        not valid_identifier(message_id)
+        or packet.get("room") != room
+        or not valid_identifier(sender, MAX_SENDER_LENGTH)
+        or not valid_text(sender_name, MAX_NAME_LENGTH)
+        or not valid_timestamp(created_at)
+        or not isinstance(body, str)
+        or not body.strip()
+    ):
+        return False
+    try:
+        body_size = len(body.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+    encoded = compact_json_bytes(packet)
+    return body_size <= MAX_BODY_BYTES and encoded is not None and len(encoded) <= MAX_PROTOCOL_PACKET_BYTES
+
+
 def validate_join(packet: Any) -> tuple[str, str, str] | None:
     if not isinstance(packet, dict) or not valid_version(packet) or packet.get("type") != "join":
         return None
@@ -435,7 +579,7 @@ def validate_message(packet: Any, client: Client) -> tuple[dict[str, Any] | None
     if room != client.room or sender != client.sender or sender_name.strip() != client.sender_name:
         return None, "invalid_packet"
 
-    return {
+    normalized = {
         "version": PROTOCOL_VERSION,
         "type": "message",
         "id": message_id,
@@ -444,7 +588,29 @@ def validate_message(packet: Any, client: Client) -> tuple[dict[str, Any] | None
         "senderName": client.sender_name,
         "createdAt": created_at,
         "body": body,
-    }, None
+    }
+    encoded_size = len(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    if encoded_size > MAX_PROTOCOL_PACKET_BYTES:
+        return None, "message_too_large"
+    return normalized, None
+
+
+def validate_history_request(packet: Any) -> dict[str, Any] | None:
+    if not isinstance(packet, dict) or not valid_version(packet) or packet.get("type") != "history_request":
+        return None
+    request_id = packet.get("requestId")
+    room = packet.get("room")
+    cursor = packet.get("cursor")
+    limit = packet.get("limit")
+    if (
+        not valid_identifier(request_id)
+        or not valid_room(room)
+        or (cursor is not None and not valid_identifier(cursor))
+        or type(limit) is not int
+        or not 1 <= limit <= MAX_HISTORY_PAGE_MESSAGES
+    ):
+        return None
+    return {"requestId": request_id, "room": room, "cursor": cursor, "limit": limit}
 
 
 async def broadcast_presence(room: str) -> None:
@@ -521,6 +687,61 @@ async def relay(client: Client, packet: dict[str, Any]) -> bool:
         return ack_failed
 
 
+async def send_history_page(client: Client, request: dict[str, Any]) -> None:
+    room = request["room"]
+    async with room_delivery_lock:
+        if client not in rooms.get(room, set()) or room != client.room:
+            await send_packet(client, packet_error("not_joined", "Join this room before requesting history."))
+            return
+        if not client.consume_history_request():
+            await send_packet(client, packet_error("rate_limited", "Please wait before requesting more history."))
+            return
+        try:
+            packets, page_bytes, next_cursor, has_more, truncated, error = await asyncio.to_thread(
+                message_store.history_page, room, request["cursor"], request["limit"]
+            )
+        except (OSError, sqlite3.Error):
+            await send_packet(client, packet_error("storage_unavailable", "The local hub could not load room history."))
+            return
+        if error == "invalid_cursor":
+            response = packet_error("invalid_cursor", "The history cursor is no longer available.")
+            response["historyTruncated"] = truncated
+            await send_packet(client, response)
+            return
+        if error == "history_packet_too_large":
+            await send_packet(client, packet_error("history_packet_too_large", "A retained history packet exceeds the page limit."))
+            return
+
+        completion = {
+            "version": PROTOCOL_VERSION,
+            "type": "history_page_complete",
+            "requestId": request["requestId"],
+            "room": room,
+            "messageIds": [packet["id"] for packet in packets],
+            "pageBytes": page_bytes,
+            "nextCursor": next_cursor,
+            "hasMore": has_more,
+            "historyTruncated": truncated,
+        }
+        encoded_size = len(json.dumps(completion, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if encoded_size > MAX_PROTOCOL_PACKET_BYTES:
+            await send_packet(client, packet_error("history_page_too_large", "History page metadata exceeds the packet limit."))
+            return
+        async def send_page() -> None:
+            for packet in packets:
+                await send_packet(client, packet)
+            await send_packet(client, completion)
+
+        try:
+            await asyncio.wait_for(send_page(), timeout=MAX_HISTORY_PAGE_SEND_SECONDS)
+        except asyncio.TimeoutError:
+            await remove_client(client)
+            try:
+                await client.websocket.close(code=1013)
+            except Exception:
+                pass
+
+
 async def remove_client(client: Client) -> None:
     members = rooms.get(client.room)
     if members is None or client not in members:
@@ -553,6 +774,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         except (json.JSONDecodeError, ValueError):
             await send_error(websocket, "invalid_packet", "Expected a valid JSON join packet.")
             await websocket.close(code=1003)
+            return
+        compact_packet = compact_json_bytes(join_packet)
+        if compact_packet is None:
+            await send_error(websocket, "invalid_packet", "Join packet contains invalid text.")
+            await websocket.close(code=1008)
+            return
+        if len(compact_packet) > MAX_PROTOCOL_PACKET_BYTES:
+            await send_error(websocket, "message_too_large", "Packet exceeds the protocol size limit.")
+            await websocket.close(code=1009)
             return
         join = validate_join(join_packet)
         if join is None:
@@ -620,10 +850,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except (json.JSONDecodeError, ValueError):
                 await send_error(websocket, "invalid_packet", "Expected a valid JSON message packet.")
                 continue
+            compact_packet = compact_json_bytes(incoming)
+            if compact_packet is None:
+                await send_packet(client, packet_error("invalid_packet", "Packet contains invalid text."))
+                continue
+            if len(compact_packet) > MAX_PROTOCOL_PACKET_BYTES:
+                await send_packet(client, packet_error("message_too_large", "Packet exceeds the protocol size limit."))
+                continue
+            if isinstance(incoming, dict) and incoming.get("type") == "history_request":
+                request = validate_history_request(incoming)
+                if request is None:
+                    await send_packet(client, packet_error("invalid_packet", "History request does not match protocol version 1."))
+                    continue
+                await send_history_page(client, request)
+                continue
             message, error = validate_message(incoming, client)
             if error is not None:
                 text = "Room is required or invalid." if error == "room_required" else (
-                    "Message body exceeds the maximum size." if error == "message_too_large" else
+                    "Message exceeds the maximum packet size." if error == "message_too_large" else
                     "Packet does not match protocol version 1."
                 )
                 message_id = incoming.get("id") if isinstance(incoming, dict) else None

@@ -248,6 +248,8 @@ impl MessageIndex {
         if !within_packet_complexity_limit(&packet) {
             return Err(SyncError::EnvelopeComplexityLimit);
         }
+        let encoded_len = compact_json_len_with_limit(&packet, MAX_ENVELOPE_BYTES)
+            .ok_or(SyncError::EnvelopeTooLarge)?;
         if !is_message_packet(&packet) {
             return Err(SyncError::InvalidMessage);
         }
@@ -265,8 +267,6 @@ impl MessageIndex {
                 Err(SyncError::MessageConflict)
             };
         }
-        let encoded_len = compact_json_len_with_limit(&packet, MAX_ENVELOPE_BYTES)
-            .ok_or(SyncError::EnvelopeTooLarge)?;
         if self.messages.len() >= MAX_INDEX_MESSAGES {
             return Err(SyncError::IndexMessageLimit);
         }
@@ -388,7 +388,7 @@ mod tests {
         oversized_conflict["extension"] = Value::String("\0".repeat(4_000));
         assert_eq!(
             index.insert(oversized_conflict),
-            Err(SyncError::MessageConflict)
+            Err(SyncError::EnvelopeTooLarge)
         );
         assert_eq!(index.encoded_bytes(), bytes);
         assert_eq!(

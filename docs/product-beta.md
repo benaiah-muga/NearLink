@@ -69,9 +69,17 @@ offline.
 4. Send short test messages in both directions. The sender should see hub
    acceptance; the recipient should see the message after saving it locally.
 5. Disconnect one browser, send a test message from the other, then reconnect.
-   Confirm what history is replayed and whether the app warns that older history
-   may be missing. History is bounded and can expire or be evicted.
+   The hub replays its joined-room messages first. Use **Load older messages**
+   to request retained pages, and confirm each page appears in the hub's
+   accepted order. The next page uses the oldest ID from the previous page as
+   its exclusive boundary. Page retries reuse that boundary and deduplicate
+   messages already saved on the device. The app warns when history may have a
+   retention gap. History is bounded and can expire or be evicted.
 6. Reload each page and confirm which messages remain on that device.
+
+Older history pages require a hub with versioned history support. If the app
+reports that the hub does not support history pages, update the local hub before
+trying this step. A failed page save can be retried without moving its cursor.
 
 The hub stores plaintext in its local SQLite database. Anyone who can read that
 database can read message contents. Protect it as sensitive data and use only

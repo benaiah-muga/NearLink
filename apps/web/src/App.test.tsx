@@ -1,10 +1,17 @@
 // @vitest-environment jsdom
 import "fake-indexeddb/auto";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { MessagePacket } from "@nearlink/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const messageReadGate = vi.hoisted(() => ({
   room: null as string | null,
+  readGateAfter: null as number | null,
+  identityPending: null as Promise<import("./lib/storage").LocalIdentity | null> | null,
+  reconcilePendingId: null as string | null,
+  reconcilePending: null as Promise<void> | null,
+  releaseReconcile: null as (() => void) | null,
+  reconcileStarted: false,
   pending: null as Promise<unknown> | null,
   releaseRead: null as (() => void) | null,
   requestedRooms: [] as string[],
@@ -53,9 +60,18 @@ vi.mock("./lib/storage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/storage")>();
   return {
     ...actual,
+    loadIdentity: () => messageReadGate.identityPending ?? actual.loadIdentity(),
+    reconcileHubReplayOrder: async (...args: Parameters<typeof actual.reconcileHubReplayOrder>) => {
+      if (args[1].includes(messageReadGate.reconcilePendingId ?? "") && messageReadGate.reconcilePending) {
+        messageReadGate.reconcileStarted = true;
+        await messageReadGate.reconcilePending;
+      }
+      return actual.reconcileHubReplayOrder(...args);
+    },
     loadMessages: (room: string) => {
       messageReadGate.requestedRooms.push(room);
-      if (room === messageReadGate.room && messageReadGate.pending) {
+      const roomReadCount = messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === room).length;
+      if (room === messageReadGate.room && messageReadGate.pending && (messageReadGate.readGateAfter === null || roomReadCount >= messageReadGate.readGateAfter)) {
         return messageReadGate.pending as ReturnType<typeof actual.loadMessages>;
       }
       return actual.loadMessages(room);
@@ -98,7 +114,7 @@ vi.mock("./lib/storage", async (importOriginal) => {
 });
 
 import App from "./App";
-import { beginRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, saveMessage, type StoredMessage } from "./lib/storage";
+import { beginRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, saveMessage, type LocalIdentity, type StoredMessage } from "./lib/storage";
 
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, "storage");
 const originalClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
@@ -184,12 +200,13 @@ async function resetDatabase(): Promise<void> {
     request.onblocked = () => reject(new Error("Test database deletion was blocked."));
   });
   await new Promise<void>((resolve, reject) => {
-    const request = indexedDB.open("nearlink-local", 3);
+    const request = indexedDB.open("nearlink-local", 4);
     request.onupgradeneeded = () => {
       const database = request.result;
       const messages = database.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
       messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
       messages.createIndex("roomDeliveryCreatedAt", ["packet.room", "delivery", "packet.createdAt"]);
+      messages.createIndex("roomDisplayOrder", ["packet.room", "displayOrder"]);
       database.createObjectStore("identity", { keyPath: "key" });
       database.createObjectStore("roomDeletions", { keyPath: "room" });
     };
@@ -204,10 +221,39 @@ async function resetDatabase(): Promise<void> {
   });
 }
 
+function hubMessage(id: string, createdAt: string, body = id): MessagePacket {
+  return { version: 1, type: "message", id, room: ROOM, sender: "station-b", senderName: "Bea", createdAt, body };
+}
+
+function sendHistoryCompletion(socket: MockWebSocket, packets: ReturnType<typeof hubMessage>[], nextCursor: string | null, hasMore: boolean) {
+  const historyRequest = JSON.parse(socket.sent.filter((item) => JSON.parse(item).type === "history_request").at(-1)!);
+  const pageBytes = packets.reduce((total, packet) => total + new TextEncoder().encode(JSON.stringify(packet)).byteLength, 0);
+  socket.receive({ version: 1, type: "history_page_complete", requestId: historyRequest.requestId, room: ROOM, messageIds: packets.map((packet) => packet.id), pageBytes, nextCursor, hasMore, historyTruncated: false });
+}
+
+async function connectTestHub(sendReplayBoundary = true): Promise<MockWebSocket> {
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+  await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+  const socket = MockWebSocket.instances[0];
+  act(() => socket.open());
+  act(() => socket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+  if (sendReplayBoundary) act(() => socket.receive({ version: 1, type: "presence", room: ROOM, peers: 1 }));
+  await screen.findByText("On frequency");
+  return socket;
+}
+
 beforeEach(async () => {
   wasmGate.fail = false;
   MockWebSocket.instances = [];
   messageReadGate.room = null;
+  messageReadGate.readGateAfter = null;
+  messageReadGate.identityPending = null;
+  messageReadGate.reconcilePendingId = null;
+  messageReadGate.reconcilePending = null;
+  messageReadGate.releaseReconcile = null;
+  messageReadGate.reconcileStarted = false;
   messageReadGate.pending = null;
   messageReadGate.releaseRead = null;
   messageReadGate.requestedRooms = [];
@@ -316,6 +362,23 @@ describe("browser storage retention feedback", () => {
 });
 
 describe("browser app messaging flow", () => {
+  it("preserves a call sign typed before the saved identity finishes loading", async () => {
+    let finishIdentity!: (identity: LocalIdentity | null) => void;
+    messageReadGate.identityPending = new Promise((resolve) => { finishIdentity = resolve; });
+    render(<App />);
+
+    const callSign = screen.getByLabelText("Your call sign") as HTMLInputElement;
+    fireEvent.change(callSign, { target: { value: "Quick Station" } });
+    expect(callSign.value).toBe("Quick Station");
+
+    await act(async () => {
+      finishIdentity(IDENTITY);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save and join room" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(callSign.value).toBe("Quick Station");
+  });
+
   it("shows and copies only privacy-safe states and counts for the loaded room", async () => {
     const sensitive = {
       room: "private-room-code-9f2a",
@@ -434,7 +497,7 @@ describe("browser app messaging flow", () => {
     await waitFor(() => expect(socket.readyState).toBe(MockWebSocket.CLOSED));
     expect(await loadMessages(ROOM)).toEqual([]);
     expect(document.activeElement).toBe(screen.getByText(/Saved and queued messages for this room were deleted/).closest('[role="status"]'));
-    expect(await loadMessages("another-room")).toEqual([otherRoomMessage]);
+    expect(await loadMessages("another-room")).toMatchObject([otherRoomMessage]);
     expect(await loadIdentity()).toEqual(IDENTITY);
     expect(localStorage.getItem("nearlink.room")).toBe(ROOM);
     expect(localStorage.getItem("nearlink.hub")).toBe("ws://localhost:8000/ws");
@@ -552,7 +615,7 @@ describe("browser app messaging flow", () => {
     await screen.findByText(/room remains locked on this device/i);
     expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(true);
     expect(await isRoomMessagesDeleted(ROOM)).toBe(true);
-    expect(await loadMessages(ROOM)).toEqual([saved]);
+    expect(await loadMessages(ROOM)).toMatchObject([saved]);
     expect((screen.getByRole("button", { name: "Clear this device's saved conversation" }) as HTMLButtonElement).disabled).toBe(false);
 
     messageReadGate.failDeleteRoomMessages = false;
@@ -708,6 +771,179 @@ describe("browser app messaging flow", () => {
     expect(document.querySelectorAll(".message-incoming")).toHaveLength(1);
   });
 
+  it("loads retained history page by page in hub order rather than timestamp order", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    const boundary = hubMessage("history-boundary", "2026-10-14T08:00:00.000Z");
+    act(() => socket.receive(boundary));
+    await screen.findByText(boundary.body);
+
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(JSON.parse(socket.sent.at(-1)!).type).toBe("history_request"));
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ cursor: boundary.id, room: ROOM });
+    const newestFirst = [
+      hubMessage("page-one-newest", "2026-10-14T07:00:00.000Z"),
+      hubMessage("page-one-oldest", "2026-10-14T23:00:00.000Z"),
+    ];
+    act(() => { socket.receive(newestFirst[0]); socket.receive(newestFirst[1]); sendHistoryCompletion(socket, newestFirst, "page-one-oldest", true); });
+    await screen.findByText(newestFirst[1].body);
+    await waitFor(async () => expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual([
+      "page-one-oldest", "page-one-newest", "history-boundary",
+    ]));
+
+    await screen.findByRole("button", { name: "Load older messages" });
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(JSON.parse(socket.sent.at(-1)!).cursor).toBe("page-one-oldest"));
+    const secondPage = [
+      hubMessage("page-two-newest", "2026-10-14T06:00:00.000Z"),
+      hubMessage("page-two-oldest", "2026-10-14T22:00:00.000Z"),
+    ];
+    act(() => { socket.receive(secondPage[0]); socket.receive(secondPage[1]); sendHistoryCompletion(socket, secondPage, null, false); });
+    await screen.findByText(secondPage[1].body);
+    await waitFor(async () => expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual([
+      "page-two-oldest", "page-two-newest", "page-one-oldest", "page-one-newest", "history-boundary",
+    ]));
+    await screen.findByText("No more retained hub history is available.");
+  });
+
+  it("resets unsupported history paging when joining a different hub URL", async () => {
+    render(<App />);
+    const oldHub = await connectTestHub();
+    const oldBoundary = hubMessage("old-hub-boundary", "2026-10-14T10:00:00.000Z");
+    act(() => oldHub.receive(oldBoundary));
+    await screen.findByText(oldBoundary.body);
+
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(JSON.parse(oldHub.sent.at(-1)!).type).toBe("history_request"));
+    act(() => oldHub.receive({ version: 1, type: "error", code: "invalid_packet", message: "History pages are unavailable." }));
+    await screen.findByText(/This hub does not support older history pages/);
+
+    fireEvent.change(screen.getByLabelText("Hub address"), { target: { value: "ws://new-hub.local:8000/ws" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save and join room" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    const newHub = MockWebSocket.instances[1];
+    act(() => newHub.open());
+    act(() => newHub.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await screen.findByText("On frequency");
+    const newBoundary = hubMessage("new-hub-boundary", "2026-10-14T11:00:00.000Z");
+    act(() => newHub.receive(newBoundary));
+    await screen.findByText(newBoundary.body);
+
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(JSON.parse(newHub.sent.at(-1)!).type).toBe("history_request"));
+    expect(JSON.parse(newHub.sent.at(-1)!)).toMatchObject({ type: "history_request", cursor: oldBoundary.id, room: ROOM });
+  });
+
+  it("repairs legacy hub order from join replay while preserving direct message order", async () => {
+    const replayedLater: StoredMessage = {
+      packet: hubMessage("legacy-hub-later", "2026-10-14T08:00:00.000Z"),
+      direction: "incoming", delivery: "sent", transport: "hub", displayOrder: 0,
+    };
+    const direct: StoredMessage = {
+      packet: { ...hubMessage("direct-between-hub-rows", "2026-10-14T09:00:00.000Z"), sender: IDENTITY.sender, senderName: IDENTITY.senderName },
+      direction: "incoming", delivery: "sent", transport: "direct", displayOrder: 1,
+    };
+    const replayedEarlier: StoredMessage = {
+      packet: hubMessage("legacy-hub-earlier", "2026-10-14T22:00:00.000Z"),
+      direction: "incoming", delivery: "sent", transport: "hub", displayOrder: 2,
+    };
+    await saveMessage(replayedLater);
+    await saveMessage(direct);
+    await saveMessage(replayedEarlier);
+    messageReadGate.reconcilePendingId = replayedEarlier.packet.id;
+    messageReadGate.reconcilePending = new Promise((resolve) => { messageReadGate.releaseReconcile = resolve; });
+
+    render(<App />);
+    const socket = await connectTestHub(false);
+    await screen.findByText(replayedLater.packet.body);
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(JSON.parse(socket.sent.at(-1)!).type).toBe("history_request"));
+    act(() => {
+      socket.receive(replayedEarlier.packet);
+      socket.receive(replayedLater.packet);
+      socket.receive({ version: 1, type: "presence", room: ROOM, peers: 1 });
+      socket.receive({ version: 1, type: "error", code: "history_page_too_large", message: "Retry with a smaller page." });
+    });
+    await waitFor(() => expect(messageReadGate.reconcileStarted).toBe(true));
+    act(() => messageReadGate.releaseReconcile?.());
+    await screen.findByText(replayedEarlier.packet.body);
+    await waitFor(async () => expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual([
+      replayedEarlier.packet.id,
+      direct.packet.id,
+      replayedLater.packet.id,
+    ]));
+  });
+
+  it("does not apply a delayed replay reload after switching rooms", async () => {
+    const replay: StoredMessage = {
+      packet: hubMessage("delayed-room-replay", "2026-10-14T10:00:00.000Z", "Old room replay"),
+      direction: "incoming", delivery: "sent", transport: "hub",
+    };
+    await saveMessage(replay);
+    render(<App />);
+    const socket = await connectTestHub();
+    await screen.findByText(replay.packet.body);
+    const staleRows = await loadMessages(ROOM);
+    messageReadGate.requestedRooms = [];
+    messageReadGate.room = ROOM;
+    messageReadGate.readGateAfter = 2;
+    messageReadGate.pending = new Promise((resolve) => { messageReadGate.releaseRead = () => resolve(staleRows); });
+
+    act(() => socket.receive(replay.packet));
+    await waitFor(() => expect(messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === ROOM)).toHaveLength(2));
+    fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "next-room" } });
+    await screen.findByRole("log", { name: "Messages in next-room" });
+    await waitFor(() => expect((screen.getByLabelText("Room frequency") as HTMLInputElement).value).toBe("next-room"));
+
+    act(() => messageReadGate.releaseRead?.());
+    await waitFor(() => expect(screen.queryByText(replay.packet.body)).toBeNull());
+    expect((await loadMessages("next-room")).map((item) => item.packet.id)).toEqual([]);
+  });
+
+  it("serializes history completion with live traffic and retries a failed page at the same cursor", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    const boundary = hubMessage("overlap-boundary", "2026-10-14T10:00:00.000Z");
+    act(() => socket.receive(boundary));
+    await screen.findByText(boundary.body);
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(JSON.parse(socket.sent.at(-1)!).type).toBe("history_request"));
+    const originalRequest = JSON.parse(socket.sent.at(-1)!);
+    const page = [hubMessage("retry-page-new", "2026-10-14T09:00:00.000Z"), hubMessage("retry-page-old", "2026-10-14T11:00:00.000Z")];
+    const live = hubMessage("live-during-page", "2026-10-14T01:00:00.000Z");
+    messageReadGate.failNextSaveIds.push(page[0].id);
+    act(() => { socket.receive(page[0]); socket.receive(page[1]); socket.receive(live); sendHistoryCompletion(socket, page, page[1].id, true); });
+    await screen.findByRole("button", { name: "Retry loading older messages" });
+    expect(JSON.parse(socket.sent.filter((item) => JSON.parse(item).type === "history_request")[0]).cursor).toBe(originalRequest.cursor);
+    expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual(["overlap-boundary", "retry-page-old", "live-during-page"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading older messages" }));
+    await waitFor(() => expect(socket.sent.filter((item) => JSON.parse(item).type === "history_request")).toHaveLength(2));
+    expect(JSON.parse(socket.sent.filter((item) => JSON.parse(item).type === "history_request")[1]).cursor).toBe(originalRequest.cursor);
+    act(() => { socket.receive(page[0]); socket.receive(page[1]); sendHistoryCompletion(socket, page, page[1].id, true); });
+    await screen.findByText(page[0].body);
+    await waitFor(async () => expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual([
+      "retry-page-old", "retry-page-new", "overlap-boundary", "live-during-page",
+    ]));
+    expect(document.querySelectorAll(".message-incoming")).toHaveLength(4);
+  });
+
+  it("does not advance history after the room deletion tombstone blocks a page", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    const boundary = hubMessage("tombstone-boundary", "2026-10-14T10:00:00.000Z");
+    act(() => socket.receive(boundary));
+    await screen.findByText(boundary.body);
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(JSON.parse(socket.sent.at(-1)!).type).toBe("history_request"));
+    const page = [hubMessage("tombstone-page", "2026-10-14T09:00:00.000Z")];
+    await beginRoomDeletion(ROOM);
+    act(() => { socket.receive(page[0]); sendHistoryCompletion(socket, page, page[0].id, true); });
+    await screen.findByRole("button", { name: "Retry loading older messages" });
+    expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual(["tombstone-boundary"]);
+    expect(socket.sent.filter((item) => JSON.parse(item).type === "history_request")).toHaveLength(1);
+  });
+
   it("retries an inbound hub replay after local save fails", async () => {
     render(<App />);
     await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
@@ -774,9 +1010,9 @@ describe("browser app messaging flow", () => {
       socket.receive(replay.packet);
       socket.receive(replay.packet);
     });
-    await waitFor(() => expect(messageReadGate.requestedRooms.filter((room) => room === ROOM)).toHaveLength(2));
+    await waitFor(() => expect(messageReadGate.requestedRooms.filter((room) => room === ROOM).length).toBeGreaterThanOrEqual(2));
 
-    expect(await loadMessages(ROOM)).toEqual([replay]);
+    expect(await loadMessages(ROOM)).toMatchObject([replay]);
     expect(document.querySelectorAll(".message-incoming")).toHaveLength(1);
   });
 
@@ -810,7 +1046,7 @@ describe("browser app messaging flow", () => {
     act(() => socket.receive({ ...saved.packet, body: "Different replay content" }));
     await screen.findByText(/conflicts with saved message content/);
 
-    expect(await loadMessages(ROOM)).toEqual([saved]);
+    expect(await loadMessages(ROOM)).toMatchObject([saved]);
     expect(screen.getByText(saved.packet.body)).toBeTruthy();
     expect(screen.queryByText("Different replay content")).toBeNull();
     expect(messageReadGate.saveAttempts.get(saved.packet.id) ?? 0).toBe(0);

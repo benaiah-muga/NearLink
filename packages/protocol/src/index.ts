@@ -4,6 +4,9 @@ export const ROOM_PATTERN = /^[A-Za-z0-9_-]{1,64}(?![\s\S])/;
 export const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})(?![\s\S])/;
 export const MAX_MESSAGE_BODY_BYTES = 16 * 1024;
 export const MAX_DISPLAY_NAME_LENGTH = 64;
+export const MAX_HISTORY_PAGE_MESSAGES = 100;
+export const MAX_HISTORY_PAGE_BYTES = 512 * 1024;
+export const MAX_PROTOCOL_ENVELOPE_BYTES = 18 * 1024;
 const HUB_WHITESPACE = "\u0009-\u000d\u001c-\u001f\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000";
 const HUB_WHITESPACE_AT_EDGES = new RegExp(`^[${HUB_WHITESPACE}]+|[${HUB_WHITESPACE}]+$`, "gu");
 
@@ -63,6 +66,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isEnvelopeWithinLimit(value: unknown): boolean {
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === "string"
+      && new TextEncoder().encode(encoded).byteLength <= MAX_PROTOCOL_ENVELOPE_BYTES;
+  } catch {
+    return false;
+  }
+}
+
 export interface JoinPacket {
   version: typeof PROTOCOL_VERSION;
   type: "join";
@@ -80,6 +93,27 @@ export interface MessagePacket {
   senderName: string;
   createdAt: string;
   body: string;
+}
+
+export interface HistoryRequestPacket {
+  version: typeof PROTOCOL_VERSION;
+  type: "history_request";
+  requestId: string;
+  room: string;
+  cursor: string | null;
+  limit: number;
+}
+
+export interface HistoryPageCompletePacket {
+  version: typeof PROTOCOL_VERSION;
+  type: "history_page_complete";
+  requestId: string;
+  room: string;
+  messageIds: string[];
+  pageBytes: number;
+  nextCursor: string | null;
+  hasMore: boolean;
+  historyTruncated: boolean;
 }
 
 export interface JoinedPacket {
@@ -112,21 +146,26 @@ export interface ErrorPacket {
     | "capacity_reached"
     | "rate_limited"
     | "message_conflict"
-    | "storage_unavailable";
+    | "storage_unavailable"
+    | "not_joined"
+    | "invalid_cursor"
+    | "history_packet_too_large"
+    | "history_page_too_large";
   message: string;
   id?: string;
 }
 
-export type ClientPacket = JoinPacket | MessagePacket;
+export type ClientPacket = JoinPacket | MessagePacket | HistoryRequestPacket;
 export type ServerPacket =
   | JoinedPacket
   | MessagePacket
   | AcknowledgmentPacket
   | PresencePacket
-  | ErrorPacket;
+  | ErrorPacket
+  | HistoryPageCompletePacket;
 
 export function isJoinPacket(value: unknown): value is JoinPacket {
-  if (!isRecord(value)) return false;
+  if (!isRecord(value) || !isEnvelopeWithinLimit(value)) return false;
   return value.version === PROTOCOL_VERSION
     && value.type === "join"
     && isProtocolRoom(value.room)
@@ -135,7 +174,7 @@ export function isJoinPacket(value: unknown): value is JoinPacket {
 }
 
 export function isMessagePacket(value: unknown): value is MessagePacket {
-  if (!isRecord(value)) return false;
+  if (!isRecord(value) || !isEnvelopeWithinLimit(value)) return false;
   return (
     value.version === PROTOCOL_VERSION &&
     value.type === "message" &&
@@ -151,10 +190,48 @@ export function isMessagePacket(value: unknown): value is MessagePacket {
   );
 }
 
+export function isHistoryRequestPacket(value: unknown): value is HistoryRequestPacket {
+  if (!isRecord(value) || !isEnvelopeWithinLimit(value)) return false;
+  return value.version === PROTOCOL_VERSION
+    && value.type === "history_request"
+    && isProtocolIdentifier(value.requestId)
+    && isProtocolRoom(value.room)
+    && (value.cursor === null || isProtocolIdentifier(value.cursor))
+    && Number.isInteger(value.limit)
+    && Number(value.limit) >= 1
+    && Number(value.limit) <= MAX_HISTORY_PAGE_MESSAGES;
+}
+
+export function isHistoryPageCompletePacket(value: unknown): value is HistoryPageCompletePacket {
+  if (!isRecord(value)
+    || !isEnvelopeWithinLimit(value)
+    || value.version !== PROTOCOL_VERSION
+    || value.type !== "history_page_complete"
+    || !isProtocolIdentifier(value.requestId)
+    || !isProtocolRoom(value.room)
+    || !Array.isArray(value.messageIds)
+    || value.messageIds.length > MAX_HISTORY_PAGE_MESSAGES
+    || !value.messageIds.every(isProtocolIdentifier)
+    || new Set(value.messageIds).size !== value.messageIds.length
+    || !Number.isInteger(value.pageBytes)
+    || Number(value.pageBytes) < 0
+    || Number(value.pageBytes) > MAX_HISTORY_PAGE_BYTES
+    || (value.messageIds.length === 0) !== (value.pageBytes === 0)
+    || !(value.nextCursor === null || isProtocolIdentifier(value.nextCursor))
+    || typeof value.hasMore !== "boolean"
+    || typeof value.historyTruncated !== "boolean") return false;
+
+  return value.hasMore
+    ? value.messageIds.length > 0 && value.nextCursor === value.messageIds[value.messageIds.length - 1]
+    : value.nextCursor === null;
+}
+
 export function isServerPacket(value: unknown): value is ServerPacket {
-  if (!isRecord(value) || value.version !== PROTOCOL_VERSION || typeof value.type !== "string") return false;
+  if (!isRecord(value) || !isEnvelopeWithinLimit(value) || value.version !== PROTOCOL_VERSION || typeof value.type !== "string") return false;
 
   switch (value.type) {
+    case "history_page_complete":
+      return isHistoryPageCompletePacket(value);
     case "joined":
       return isProtocolRoom(value.room)
         && Number.isInteger(value.peers)
@@ -168,7 +245,19 @@ export function isServerPacket(value: unknown): value is ServerPacket {
       return Number.isInteger(value.peers) && Number(value.peers) >= 0;
     case "error":
       return typeof value.code === "string"
-        && ["invalid_packet", "room_required", "message_too_large", "capacity_reached", "rate_limited", "message_conflict", "storage_unavailable"].includes(value.code)
+        && [
+          "invalid_packet",
+          "room_required",
+          "message_too_large",
+          "capacity_reached",
+          "rate_limited",
+          "message_conflict",
+          "storage_unavailable",
+          "not_joined",
+          "invalid_cursor",
+          "history_packet_too_large",
+          "history_page_too_large",
+        ].includes(value.code)
         && typeof value.message === "string"
         && (value.id === undefined || isProtocolIdentifier(value.id));
     default:
@@ -177,5 +266,5 @@ export function isServerPacket(value: unknown): value is ServerPacket {
 }
 
 export function isClientPacket(value: unknown): value is ClientPacket {
-  return isJoinPacket(value) || isMessagePacket(value);
+  return isJoinPacket(value) || isMessagePacket(value) || isHistoryRequestPacket(value);
 }

@@ -14,8 +14,9 @@
 
 use nearlink_protocol_core::sync::{InsertOutcome, MessageIndex, SyncError, MAX_ENVELOPE_BYTES};
 use nearlink_protocol_core::{
-    is_client_packet, is_join_packet, is_message_packet, is_protocol_identifier, is_protocol_room,
-    is_protocol_timestamp, is_server_packet,
+    is_client_packet, is_history_page_complete_packet, is_history_request_packet, is_join_packet,
+    is_message_packet, is_protocol_identifier, is_protocol_room, is_protocol_timestamp,
+    is_server_packet,
 };
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
@@ -95,12 +96,13 @@ fn sync_error_json(error: SyncError) -> String {
 /// Run one protocol-core validator against a bounded JSON value.
 ///
 /// Supported names match `packages/protocol/vectors/v1.json`: `client`,
-/// `join`, `message`, `server`, `timestamp`, `identifier`, and `room`.
+/// `join`, `message`, `history_request`, `server`, `history_page_complete`,
+/// `timestamp`, `identifier`, and `room`.
 /// Input above 18 KiB is rejected before JSON parsing. Known validators return
 /// `{"ok":true,"valid":true}` or `{"ok":true,"valid":false}`.
 #[wasm_bindgen]
 pub fn validate_json(validator: &str, value_json: &str) -> String {
-    if validator.len() > 16 {
+    if validator.len() > 32 {
         return error_json(ErrorCode::UnknownValidator);
     }
     if value_json.len() > MAX_ENVELOPE_BYTES {
@@ -114,7 +116,9 @@ pub fn validate_json(validator: &str, value_json: &str) -> String {
         "client" => is_client_packet(&value),
         "join" => is_join_packet(&value),
         "message" => is_message_packet(&value),
+        "history_request" => is_history_request_packet(&value),
         "server" => is_server_packet(&value),
+        "history_page_complete" => is_history_page_complete_packet(&value),
         "timestamp" => value.as_str().is_some_and(is_protocol_timestamp),
         "identifier" => value.as_str().is_some_and(is_protocol_identifier),
         "room" => value.as_str().is_some_and(is_protocol_room),
@@ -265,6 +269,22 @@ mod tests {
         );
         assert_eq!(
             parse_result(&validate_json("room", &" ".repeat(MAX_ENVELOPE_BYTES + 1))),
+            json!({"ok": false, "code": "input_too_large"})
+        );
+        let escaped_body = json!({
+            "version": 1,
+            "type": "message",
+            "id": "m1",
+            "room": "room1",
+            "sender": "device1",
+            "senderName": "Amina",
+            "createdAt": "2026-10-14T12:00:00Z",
+            "body": "\u{1}".repeat(4_000),
+        })
+        .to_string();
+        assert!(escaped_body.len() > MAX_ENVELOPE_BYTES);
+        assert_eq!(
+            parse_result(&validate_json("message", &escaped_body)),
             json!({"ok": false, "code": "input_too_large"})
         );
     }

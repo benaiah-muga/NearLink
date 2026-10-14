@@ -8,6 +8,7 @@ export interface StoredMessage {
   delivery: DeliveryState;
   transport?: "hub" | "direct";
   failure?: "message_conflict";
+  displayOrder?: number;
 }
 
 export interface LocalIdentity {
@@ -40,12 +41,13 @@ export async function requestStoragePersistence(): Promise<StoragePersistenceRes
 }
 
 const DATABASE_NAME = "nearlink-local";
-const DATABASE_VERSION = 3;
+const DATABASE_VERSION = 4;
 const MESSAGE_STORE = "messages";
 const IDENTITY_STORE = "identity";
 const ROOM_DELETION_STORE = "roomDeletions";
 const ROOM_CREATED_INDEX = "roomCreatedAt";
 const ROOM_DELIVERY_CREATED_INDEX = "roomDeliveryCreatedAt";
+const ROOM_DISPLAY_ORDER_INDEX = "roomDisplayOrder";
 const IDENTITY_KEY_PATH = "key";
 const MESSAGE_KEY_PATH = ["packet.room", "packet.id"];
 const ROOM_CREATED_KEY_PATH = ["packet.room", "packet.createdAt"];
@@ -66,6 +68,23 @@ function fail(operation: string, cause: unknown): LocalStorageError {
 function equalKeyPath(actual: string | string[], expected: string | string[]): boolean {
   if (typeof actual === "string" || typeof expected === "string") return actual === expected;
   return actual.length === expected.length && actual.every((part, index) => part === expected[index]);
+}
+
+function compareDisplayOrder(left: StoredMessage, right: StoredMessage): number {
+  const leftOrder = Number.isFinite(left.displayOrder) ? left.displayOrder! : Number.MAX_SAFE_INTEGER;
+  const rightOrder = Number.isFinite(right.displayOrder) ? right.displayOrder! : Number.MAX_SAFE_INTEGER;
+  return leftOrder - rightOrder;
+}
+
+function samePacket(left: MessagePacket, right: MessagePacket): boolean {
+  return left.version === right.version
+    && left.type === right.type
+    && left.id === right.id
+    && left.room === right.room
+    && left.sender === right.sender
+    && left.senderName === right.senderName
+    && left.createdAt === right.createdAt
+    && left.body === right.body;
 }
 
 function ensureStore(
@@ -98,8 +117,32 @@ function migrate(database: IDBDatabase, transaction: IDBTransaction): void {
   const messages = ensureStore(database, transaction, MESSAGE_STORE, MESSAGE_KEY_PATH);
   ensureIndex(messages, ROOM_CREATED_INDEX, ROOM_CREATED_KEY_PATH);
   ensureIndex(messages, ROOM_DELIVERY_CREATED_INDEX, ROOM_DELIVERY_CREATED_KEY_PATH);
+  ensureIndex(messages, ROOM_DISPLAY_ORDER_INDEX, ["packet.room", "displayOrder"]);
   ensureStore(database, transaction, IDENTITY_STORE, IDENTITY_KEY_PATH);
   ensureStore(database, transaction, ROOM_DELETION_STORE, "room");
+
+  const migration = messages.index(ROOM_CREATED_INDEX).openCursor();
+  let activeRoom: string | undefined;
+  let nextOrder = 0;
+  migration.onsuccess = () => {
+    const cursor = migration.result;
+    if (!cursor) return;
+    const message = cursor.value as StoredMessage;
+    if (message.packet.room !== activeRoom) {
+      activeRoom = message.packet.room;
+      nextOrder = 0;
+    }
+    message.displayOrder = nextOrder;
+    nextOrder += 1;
+    const update = cursor.update(message);
+    update.onerror = () => {
+      try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
+    };
+    cursor.continue();
+  };
+  migration.onerror = () => {
+    try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
+  };
 }
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -217,11 +260,28 @@ export async function loadMessages(room: string): Promise<StoredMessage[]> {
   return withTransaction<StoredMessage[]>(
     "Could not load the local conversation",
     MESSAGE_STORE,
-    "readonly",
+    "readwrite",
     (store, complete, setFailure) => {
       const range = IDBKeyRange.bound([room, ""], [room, "\uffff"]);
       const request = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
-      observe(request, (messages) => complete(messages.sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt))), setFailure);
+      observe(request, (messages) => {
+        let nextOrder = messages.reduce((maximum, item) => Math.max(maximum, Number.isFinite(item.displayOrder) ? item.displayOrder! : -1), -1) + 1;
+        for (const item of messages) {
+          if (Number.isFinite(item.displayOrder)) continue;
+          item.displayOrder = nextOrder;
+          nextOrder += 1;
+          try {
+            const put = store.put(item);
+            put.onerror = () => setFailure(put.error ?? new Error("Could not persist local message order."));
+          }
+          catch (error) {
+            setFailure(error);
+            request.transaction?.abort();
+            return;
+          }
+        }
+        complete(messages.sort(compareDisplayOrder));
+      }, setFailure);
     },
   );
 }
@@ -297,20 +357,230 @@ export async function saveMessage(message: StoredMessage): Promise<boolean> {
     "readwrite",
     (store, complete, setFailure, transaction) => {
       const tombstones = transaction.objectStore(ROOM_DELETION_STORE);
-      const request = tombstones.get(message.packet.room);
-      request.onsuccess = () => {
-        if (request.result) {
+      const tombstoneRequest = tombstones.get(message.packet.room);
+      const existingRequest = store.get([message.packet.room, message.packet.id]) as IDBRequest<StoredMessage | undefined>;
+      const range = IDBKeyRange.bound([message.packet.room, ""], [message.packet.room, "\uffff"]);
+      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
+      let tombstoneReady = false;
+      let deleted = false;
+      let existingReady = false;
+      let existing: StoredMessage | undefined;
+      let roomMessages: StoredMessage[] | undefined;
+      const maybeSave = () => {
+        if (!tombstoneReady || !existingReady || !roomMessages) return;
+        if (deleted) {
           complete(false);
           return;
         }
+        const nextOrder = roomMessages.reduce((maximum, item) => Math.max(maximum, Number.isFinite(item.displayOrder) ? item.displayOrder! : -1), -1) + 1;
+        const displayOrder = Number.isFinite(message.displayOrder)
+          ? message.displayOrder
+          : existing?.displayOrder ?? nextOrder;
+        const savedMessage = { ...message, displayOrder };
         try {
-          observe(store.put(message), () => complete(true), setFailure);
+          observe(store.put(savedMessage), () => complete(true), setFailure);
         } catch (error) {
           setFailure(error);
           transaction.abort();
         }
       };
-      request.onerror = () => setFailure(request.error ?? new Error("Could not check whether the local conversation was cleared."));
+      tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeSave(); };
+      existingRequest.onsuccess = () => { existingReady = true; existing = existingRequest.result; maybeSave(); };
+      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeSave(); };
+      tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
+      existingRequest.onerror = () => setFailure(existingRequest.error ?? new Error("Could not read the existing local message."));
+      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read local message order."));
+    },
+  );
+}
+
+/** Reorder replayed hub rows into the order their packets arrived, keeping other rows in their current slots. */
+export async function reconcileHubReplayOrder(room: string, orderedIds: string[]): Promise<boolean> {
+  if (orderedIds.length < 2) return true;
+  return withTransaction<boolean>(
+    "Could not reconcile replayed hub message order",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readwrite",
+    (store, complete, setFailure, transaction) => {
+      const tombstoneRequest = transaction.objectStore(ROOM_DELETION_STORE).get(room);
+      const range = IDBKeyRange.bound([room, ""], [room, "\uffff"]);
+      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
+      let tombstoneReady = false;
+      let deleted = false;
+      let roomMessages: StoredMessage[] | undefined;
+      const maybeReconcile = () => {
+        if (!tombstoneReady || !roomMessages) return;
+        if (deleted) {
+          complete(false);
+          return;
+        }
+        const orderedSet = new Set(orderedIds);
+        const replayedRows = roomMessages
+          .filter((item) => orderedSet.has(item.packet.id) && item.transport === "hub" && item.delivery === "sent")
+          .sort(compareDisplayOrder);
+        if (replayedRows.length < 2) {
+          complete(true);
+          return;
+        }
+        const rowsById = new Map(replayedRows.map((item) => [item.packet.id, item]));
+        const acceptedOrder = orderedIds
+          .map((id) => rowsById.get(id))
+          .filter((item): item is StoredMessage => Boolean(item));
+        const slots = replayedRows.map((item, index) => Number.isFinite(item.displayOrder) ? item.displayOrder! : index);
+        acceptedOrder.forEach((item, index) => {
+          if (item.displayOrder === slots[index]) return;
+          try {
+            const put = store.put({ ...item, displayOrder: slots[index] });
+            put.onerror = () => setFailure(put.error ?? new Error("Could not persist replayed hub message order."));
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
+          }
+        });
+        complete(true);
+      };
+      tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeReconcile(); };
+      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeReconcile(); };
+      tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
+      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read replayed hub message order."));
+    },
+  );
+}
+
+/** Atomically save one verified newest-to-oldest history page before the current oldest row. */
+export async function saveHubHistoryPage(messages: StoredMessage[], cursor: string | null, requestStartOrder: number): Promise<boolean> {
+  if (messages.length === 0) return true;
+  const room = messages[0].packet.room;
+  if (messages.some((message) => message.packet.room !== room)) {
+    throw new Error("A history page must contain messages from one room.");
+  }
+
+  return withTransaction<boolean>(
+    "Could not save the local history page",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readwrite",
+    (store, complete, setFailure, transaction) => {
+      const tombstones = transaction.objectStore(ROOM_DELETION_STORE);
+      const tombstoneRequest = tombstones.get(room);
+      const range = IDBKeyRange.bound([room, ""], [room, "\uffff"]);
+      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
+      let tombstoneReady = false;
+      let deleted = false;
+      let roomMessages: StoredMessage[] | undefined;
+      const maybeSave = () => {
+        if (!tombstoneReady || !roomMessages) return;
+        if (deleted) {
+          complete(false);
+          return;
+        }
+        const byId = new Map(roomMessages.map((item) => [item.packet.id, item]));
+        for (const candidate of messages) {
+          const existing = byId.get(candidate.packet.id);
+          if (existing && !samePacket(existing.packet, candidate.packet)) {
+            setFailure(new Error("A history page ID conflicts with saved message content."));
+            transaction.abort();
+            return;
+          }
+        }
+
+        const pageIds = new Set(messages.map((item) => item.packet.id));
+        if (cursor !== null) {
+          const anchorOrder = byId.get(cursor)?.displayOrder
+            ?? roomMessages.reduce((minimum, item) => Math.min(minimum, Number.isFinite(item.displayOrder) ? item.displayOrder! : 0), 0);
+          for (let index = 0; index < messages.length; index += 1) {
+            const candidate = messages[index];
+            const existing = byId.get(candidate.packet.id);
+            const alreadyOlderThanCursor = existing
+              && Number.isFinite(existing.displayOrder)
+              && existing.displayOrder! < anchorOrder;
+            const displayOrder = alreadyOlderThanCursor ? existing.displayOrder : anchorOrder - (index + 1);
+            const savedMessage: StoredMessage = existing
+              ? { ...existing, transport: "hub", delivery: "sent", displayOrder }
+              : { ...candidate, transport: "hub", delivery: "sent", displayOrder };
+            try {
+              const put = store.put(savedMessage);
+              put.onerror = () => setFailure(put.error ?? new Error("Could not persist the history page order."));
+            } catch (error) {
+              setFailure(error);
+              transaction.abort();
+              return;
+            }
+          }
+          complete(true);
+          return;
+        }
+
+        const rowsById = new Map(roomMessages.map((item) => [item.packet.id, item]));
+        const pageOldestFirst = [...messages].reverse();
+        const anchors = new Set(pageOldestFirst
+          .filter((item) => {
+            const existing = rowsById.get(item.packet.id);
+            return existing && Number.isFinite(existing.displayOrder) && existing.displayOrder! <= requestStartOrder;
+          })
+          .map((item) => item.packet.id));
+        const rows = roomMessages
+          .filter((item) => !pageIds.has(item.packet.id) || anchors.has(item.packet.id))
+          .sort(compareDisplayOrder);
+        const beforeAnchor = new Map<string, StoredMessage[]>();
+        const afterAnchor = new Map<string, StoredMessage[]>();
+        const beforePostRequest = new Map<number, StoredMessage[]>();
+        let previousAnchor: string | null = null;
+        for (let index = 0; index < pageOldestFirst.length; index += 1) {
+          const candidate = pageOldestFirst[index];
+          if (anchors.has(candidate.packet.id)) {
+            previousAnchor = candidate.packet.id;
+            continue;
+          }
+          const nextAnchor = pageOldestFirst.slice(index + 1).find((item) => anchors.has(item.packet.id))?.packet.id;
+          const existing = rowsById.get(candidate.packet.id);
+          const savedMessage: StoredMessage = existing
+            ? { ...existing, transport: "hub", delivery: "sent" }
+            : { ...candidate, transport: "hub", delivery: "sent" };
+          if (nextAnchor) {
+            const bucket = beforeAnchor.get(nextAnchor) ?? [];
+            bucket.push(savedMessage);
+            beforeAnchor.set(nextAnchor, bucket);
+          } else if (previousAnchor) {
+            const bucket = afterAnchor.get(previousAnchor) ?? [];
+            bucket.push(savedMessage);
+            afterAnchor.set(previousAnchor, bucket);
+          } else {
+            const insertionIndex = rows.findIndex((item) => Number.isFinite(item.displayOrder) && item.displayOrder! > requestStartOrder);
+            const indexKey = insertionIndex === -1 ? rows.length : insertionIndex;
+            const bucket = beforePostRequest.get(indexKey) ?? [];
+            bucket.push(savedMessage);
+            beforePostRequest.set(indexKey, bucket);
+          }
+        }
+
+        const merged: StoredMessage[] = [];
+        for (let index = 0; index <= rows.length; index += 1) {
+          merged.push(...(beforePostRequest.get(index) ?? []));
+          if (index === rows.length) break;
+          const row = rows[index];
+          merged.push(...(beforeAnchor.get(row.packet.id) ?? []), row);
+          merged.push(...(afterAnchor.get(row.packet.id) ?? []));
+        }
+        merged.forEach((item, index) => {
+          const candidate = byId.get(item.packet.id) ?? item;
+          const savedMessage = pageIds.has(item.packet.id)
+            ? { ...candidate, transport: "hub" as const, delivery: "sent" as const, displayOrder: index }
+            : { ...candidate, displayOrder: index };
+          try {
+            const put = store.put(savedMessage);
+            put.onerror = () => setFailure(put.error ?? new Error("Could not persist the history page order."));
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
+            return;
+          }
+        });
+        complete(true);
+      };
+      tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeSave(); };
+      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeSave(); };
+      tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
+      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read local message order."));
     },
   );
 }

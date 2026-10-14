@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
-import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, resumeRoomMessages, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const DATABASE_NAME = "nearlink-local";
 
@@ -50,9 +50,9 @@ describe("local IndexedDB storage", () => {
 
     await expect(loadIdentity()).resolves.toEqual({ sender: "device-1", senderName: "Ada" });
     await expect(loadMessages("alpha")).resolves.toEqual([
-      { ...message("earlier", "2026-10-14T09:00:00.000Z"), delivery: "queued" },
-      { ...message("incoming", "2026-10-14T09:30:00.000Z", "sent"), direction: "incoming" },
-      message("later", "2026-10-14T10:00:00.000Z"),
+      { ...message("later", "2026-10-14T10:00:00.000Z"), displayOrder: 0 },
+      { ...message("earlier", "2026-10-14T09:00:00.000Z"), displayOrder: 1 },
+      { ...message("incoming", "2026-10-14T09:30:00.000Z", "sent"), direction: "incoming", displayOrder: 2 },
     ]);
     await expect(loadMessages("missing")).resolves.toEqual([]);
   });
@@ -62,7 +62,7 @@ describe("local IndexedDB storage", () => {
     await saveMessage(message("parallel-read", "2026-10-14T09:00:00.000Z"));
     await expect(Promise.all([loadIdentity(), loadMessages("alpha"), isRoomMessagesDeleted("alpha")])).resolves.toEqual([
       { sender: "device-1", senderName: "Ada" },
-      [message("parallel-read", "2026-10-14T09:00:00.000Z")],
+      [{ ...message("parallel-read", "2026-10-14T09:00:00.000Z"), displayOrder: 0 }],
       false,
     ]);
   });
@@ -73,7 +73,7 @@ describe("local IndexedDB storage", () => {
     duplicate.packet.body = "updated duplicate";
     await saveMessage(duplicate);
 
-    await expect(loadMessages("alpha")).resolves.toEqual([duplicate]);
+    await expect(loadMessages("alpha")).resolves.toEqual([{ ...duplicate, displayOrder: 0 }]);
   });
 
   it("persists the optional transport hint and keeps legacy rows hub-compatible", async () => {
@@ -92,7 +92,39 @@ describe("local IndexedDB storage", () => {
     await updateDelivery("alpha", "delivery", "failed");
     await updateDelivery("alpha", "does-not-exist", "sent");
 
-    await expect(loadMessages("alpha")).resolves.toEqual([message("delivery", "2026-10-14T09:00:00.000Z", "failed")]);
+    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("delivery", "2026-10-14T09:00:00.000Z", "failed"), displayOrder: 0 }]);
+  });
+
+  it("places newest-to-oldest history IDs before the boundary in hub acceptance order", async () => {
+    const boundary = { ...message("boundary", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub" as const };
+    await saveMessage(boundary);
+    const pageNewest = { ...message("page-newest", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const };
+    const pageOldest = { ...message("page-oldest", "2026-10-14T23:00:00.000Z", "sent"), transport: "hub" as const };
+
+    await expect(saveHubHistoryPage([pageNewest, pageOldest], "boundary", 0)).resolves.toBe(true);
+    const saved = await loadMessages("alpha");
+    expect(saved.map((item) => item.packet.id)).toEqual(["page-oldest", "page-newest", "boundary"]);
+    expect(saved.map((item) => item.displayOrder)).toEqual([-2, -1, 0]);
+  });
+
+  it("merges a null-cursor retry around known rows without moving them by timestamp", async () => {
+    const first = { ...message("first", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub" as const };
+    const second = { ...message("second", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub" as const };
+    await saveMessage(first);
+    await saveMessage(second);
+    const older = { ...message("older", "2026-10-14T23:00:00.000Z", "sent"), transport: "hub" as const };
+
+    await expect(saveHubHistoryPage([first, older], null, 1)).resolves.toBe(true);
+    const saved = await loadMessages("alpha");
+    expect(saved.map((item) => item.packet.id)).toEqual(["older", "first", "second"]);
+  });
+
+  it("honors a room deletion tombstone when committing a history page", async () => {
+    await beginRoomDeletion("alpha");
+    const page = { ...message("deleted-page", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub" as const };
+
+    await expect(saveHubHistoryPage([page], null, -1)).resolves.toBe(false);
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
   });
 
   it("deletes all saved and queued messages from one room while preserving identity and other rooms", async () => {
@@ -206,17 +238,51 @@ describe("local IndexedDB storage", () => {
     database.close();
 
     await expect(loadIdentity()).resolves.toEqual({ sender: "legacy-device", senderName: "Legacy" });
-    await expect(loadMessages("alpha")).resolves.toEqual([message("legacy", "2026-10-14T09:00:00.000Z")]);
+    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("legacy", "2026-10-14T09:00:00.000Z"), displayOrder: 0 }]);
 
     const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = openRequest();
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
-    expect(upgraded.version).toBe(3);
+    expect(upgraded.version).toBe(4);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDeliveryCreatedAt")).toBe(true);
+    expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDisplayOrder")).toBe(true);
     expect(upgraded.objectStoreNames.contains("roomDeletions")).toBe(true);
     upgraded.close();
+  });
+
+  it("repairs timestamp-ordered legacy hub rows from accepted replay order without moving direct rows", async () => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = openRequest(1);
+      request.onupgradeneeded = () => {
+        const messages = request.result.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
+        messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
+        request.result.createObjectStore("identity", { keyPath: "key" });
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("messages", "readwrite");
+      transaction.objectStore("messages").put({ ...message("hub-accepted-later", "2026-10-14T08:00:00.000Z"), transport: "hub", delivery: "sent" });
+      transaction.objectStore("messages").put({ ...message("direct-between", "2026-10-14T09:00:00.000Z"), transport: "direct", delivery: "sent" });
+      transaction.objectStore("messages").put({ ...message("hub-accepted-first", "2026-10-14T22:00:00.000Z"), transport: "hub", delivery: "sent" });
+      transaction.oncomplete = () => resolve();
+      transaction.onabort = () => reject(transaction.error);
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    expect((await loadMessages("alpha")).map((item) => item.packet.id)).toEqual([
+      "hub-accepted-later", "direct-between", "hub-accepted-first",
+    ]);
+    await expect(reconcileHubReplayOrder("alpha", ["hub-accepted-first", "hub-accepted-later"])).resolves.toBe(true);
+    const reconciled = await loadMessages("alpha");
+    expect(reconciled.map((item) => item.packet.id)).toEqual([
+      "hub-accepted-first", "direct-between", "hub-accepted-later",
+    ]);
+    expect(reconciled.find((item) => item.packet.id === "direct-between")).toMatchObject({ transport: "direct", displayOrder: 1 });
   });
 
   it("reports a quota-style write failure and leaves existing messages intact", async () => {
@@ -233,7 +299,7 @@ describe("local IndexedDB storage", () => {
       cause: expect.objectContaining({ name: "QuotaExceededError" }),
     });
     vi.restoreAllMocks();
-    await expect(loadMessages("alpha")).resolves.toEqual([message("preserved", "2026-10-14T09:00:00.000Z")]);
+    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("preserved", "2026-10-14T09:00:00.000Z"), displayOrder: 0 }]);
   });
 
   it("reports a transaction abort even after the write request succeeds", async () => {

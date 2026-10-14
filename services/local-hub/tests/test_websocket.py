@@ -130,13 +130,130 @@ def test_message_with_lone_surrogate_is_rejected_without_ending_connection():
             rejected = websocket.receive_json()
             assert rejected["type"] == "error"
             assert rejected["code"] == "invalid_packet"
-            assert rejected["id"] == "message-1"
+            assert "id" not in rejected
 
             websocket.send_json(message_packet(message_id="valid-after-surrogate"))
             assert websocket.receive_json() == {"version": 1, "type": "ack", "id": "valid-after-surrogate"}
 
     assert hub.rooms == {}
     assert hub.active_connections == 0
+
+
+def test_compact_message_packet_limit_is_enforced_even_for_escaped_text():
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            websocket.receive_json()
+
+            oversized = message_packet(message_id="escaped-envelope")
+            oversized["body"] = "\u0001" * 4_000
+            websocket.send_json(oversized)
+            rejected = websocket.receive_json()
+            assert rejected["type"] == "error"
+            assert rejected["code"] == "message_too_large"
+            assert "id" not in rejected
+            assert hub.message_store.recent("test-room")[0] == []
+
+
+def test_compact_incoming_envelope_limit_applies_before_packet_type_validation():
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            oversized_join = {**join_packet(), "ignored": "x" * 19_000}
+            raw_join = json.dumps(oversized_join, separators=(",", ":"))
+            assert len(raw_join.encode("utf-8")) < hub.MAX_FRAME_BYTES
+            websocket.send_text(raw_join)
+            rejected_join = websocket.receive_json()
+            assert rejected_join["code"] == "message_too_large"
+            with pytest.raises(WebSocketDisconnect):
+                websocket.receive_json()
+
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            assert websocket.receive_json()["type"] == "presence"
+
+            oversized_message = {**message_packet(message_id="ignored-extra"), "ignored": "x" * 19_000}
+            raw_message = json.dumps(oversized_message, separators=(",", ":"))
+            assert len(raw_message.encode("utf-8")) < hub.MAX_FRAME_BYTES
+            websocket.send_text(raw_message)
+            assert websocket.receive_json()["code"] == "message_too_large"
+
+            oversized_history = {
+                "version": 1,
+                "type": "history_request",
+                "requestId": "large-history-request",
+                "room": "test-room",
+                "cursor": None,
+                "limit": 10,
+                "ignored": "x" * 19_000,
+            }
+            raw_history = json.dumps(oversized_history, separators=(",", ":"))
+            assert len(raw_history.encode("utf-8")) < hub.MAX_FRAME_BYTES
+            websocket.send_text(raw_history)
+            assert websocket.receive_json()["code"] == "message_too_large"
+
+
+def test_legacy_v2_rows_over_packet_limit_are_pruned_on_replay_and_page():
+    store = hub.message_store
+    valid = message_packet(message_id="retained-valid")
+    oversized = message_packet(message_id="legacy-oversized")
+    oversized["body"] = "\u0001" * 4_000
+    encoded_oversized = json.dumps(oversized, ensure_ascii=False, separators=(",", ":"))
+    assert len(encoded_oversized.encode("utf-8")) > hub.MAX_PROTOCOL_PACKET_BYTES
+
+    with store._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        connection.execute(
+            "INSERT INTO messages(room, message_id, packet, packet_bytes, stored_at) VALUES (?, ?, ?, ?, ?)",
+            ("test-room", oversized["id"], encoded_oversized, len(encoded_oversized.encode("utf-8")), hub.time()),
+        )
+    assert store.store(valid) == "stored"
+
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            joined = websocket.receive_json()
+            assert joined["historyTruncated"] is True
+            replayed = websocket.receive_json()
+            assert replayed == valid
+            assert websocket.receive_json()["type"] == "presence"
+            with store._connect() as connection:
+                assert connection.execute(
+                    "SELECT COUNT(*) FROM messages WHERE message_id = ?", (oversized["id"],)
+                ).fetchone()[0] == 0
+
+            page_oversized = {**oversized, "id": "legacy-page-oversized"}
+            page_encoded = json.dumps(page_oversized, ensure_ascii=False, separators=(",", ":"))
+            with store._connect() as connection:
+                connection.execute(
+                    "INSERT INTO messages(room, message_id, packet, packet_bytes, stored_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "test-room",
+                        page_oversized["id"],
+                        page_encoded,
+                        len(page_encoded.encode("utf-8")),
+                        hub.time(),
+                    ),
+                )
+            websocket.send_json({
+                "version": 1,
+                "type": "history_request",
+                "requestId": "legacy-page",
+                "room": "test-room",
+                "cursor": None,
+                "limit": 10,
+            })
+            page_message = websocket.receive_json()
+            completion = websocket.receive_json()
+            assert page_message == valid
+            assert completion["type"] == "history_page_complete"
+            assert completion["messageIds"] == ["retained-valid"]
+            assert completion["historyTruncated"] is True
+            with store._connect() as connection:
+                assert connection.execute(
+                    "SELECT COUNT(*) FROM messages WHERE message_id = ?", (page_oversized["id"],)
+                ).fetchone()[0] == 0
 
 
 def test_relay_ack_order_presence_and_disconnect_cleanup():
@@ -303,20 +420,178 @@ def test_duplicate_retry_is_idempotent_and_conflicting_id_is_rejected():
 
 
 def test_history_retention_and_replay_are_bounded(tmp_path):
-    store = hub.MessageStore(tmp_path / "bounded.sqlite3", replay_limit=2, per_room_limit=3, total_limit=4)
-    for index in range(4):
+    store = hub.MessageStore(tmp_path / "bounded.sqlite3", replay_limit=2, per_room_limit=3, total_limit=10)
+    for index in range(3):
         assert store.store(message_packet(message_id=f"room-a-{index}")) == "stored"
     for index in range(2):
         assert store.store(message_packet(message_id=f"room-b-{index}", room="room-b")) == "stored"
 
     room_a, truncated_a = store.recent("test-room")
     room_b, truncated_b = store.recent("room-b")
-    assert [packet["id"] for packet in room_a] == ["room-a-2", "room-a-3"]
+    assert [packet["id"] for packet in room_a] == ["room-a-1", "room-a-2"]
     assert [packet["id"] for packet in room_b] == ["room-b-0", "room-b-1"]
-    assert truncated_a is True
+    assert truncated_a is False
     assert truncated_b is False
     with store._connect() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 5
+    page, _, next_cursor, has_more, page_truncated, error = store.history_page("test-room", None, 2)
+    assert error is None
+    assert [packet["id"] for packet in page] == ["room-a-2", "room-a-1"]
+    assert next_cursor == "room-a-1"
+    assert has_more is True
+    assert page_truncated is False
+
+
+def test_history_requests_page_newest_first_and_use_message_ids_as_cursors():
+    for index in range(5):
+        assert hub.message_store.store(message_packet(message_id=f"page-{index}")) == "stored"
+
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            for _ in range(5):
+                assert websocket.receive_json()["type"] == "message"
+            assert websocket.receive_json()["type"] == "presence"
+
+            request = {
+                "version": 1,
+                "type": "history_request",
+                "requestId": "page-request",
+                "room": "test-room",
+                "cursor": None,
+                "limit": 2,
+            }
+            websocket.send_json(request)
+            first = [websocket.receive_json(), websocket.receive_json(), websocket.receive_json()]
+            assert [packet["id"] for packet in first[:2]] == ["page-4", "page-3"]
+            complete = first[2]
+            assert complete == {
+                "version": 1,
+                "type": "history_page_complete",
+                "requestId": "page-request",
+                "room": "test-room",
+                "messageIds": ["page-4", "page-3"],
+                "pageBytes": sum(
+                    len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                    for packet in first[:2]
+                ),
+                "nextCursor": "page-3",
+                "hasMore": True,
+                "historyTruncated": False,
+            }
+
+            websocket.send_json({**request, "requestId": "page-request-2", "cursor": "page-3"})
+            second = [websocket.receive_json(), websocket.receive_json(), websocket.receive_json()]
+            assert [packet["id"] for packet in second[:2]] == ["page-2", "page-1"]
+            assert second[2]["nextCursor"] == "page-1"
+            assert second[2]["hasMore"] is True
+
+            retry = {**request, "requestId": "retry", "cursor": "page-3"}
+            websocket.send_json(retry)
+            repeated = [websocket.receive_json(), websocket.receive_json(), websocket.receive_json()]
+            assert [packet["id"] for packet in repeated[:2]] == second[2]["messageIds"]
+            assert repeated[2]["messageIds"] == second[2]["messageIds"]
+
+
+def test_history_request_requires_room_membership_and_known_cursor():
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            assert websocket.receive_json()["type"] == "presence"
+
+            websocket.send_json({
+                "version": 1,
+                "type": "history_request",
+                "requestId": "wrong-room",
+                "room": "another-room",
+                "cursor": None,
+                "limit": 10,
+            })
+            assert websocket.receive_json()["code"] == "not_joined"
+
+            websocket.send_json({
+                "version": 1,
+                "type": "history_request",
+                "requestId": "missing-cursor",
+                "room": "test-room",
+                "cursor": "pruned-message",
+                "limit": 10,
+            })
+            stale = websocket.receive_json()
+            assert stale["code"] == "invalid_cursor"
+            assert stale["historyTruncated"] is False
+
+
+def test_history_request_rate_limit_is_separate_and_bounded(monkeypatch):
+    monkeypatch.setattr(hub, "MAX_HISTORY_REQUESTS_PER_MINUTE", 1)
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            assert websocket.receive_json()["type"] == "presence"
+            request = {
+                "version": 1,
+                "type": "history_request",
+                "requestId": "first-history-request",
+                "room": "test-room",
+                "cursor": None,
+                "limit": 10,
+            }
+            websocket.send_json(request)
+            first = websocket.receive_json()
+            assert first["type"] == "history_page_complete"
+            websocket.send_json({**request, "requestId": "second-history-request"})
+            limited = websocket.receive_json()
+            assert limited["code"] == "rate_limited"
+
+
+def test_history_page_is_bounded_and_truncation_only_reports_storage_loss():
+    for index in range(100):
+        packet = message_packet(message_id=f"bounded-{index}")
+        packet["body"] = "x" * 7_500
+        assert hub.message_store.store(packet) == "stored"
+    with sqlite3.connect(hub.message_store.path) as connection:
+        connection.execute(
+            "UPDATE room_state SET history_truncated = 1 WHERE room = ?", ("test-room",)
+        )
+
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            for _ in range(100):
+                websocket.receive_json()
+            assert websocket.receive_json()["type"] == "presence"
+            websocket.send_json({
+                "version": 1,
+                "type": "history_request",
+                "requestId": "bounded-page",
+                "room": "test-room",
+                "cursor": None,
+                "limit": 100,
+            })
+            packets = []
+            while True:
+                packet = websocket.receive_json()
+                if packet["type"] == "history_page_complete":
+                    complete = packet
+                    break
+                packets.append(packet)
+            assert 0 < len(packets) <= 100
+            assert all(
+                len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                <= hub.MAX_PROTOCOL_PACKET_BYTES
+                for packet in packets
+            )
+            assert complete["pageBytes"] <= 512 * 1024
+            assert complete["pageBytes"] == sum(
+                len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                for packet in packets
+            )
+            assert complete["hasMore"] is True
+            assert complete["historyTruncated"] is True
 
 
 def test_byte_retention_and_room_marker_metadata_are_bounded(tmp_path, monkeypatch):

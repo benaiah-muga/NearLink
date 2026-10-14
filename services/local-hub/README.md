@@ -36,11 +36,32 @@ committed data.
 Connect clients to `ws://127.0.0.1:8000/ws`. Each connection must send a valid
 version 1 `join` packet first. The hub responds with `joined`, which carries a
 `historyTruncated` boolean, replays up to 100 recent room messages in sequence
-order, then broadcasts `presence`. The boolean tells a client that some earlier
-room history was removed by a cap or retention expiry. If the bounded room
-marker table overflows, the hub sets this flag conservatively for all rooms. A
-global delivery lock makes the history snapshot and transition to live relay
-ordered across rooms.
+order, then broadcasts `presence`. The boolean reports history removed by a
+storage cap or retention expiry. It does not mean more retained rows are
+available. If the bounded room marker table overflows, the hub sets this flag
+conservatively for all rooms. A global delivery lock orders history snapshots
+and live relays.
+
+Joined room members can request more retained history with a version 1 packet
+shaped like `{"version":1,"type":"history_request","requestId":"req-1","room":"room-code","cursor":null,"limit":100}`.
+The limit must be from 1 to 100. A null cursor starts at the newest retained
+message; a later cursor is the oldest message ID already loaded. The hub sends
+ordinary `message` packets from newest to oldest, then one
+`history_page_complete` packet. Its ordered `messageIds` identify only the page
+packets, `pageBytes` counts their compact UTF-8 JSON envelopes, `nextCursor` is
+the oldest page message ID when `hasMore` is true, and `historyTruncated` reports
+retention or storage loss independently of `hasMore`. Each message packet is
+limited to 18 KiB, and a page is limited to 100 packets and 512 KiB total.
+History requests are limited to 30 per connection per minute.
+
+`requestId` is a correlation value, not a server-side pagination session. A
+retry with a null cursor starts from the newest retained edge again and may
+include newer messages accepted since the first request. A retry with a
+non-null cursor returns the same older slice while that cursor and its older
+rows remain retained. Clients should deduplicate messages by ID before saving
+or advancing the cursor. If retention removes a cursor row, the hub returns an
+`invalid_cursor` error with the current `historyTruncated` state; clients should
+restart from a null cursor and deduplicate already saved IDs.
 
 Valid `message` packets are durably committed before the sender receives an
 `ack`. This confirms local hub storage only. It does not confirm recipient

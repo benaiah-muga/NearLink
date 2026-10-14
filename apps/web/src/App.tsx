@@ -1,12 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
-import { PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
-import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, requestStoragePersistence, resumeRoomMessages, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
+import { MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket } from "@nearlink/protocol";
+import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, requestStoragePersistence, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
 import { buildDiagnosticsSummary, formatDiagnosticsSummary } from "./lib/diagnostics";
 import { initializeWasmProtocol, MAX_PROTOCOL_ENVELOPE_BYTES, validateJsonWithWasm, validateWithWasm } from "./lib/wasmProtocol";
 
 type LinkState = "offline" | "connecting" | "linking" | "online" | "retrying" | "error";
+type HistoryPagingState = "unavailable" | "available" | "loading" | "retry" | "done" | "unsupported";
+interface PendingHistoryRequest {
+  socket: WebSocket;
+  room: string;
+  requestId: string;
+  cursor: string | null;
+  requestStartOrder: number;
+  packets: Map<string, MessagePacket>;
+  timeout: number;
+}
 const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8000/ws`;
 const HUB_KEY = "nearlink.hub";
 const ROOM_KEY = "nearlink.room";
@@ -61,6 +71,10 @@ function sameMessagePacket(left: MessagePacket, right: MessagePacket): boolean {
     && left.senderName === right.senderName
     && left.createdAt === right.createdAt
     && left.body === right.body;
+}
+
+function compactPacketBytes(packet: MessagePacket): number {
+  return new TextEncoder().encode(JSON.stringify(packet)).byteLength;
 }
 
 function hasHubInboundFailure(failures: Set<string>, room: string): boolean {
@@ -118,6 +132,9 @@ function App() {
   const [confirmRoomDeletion, setConfirmRoomDeletion] = useState(false);
   const [deletingRoom, setDeletingRoom] = useState(false);
   const [roomDeletedLocally, setRoomDeletedLocally] = useState(false);
+  const [historyPagingState, setHistoryPagingState] = useState<HistoryPagingState>("unavailable");
+  const [historyPagingMessage, setHistoryPagingMessage] = useState("");
+  const [historyTruncated, setHistoryTruncated] = useState(false);
   const [sendTransport, setSendTransport] = useState<"hub" | "direct">("hub");
   const [diagnosticsCopyStatus, setDiagnosticsCopyStatus] = useState("");
   const [manualDiagnosticsText, setManualDiagnosticsText] = useState<string | null>(null);
@@ -128,6 +145,7 @@ function App() {
   const socketRef = useRef<WebSocket | null>(null);
   const directRef = useRef<DirectWebRtcTransport | null>(null);
   const messagesRef = useRef(messages);
+  const callSignEditedRef = useRef(false);
   const messageKeysRef = useRef(new Set<string>());
   const conflictedHubMessageKeysRef = useRef(new Set<string>());
   const retryingMessageKeysRef = useRef(new Set<string>());
@@ -146,13 +164,90 @@ function App() {
   const directInFlightRef = useRef(new Set<string>());
   const directInboundOperationsRef = useRef(new Map<string, Promise<void>>());
   const hubInboundOperationsRef = useRef(new Map<string, Promise<void>>());
+  const hubInboundTailRef = useRef<Promise<void>>(Promise.resolve());
   const hubInboundFailuresRef = useRef(new Set<string>());
+  const historyRequestRef = useRef<PendingHistoryRequest | null>(null);
+  const historyCursorRef = useRef<string | null | undefined>(undefined);
+  const historyLimitRef = useRef(MAX_HISTORY_PAGE_MESSAGES);
+  const historyRestartedRef = useRef(false);
+  const joinedHistoryHubUrlRef = useRef<string | null>(null);
+  const hubReplayOrderRef = useRef<{ socket: WebSocket; room: string; ids: string[] } | null>(null);
+  const skipHistoryAutoScrollRef = useRef(false);
+  const messageScrollRef = useRef<HTMLDivElement>(null);
   const messageEndRef = useRef<HTMLDivElement>(null);
 
   messagesRef.current = messages;
   activeRoomRef.current = room.trim();
   currentRoomRef.current = room.trim();
   fingerprintConfirmedRef.current = fingerprintConfirmed;
+
+  function oldestLoadedHubMessageId(): string | null {
+    return [...messagesRef.current]
+      .filter((item) => item.packet.room === activeRoomRef.current && item.transport === "hub" && item.delivery === "sent")
+      .sort((left, right) => (left.displayOrder ?? Number.MAX_SAFE_INTEGER) - (right.displayOrder ?? Number.MAX_SAFE_INTEGER))[0]
+      ?.packet.id ?? null;
+  }
+
+  function requestOlderHistory(cursorOverride?: string | null): void {
+    const socket = socketRef.current;
+    const connectionRoom = activeRoomRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN || historyRequestRef.current || historyPagingState === "done" || historyPagingState === "unsupported") return;
+    const cursor = cursorOverride === undefined
+      ? historyCursorRef.current === undefined ? oldestLoadedHubMessageId() : historyCursorRef.current
+      : cursorOverride;
+    const request: HistoryRequestPacket = {
+      version: PROTOCOL_VERSION,
+      type: "history_request",
+      requestId: makeId(),
+      room: connectionRoom,
+      cursor,
+      limit: historyLimitRef.current,
+    };
+    if (!validateWithWasm("client", request)) {
+      setHistoryPagingState("retry");
+      setHistoryPagingMessage("The history request did not pass protocol checks. The current page cursor was kept so you can retry.");
+      return;
+    }
+    const requestStartOrder = messagesRef.current
+      .filter((item) => item.packet.room === connectionRoom && Number.isFinite(item.displayOrder))
+      .reduce((maximum, item) => Math.max(maximum, item.displayOrder!), -1);
+    const pending: PendingHistoryRequest = {
+      socket,
+      room: connectionRoom,
+      requestId: request.requestId,
+      cursor,
+      requestStartOrder,
+      packets: new Map(),
+      timeout: 0,
+    };
+    historyRequestRef.current = pending;
+    historyCursorRef.current = cursor;
+    setHistoryPagingState("loading");
+    setHistoryPagingMessage("Loading older messages from the hub.");
+    pending.timeout = window.setTimeout(() => {
+      if (historyRequestRef.current !== pending) return;
+      historyRequestRef.current = null;
+      setHistoryPagingState("retry");
+      setHistoryPagingMessage("The hub did not finish this history page. Retry to request the same cursor again.");
+    }, 10000);
+    try {
+      socket.send(JSON.stringify(request));
+    } catch {
+      window.clearTimeout(pending.timeout);
+      historyRequestRef.current = null;
+      setHistoryPagingState("retry");
+      setHistoryPagingMessage("The history request could not be sent. Retry the same page when the hub is connected.");
+    }
+  }
+
+  function failHistoryRequest(pending: PendingHistoryRequest, message: string): void {
+    if (historyRequestRef.current !== pending) return;
+    window.clearTimeout(pending.timeout);
+    historyRequestRef.current = null;
+    historyCursorRef.current = pending.cursor;
+    setHistoryPagingState("retry");
+    setHistoryPagingMessage(message);
+  }
 
   function closeDirectTransport() {
     directRef.current?.close();
@@ -170,6 +265,13 @@ function App() {
     shouldReconnectRef.current = false;
     setLinkRequested(false);
     setLinkState("offline");
+    const pendingHistory = historyRequestRef.current;
+    if (pendingHistory) {
+      window.clearTimeout(pendingHistory.timeout);
+      historyRequestRef.current = null;
+      setHistoryPagingState("retry");
+      setHistoryPagingMessage("The connection closed before this history page finished. Retry the same cursor after reconnecting.");
+    }
     const socket = socketRef.current;
     socketRef.current = null;
     socket?.close();
@@ -195,6 +297,13 @@ function App() {
       }
       throw new Error("A room deletion took priority over resuming this room.");
     }
+  }
+
+  async function reconcileHubReplayPacket(selectedRoom: string, socket: WebSocket, messageId: string): Promise<boolean> {
+    const replayOrder = hubReplayOrderRef.current;
+    if (!replayOrder || replayOrder.socket !== socket || replayOrder.room !== selectedRoom) return true;
+    if (!replayOrder.ids.includes(messageId)) replayOrder.ids.push(messageId);
+    return reconcileHubReplayOrder(selectedRoom, replayOrder.ids);
   }
 
   useEffect(() => {
@@ -297,7 +406,7 @@ function App() {
       if (!active) return;
       const next = saved ?? { sender: makeId(), senderName: "" };
       setIdentity(next);
-      setDisplayName(next.senderName);
+      if (!callSignEditedRef.current) setDisplayName(next.senderName);
       setProfileSaved(Boolean(saved?.senderName.trim()));
       if (!saved) void saveIdentity(next).catch(() => setNotice("Local identity could not be saved on this device."));
       setStorageReady(true);
@@ -331,6 +440,17 @@ function App() {
       setNotice("Your room setting could not be saved. Re-enter it if you reload this page.");
     }
     setRoomDeletedLocally(false);
+    const pendingHistory = historyRequestRef.current;
+    if (pendingHistory) window.clearTimeout(pendingHistory.timeout);
+    historyRequestRef.current = null;
+    historyCursorRef.current = undefined;
+    historyLimitRef.current = MAX_HISTORY_PAGE_MESSAGES;
+    historyRestartedRef.current = false;
+    joinedHistoryHubUrlRef.current = null;
+    hubReplayOrderRef.current = null;
+    setHistoryPagingState("unavailable");
+    setHistoryPagingMessage("");
+    setHistoryTruncated(false);
     setConversationReady(false);
     setLoadedRoom(null);
     setMessages([]);
@@ -365,6 +485,10 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (skipHistoryAutoScrollRef.current) {
+      skipHistoryAutoScrollRef.current = false;
+      return;
+    }
     messageEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages.length]);
 
@@ -414,8 +538,25 @@ function App() {
         if (!validateWithWasm("server", packet)) { setNotice("The hub sent an invalid packet. It was ignored."); return; }
         if (packet.type === "joined") {
           if (packet.room !== room.trim()) { setNotice("The hub confirmed a different room. Check the room code."); return; }
+          const joinedHubUrl = socket.url;
+          if (joinedHistoryHubUrlRef.current !== null && joinedHistoryHubUrlRef.current !== joinedHubUrl) {
+            const pendingHistory = historyRequestRef.current;
+            if (pendingHistory) window.clearTimeout(pendingHistory.timeout);
+            historyRequestRef.current = null;
+            historyCursorRef.current = undefined;
+            historyLimitRef.current = MAX_HISTORY_PAGE_MESSAGES;
+            historyRestartedRef.current = false;
+            setHistoryPagingState("available");
+            setHistoryPagingMessage("");
+            setHistoryTruncated(Boolean(packet.historyTruncated));
+          }
+          joinedHistoryHubUrlRef.current = joinedHubUrl;
+          hubReplayOrderRef.current = { socket, room: packet.room, ids: [] };
           setPeers(packet.peers);
           setLinkState("online");
+          setHistoryTruncated((current) => current || Boolean(packet.historyTruncated));
+          setHistoryPagingState((current) => current === "retry" || current === "unsupported" || current === "done" ? current : "available");
+          if (packet.historyTruncated) setHistoryPagingMessage("Some retained room history is unavailable. You can still load older messages that remain on the hub.");
           setNotice(packet.historyTruncated
             ? "The hub could not replay the full room history. Older messages may be unavailable."
             : hasHubInboundFailure(hubInboundFailuresRef.current, room.trim()) ? HUB_REPLAY_FAILURE_NOTICE : "");
@@ -429,7 +570,17 @@ function App() {
           }
           return;
         }
-        if (packet.type === "presence") { setPeers(packet.peers); return; }
+        if (packet.type === "presence") {
+          const replayOrder = hubReplayOrderRef.current;
+          if (replayOrder?.socket === socket && replayOrder.room === room.trim()) {
+            const barrier = hubInboundTailRef.current.catch(() => undefined).then(() => {
+              if (hubReplayOrderRef.current === replayOrder) hubReplayOrderRef.current = null;
+            });
+            hubInboundTailRef.current = barrier.then(() => undefined, () => undefined);
+          }
+          setPeers(packet.peers);
+          return;
+        }
         if (packet.type === "ack") {
           const pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === room.trim() && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
           if (!pending) return;
@@ -443,6 +594,42 @@ function App() {
         }
         if (packet.type === "error") {
           const connectionRoom = room.trim();
+          const pendingHistory = historyRequestRef.current;
+          if (pendingHistory?.socket === socket && pendingHistory.room === connectionRoom
+            && ["invalid_cursor", "history_packet_too_large", "history_page_too_large", "not_joined", "invalid_packet"].includes(packet.code)) {
+            if (packet.code === "invalid_cursor") {
+              window.clearTimeout(pendingHistory.timeout);
+              historyRequestRef.current = null;
+              if (!historyRestartedRef.current && pendingHistory.cursor !== null) {
+                historyRestartedRef.current = true;
+                historyCursorRef.current = null;
+                setHistoryPagingState("available");
+                setHistoryPagingMessage("The hub no longer recognizes this cursor. Restarting from its newest retained history.");
+                requestOlderHistory(null);
+              } else {
+                failHistoryRequest(pendingHistory, "The hub rejected this history cursor. Retry from the newest retained history.");
+              }
+              return;
+            }
+            if (packet.code === "history_packet_too_large" || packet.code === "history_page_too_large") {
+              window.clearTimeout(pendingHistory.timeout);
+              historyRequestRef.current = null;
+              historyCursorRef.current = pendingHistory.cursor;
+              historyLimitRef.current = Math.max(1, Math.floor(historyLimitRef.current / 2));
+              setHistoryPagingState("retry");
+              setHistoryPagingMessage("This history page exceeded the hub limit. Retry the same cursor with a smaller page.");
+              return;
+            }
+            if (packet.code === "invalid_packet") {
+              window.clearTimeout(pendingHistory.timeout);
+              historyRequestRef.current = null;
+              setHistoryPagingState("unsupported");
+              setHistoryPagingMessage("This hub does not support versioned history pages. Update the local hub to load older messages.");
+              return;
+            }
+            failHistoryRequest(pendingHistory, "The hub session ended before history could load. Reconnect, then retry the same page.");
+            return;
+          }
           const guidance = packet.code === "capacity_reached" ? "Try a different room or reconnect later."
             : packet.code === "rate_limited" ? "Wait a moment before sending again."
               : packet.code === "storage_unavailable" ? "The message can be retried when hub storage is available."
@@ -469,13 +656,88 @@ function App() {
           setNotice(`${packet.message} ${guidance} (${packet.code})`);
           return;
         }
+        if (packet.type === "history_page_complete") {
+          const pending = historyRequestRef.current;
+          if (!pending || pending.socket !== socket || pending.room !== packet.room || pending.requestId !== packet.requestId) return;
+          const completion = packet as HistoryPageCompletePacket;
+          const operation = hubInboundTailRef.current.catch(() => undefined).then(async () => {
+            if (historyRequestRef.current !== pending || socketRef.current !== socket || currentRoomRef.current !== pending.room) return;
+            if (hasHubInboundFailure(hubInboundFailuresRef.current, pending.room)) {
+              failHistoryRequest(pending, "A streamed history message could not be saved. Retry this page; its cursor has not advanced.");
+              return;
+            }
+            const persisted = await loadMessages(pending.room);
+            const pageMessages: StoredMessage[] = [];
+            for (const id of completion.messageIds) {
+              const packetForId = pending.packets.get(id);
+              const existing = persisted.find((item) => item.packet.id === id);
+              const source = packetForId ?? existing?.packet;
+              if (!source || source.room !== pending.room || source.id !== id || !validateWithWasm("message", source)) {
+                failHistoryRequest(pending, "The history page was incomplete or invalid. Retry the same cursor; it has not advanced.");
+                return;
+              }
+              if (existing && !sameMessagePacket(existing.packet, source)) {
+                failHistoryRequest(pending, "A history message conflicts with saved content. The cursor was kept so the page can be reviewed again.");
+                return;
+              }
+              pageMessages.push({
+                packet: source,
+                direction: source.sender === identity?.sender ? "outgoing" : "incoming",
+                delivery: "sent",
+                transport: "hub",
+                ...(existing?.displayOrder === undefined ? {} : { displayOrder: existing.displayOrder }),
+              });
+            }
+            const computedBytes = pageMessages.reduce((total, item) => total + compactPacketBytes(item.packet), 0);
+            if (computedBytes !== completion.pageBytes) {
+              failHistoryRequest(pending, "The history page size did not match the received messages. Retry the same cursor.");
+              return;
+            }
+            try {
+              const saved = await saveHubHistoryPage(pageMessages, pending.cursor, pending.requestStartOrder);
+              if (!saved) {
+                failHistoryRequest(pending, "This room was cleared on this device. Resume it before loading hub history again.");
+                return;
+              }
+              const verified = await loadMessages(pending.room);
+              if (!completion.messageIds.every((id) => {
+                const expected = pageMessages.find((item) => item.packet.id === id)?.packet;
+                const actual = verified.find((item) => item.packet.id === id)?.packet;
+                return Boolean(expected && actual && sameMessagePacket(expected, actual));
+              })) {
+                failHistoryRequest(pending, "The saved history page could not be verified. Retry the same cursor.");
+                return;
+              }
+              if (historyRequestRef.current !== pending || socketRef.current !== socket || currentRoomRef.current !== pending.room) return;
+              skipHistoryAutoScrollRef.current = true;
+              setMessages(verified);
+              for (const id of completion.messageIds) messageKeysRef.current.add(`${pending.room}\u0000${id}`);
+              historyCursorRef.current = completion.hasMore ? completion.nextCursor : pending.cursor;
+              historyLimitRef.current = MAX_HISTORY_PAGE_MESSAGES;
+              historyRestartedRef.current = false;
+              window.clearTimeout(pending.timeout);
+              historyRequestRef.current = null;
+              setHistoryTruncated((current) => current || completion.historyTruncated);
+              setHistoryPagingState(completion.hasMore ? "available" : "done");
+              setHistoryPagingMessage(completion.historyTruncated
+                ? "Some older room history has expired or was removed. The messages shown follow hub acceptance order."
+                : completion.hasMore ? "History page saved. Load the next older page when ready." : "No more retained hub history is available.");
+            } catch {
+              failHistoryRequest(pending, "Could not save or verify this history page. Retry the same cursor; it has not advanced.");
+            }
+          });
+          hubInboundTailRef.current = operation.then(() => undefined, () => undefined);
+          return;
+        }
         if (packet.type === "message") {
           if (packet.room !== room.trim()) return;
           const messageKey = `${packet.room}\u0000${packet.id}`;
           const connectionRoom = room.trim();
           const previous = hubInboundOperationsRef.current.get(messageKey) ?? Promise.resolve();
-          const operation = previous.catch(() => undefined).then(async () => {
+          const operation = Promise.all([hubInboundTailRef.current.catch(() => undefined), previous.catch(() => undefined)]).then(async () => {
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+            const pending = historyRequestRef.current;
+            if (pending?.socket === socket && pending.room === connectionRoom) pending.packets.set(packet.id, packet);
             const persisted = await loadMessages(connectionRoom).catch(() => null);
             if (!persisted || socketRef.current !== socket || currentRoomRef.current !== connectionRoom) {
               if (!persisted && currentRoomRef.current === connectionRoom) {
@@ -490,12 +752,30 @@ function App() {
                 setNotice("The hub replay used an ID that conflicts with saved message content. The saved message was kept and the replay was ignored.");
                 return;
               }
+              if (existing.transport !== "hub" || existing.delivery !== "sent") {
+                try {
+                  const saved = await saveMessage({ ...existing, transport: "hub", delivery: "sent" });
+                  if (!saved) throw new Error("Room deletion blocked this replay.");
+                } catch {
+                  hubInboundFailuresRef.current.add(messageKey);
+                  setNotice(HUB_REPLAY_FAILURE_NOTICE);
+                  return;
+                }
+              }
+              try {
+                const reconciled = await reconcileHubReplayPacket(connectionRoom, socket, packet.id);
+                if (!reconciled) return;
+              } catch {
+                hubInboundFailuresRef.current.add(messageKey);
+                setNotice(HUB_REPLAY_FAILURE_NOTICE);
+                return;
+              }
               hubInboundFailuresRef.current.delete(messageKey);
               messageKeysRef.current.add(messageKey);
               if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
-              setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id)
-                ? current
-                : [...current, existing].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+              const refreshed = await loadMessages(connectionRoom);
+              if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+              setMessages(refreshed);
               return;
             }
             const item: StoredMessage = { packet, direction: packet.sender === identity.sender ? "outgoing" : "incoming", delivery: "sent", transport: "hub" };
@@ -512,15 +792,26 @@ function App() {
               }
               return;
             }
+            try {
+              const reconciled = await reconcileHubReplayPacket(connectionRoom, socket, packet.id);
+              if (!reconciled) return;
+            } catch {
+              if (currentRoomRef.current === connectionRoom) {
+                hubInboundFailuresRef.current.add(messageKey);
+                setNotice(HUB_REPLAY_FAILURE_NOTICE);
+              }
+              return;
+            }
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
             hubInboundFailuresRef.current.delete(messageKey);
             messageKeysRef.current.add(messageKey);
             if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
-            setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id)
-              ? current
-              : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+            const refreshed = await loadMessages(connectionRoom);
+            if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+            setMessages(refreshed);
           });
           hubInboundOperationsRef.current.set(messageKey, operation);
+          hubInboundTailRef.current = operation.then(() => undefined, () => undefined);
           void operation.finally(() => {
             if (hubInboundOperationsRef.current.get(messageKey) === operation) hubInboundOperationsRef.current.delete(messageKey);
           });
@@ -529,6 +820,8 @@ function App() {
       socket.onerror = () => setNotice("The radio link reported a socket error. Retrying automatically.");
       socket.onclose = () => {
         if (socketRef.current === socket) socketRef.current = null;
+        const pendingHistory = historyRequestRef.current;
+        if (pendingHistory?.socket === socket) failHistoryRequest(pendingHistory, "The connection closed before this history page finished. Reconnect, then retry the same cursor.");
         if (cancelled || !shouldReconnectRef.current) return;
         setLinkState("retrying");
         attemptRef.current += 1;
@@ -546,7 +839,11 @@ function App() {
     };
   }, [linkRequested, wasmReady, storageReady, conversationReady, identity, room, hubUrl]);
 
-  const sortedMessages = useMemo(() => loadedRoom === room.trim() ? [...messages].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)) : [], [loadedRoom, messages, room]);
+  const sortedMessages = useMemo(() => loadedRoom === room.trim() ? [...messages].sort((a, b) => {
+    const left = Number.isFinite(a.displayOrder) ? a.displayOrder! : Number.MAX_SAFE_INTEGER;
+    const right = Number.isFinite(b.displayOrder) ? b.displayOrder! : Number.MAX_SAFE_INTEGER;
+    return left - right;
+  }) : [], [loadedRoom, messages, room]);
   const normalizedName = displayName.trim();
   const conversationLoaded = storageReady && conversationReady && loadedRoom === room.trim();
   const composerReady = conversationLoaded && !roomDeletedLocally;
@@ -1058,7 +1355,7 @@ function App() {
           <div className="section-label"><span>01</span><h2>Station setup</h2></div>
           <form className="station-form" onSubmit={saveProfile}>
             <label htmlFor="display-name">Your call sign</label>
-            <input id="display-name" autoComplete="nickname" maxLength={48} placeholder="e.g. Sam" value={displayName} onChange={(event) => { setDisplayName(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
+            <input id="display-name" autoComplete="nickname" maxLength={48} placeholder="e.g. Sam" value={displayName} onChange={(event) => { callSignEditedRef.current = true; setDisplayName(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
 
             <label htmlFor="room-code">Room frequency</label>
             <input id="room-code" maxLength={64} placeholder="Enter a shared room code" value={room} disabled={deletingRoom} onChange={(event) => { setConversationReady(false); setRoom(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
@@ -1167,8 +1464,18 @@ function App() {
           : storagePersistence === "granted"
             ? "The browser reports that NearLink storage is persistent. This may reduce automatic clearing, but it does not guarantee retention. Messages may still be lost through user action, device loss, or browser behavior. This is not a backup."
             : "This browser cannot assure that saved messages will be retained. Messages may still be lost through user action, device loss, or browser behavior. This is not a backup."}</div>
-        <div className="message-scroll" role="log" aria-label={`Messages in ${room.trim() || "the selected room"}`} aria-live="polite" aria-relevant="additions" tabIndex={0}>
+        <div ref={messageScrollRef} className="message-scroll" role="log" aria-label={`Messages in ${room.trim() || "the selected room"}`} aria-live="polite" aria-relevant="additions" tabIndex={0}>
           {notice && <div ref={deletionStatusRef} className="notice-banner" role="status" tabIndex={-1}><span>!</span>{notice}<button type="button" aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
+          {historyPagingState !== "unavailable" && <section className="history-controls" aria-label="Older room history">
+            {historyPagingState === "loading" ? <p role="status" aria-live="polite" aria-busy="true">Loading older messages…</p>
+              : historyPagingState === "done" ? <p role="status" aria-live="polite">No more retained hub history is available.</p>
+                : historyPagingState === "unsupported" ? <p role="status" aria-live="polite">This hub does not support older history pages. Update the local hub to load older messages.</p>
+                  : <button type="button" onClick={() => requestOlderHistory()} disabled={linkState !== "online" || deletingRoom}>
+                    {historyPagingState === "retry" ? "Retry loading older messages" : "Load older messages"}
+                  </button>}
+            {historyPagingMessage && historyPagingState !== "loading" && historyPagingState !== "done" && <p role="status" aria-live="polite">{historyPagingMessage}</p>}
+            {historyTruncated && <p className="history-retention-gap" role="status" aria-live="polite">Some older room history is unavailable because the hub reported a retention gap.</p>}
+          </section>}
           {sortedMessages.length === 0 ? (
             <div className="empty-state">
               <div className="empty-icon"><SignalMark active={false} /></div>
@@ -1177,8 +1484,8 @@ function App() {
               <p>Join a room to meet nearby stations. Messages sent while offline wait here until your radio reconnects.</p>
               <div className="empty-coordinates"><span>LOCAL ROOM</span><i /><span>READY WHEN YOU ARE</span></div>
             </div>
-          ) : groups.map((group) => (
-            <section className="message-day" key={group.label}>
+          ) : groups.map((group, index) => (
+            <section className="message-day" key={`${group.label}-${index}`}>
               <div className="day-divider"><span>{group.label}</span><i /></div>
               {group.items.map(({ packet, direction, delivery, transport, failure }) => (
                 <article key={`${packet.room}:${packet.id}`} className={`message-row ${direction === "outgoing" ? "message-outgoing" : "message-incoming"}`}>

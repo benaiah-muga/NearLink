@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   isClientPacket,
+  isHistoryPageCompletePacket,
+  isHistoryRequestPacket,
   isJoinPacket,
   isMessagePacket,
   isProtocolIdentifier,
@@ -9,6 +11,8 @@ import {
   isProtocolTimestamp,
   isServerPacket,
   PROTOCOL_VERSION,
+  MAX_HISTORY_PAGE_MESSAGES,
+  MAX_PROTOCOL_ENVELOPE_BYTES,
 } from "../src/index";
 
 const sharedVectors = JSON.parse(readFileSync(new URL("../vectors/v1.json", import.meta.url), "utf8")) as {
@@ -40,9 +44,11 @@ describe("NearLink protocol v1 validation", () => {
   it("matches the shared JSON protocol vectors", () => {
     const validators: Record<string, (value: unknown) => boolean> = {
       client: isClientPacket,
+      history_request: isHistoryRequestPacket,
       join: isJoinPacket,
       message: isMessagePacket,
       server: isServerPacket,
+      history_page_complete: isHistoryPageCompletePacket,
       timestamp: isProtocolTimestamp,
       identifier: isProtocolIdentifier,
       room: isProtocolRoom,
@@ -77,6 +83,42 @@ describe("NearLink protocol v1 validation", () => {
     for (const packet of serverPackets) expect(isServerPacket(packet)).toBe(true);
   });
 
+  it("bounds history requests and enforces completion cursor semantics", () => {
+    const request = {
+      version: PROTOCOL_VERSION,
+      type: "history_request",
+      requestId: "history-1",
+      room: "near_link-1",
+      cursor: null,
+      limit: MAX_HISTORY_PAGE_MESSAGES,
+    };
+    expect(isHistoryRequestPacket(request)).toBe(true);
+    expect(isClientPacket(request)).toBe(true);
+    for (const limit of [0, 1.5, MAX_HISTORY_PAGE_MESSAGES + 1]) {
+      expect(isHistoryRequestPacket({ ...request, limit })).toBe(false);
+    }
+    expect(isHistoryRequestPacket({ ...request, cursor: "bad cursor" })).toBe(false);
+
+    const complete = {
+      version: PROTOCOL_VERSION,
+      type: "history_page_complete",
+      requestId: "history-1",
+      room: "near_link-1",
+      messageIds: ["message-1"],
+      pageBytes: 120,
+      nextCursor: "message-1",
+      hasMore: true,
+      historyTruncated: false,
+    };
+    expect(isHistoryPageCompletePacket(complete)).toBe(true);
+    expect(isServerPacket(complete)).toBe(true);
+    expect(isHistoryPageCompletePacket({ ...complete, nextCursor: null })).toBe(false);
+    expect(isHistoryPageCompletePacket({ ...complete, hasMore: false })).toBe(false);
+    expect(isHistoryPageCompletePacket({ ...complete, messageIds: ["message-1", "message-1"] })).toBe(false);
+    expect(isHistoryPageCompletePacket({ ...complete, pageBytes: 512 * 1024 + 1 })).toBe(false);
+    expect(isHistoryPageCompletePacket({ ...complete, messageIds: [], pageBytes: 0, nextCursor: null, hasMore: false })).toBe(true);
+  });
+
   it("rejects malformed identifiers and rooms", () => {
     for (const id of ["", "bad id", "x".repeat(129), "emoji-🔒", "id\n"]) {
       expect(isProtocolIdentifier(id)).toBe(false);
@@ -96,6 +138,13 @@ describe("NearLink protocol v1 validation", () => {
     expect(isMessagePacket({ ...message, body: "🔒".repeat(4096) })).toBe(true);
     expect(isMessagePacket({ ...message, body: "🔒".repeat(4097) })).toBe(false);
     expect(isMessagePacket({ ...message, body: "  \n  " })).toBe(false);
+  });
+
+  it("also bounds the compact serialized packet when JSON escaping expands a body", () => {
+    const escapedBody = { ...message, body: "\u0001".repeat(4_000) };
+    expect(new TextEncoder().encode(escapedBody.body).byteLength).toBe(4_000);
+    expect(new TextEncoder().encode(JSON.stringify(escapedBody)).byteLength).toBeGreaterThan(MAX_PROTOCOL_ENVELOPE_BYTES);
+    expect(isMessagePacket(escapedBody)).toBe(false);
   });
 
   it("matches Python str.strip whitespace for names and message bodies", () => {
