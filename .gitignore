@@ -9,4 +9,6 @@ target/
 !.env.example
 .unlazy/
 coverage/
+playwright-report/
+test-results/
 .DS_Store
