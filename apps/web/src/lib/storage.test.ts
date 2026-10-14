@@ -85,6 +85,17 @@ describe("local IndexedDB storage", () => {
     await expect(loadMessages("alpha")).resolves.toEqual([message("delivery", "2026-10-14T09:00:00.000Z", "failed")]);
   });
 
+  it("persists a hub conflict failure and clears it when a message is manually retried", async () => {
+    await saveMessage(message("conflict", "2026-10-14T09:00:00.000Z"));
+    await updateDelivery("alpha", "conflict", "failed", "message_conflict");
+    expect((await loadMessages("alpha"))[0]).toMatchObject({ delivery: "failed", failure: "message_conflict" });
+
+    await updateDelivery("alpha", "conflict", "queued", null);
+    const retried = (await loadMessages("alpha"))[0];
+    expect(retried.delivery).toBe("queued");
+    expect(retried.failure).toBeUndefined();
+  });
+
   it("upgrades a version 1 database without losing identity or conversation data", async () => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = openRequest(1);

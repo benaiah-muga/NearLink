@@ -8,6 +8,7 @@ type LinkState = "offline" | "connecting" | "linking" | "online" | "retrying" | 
 const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8000/ws`;
 const HUB_KEY = "nearlink.hub";
 const ROOM_KEY = "nearlink.room";
+const HUB_REPLAY_FAILURE_NOTICE = "A hub message could not be saved or checked on this device. It was not accepted and can be retried after reconnecting.";
 
 function readLocalSetting(key: string): string | null {
   try { return localStorage.getItem(key); }
@@ -58,6 +59,11 @@ function sameMessagePacket(left: MessagePacket, right: MessagePacket): boolean {
     && left.body === right.body;
 }
 
+function hasHubInboundFailure(failures: Set<string>, room: string): boolean {
+  const prefix = `${room}\u0000`;
+  return [...failures].some((key) => key.startsWith(prefix));
+}
+
 function formatTime(timestamp: string): string {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return "time unknown";
@@ -94,6 +100,7 @@ function App() {
   const [isInstallable, setIsInstallable] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [retryingMessageKeys, setRetryingMessageKeys] = useState<Set<string>>(() => new Set());
+  const [conflictedHubMessageKeys, setConflictedHubMessageKeys] = useState<Set<string>>(() => new Set());
   const [directState, setDirectState] = useState<TransportState>("closed");
   const [signalInput, setSignalInput] = useState("");
   const [localSignal, setLocalSignal] = useState("");
@@ -106,6 +113,7 @@ function App() {
   const directRef = useRef<DirectWebRtcTransport | null>(null);
   const messagesRef = useRef(messages);
   const messageKeysRef = useRef(new Set<string>());
+  const conflictedHubMessageKeysRef = useRef(new Set<string>());
   const retryingMessageKeysRef = useRef(new Set<string>());
   const activeRoomRef = useRef(room.trim());
   const pendingSendRef = useRef(false);
@@ -115,6 +123,8 @@ function App() {
   const fingerprintConfirmedRef = useRef(fingerprintConfirmed);
   const directInFlightRef = useRef(new Set<string>());
   const directInboundOperationsRef = useRef(new Map<string, Promise<void>>());
+  const hubInboundOperationsRef = useRef(new Map<string, Promise<void>>());
+  const hubInboundFailuresRef = useRef(new Set<string>());
   const messageEndRef = useRef<HTMLDivElement>(null);
 
   messagesRef.current = messages;
@@ -159,6 +169,9 @@ function App() {
     closeDirectTransport();
     setSignalInput("");
     setSendTransport("hub");
+    if (!hasHubInboundFailure(hubInboundFailuresRef.current, room.trim())) {
+      setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
+    }
     if (room && !writeLocalSetting(ROOM_KEY, room)) {
       setNotice("Your room setting could not be saved. Re-enter it if you reload this page.");
     }
@@ -168,7 +181,7 @@ function App() {
     messageKeysRef.current.clear();
     let active = true;
     if (room.trim()) {
-      loadMessages(room.trim()).then((stored) => { if (active) { setMessages(stored); messageKeysRef.current = new Set(stored.map((item) => `${item.packet.room}\u0000${item.packet.id}`)); setLoadedRoom(room.trim()); setConversationReady(true); } }).catch(() => { if (active) { setMessages([]); messageKeysRef.current.clear(); setLoadedRoom(room.trim()); setNotice("Could not read this conversation from local storage."); setConversationReady(true); } });
+      loadMessages(room.trim()).then((stored) => { if (active) { setMessages(stored); messageKeysRef.current = new Set(stored.map((item) => `${item.packet.room}\u0000${item.packet.id}`)); for (const item of stored) if (item.failure === "message_conflict") conflictedHubMessageKeysRef.current.add(`${item.packet.room}\u0000${item.packet.id}`); setLoadedRoom(room.trim()); setConversationReady(true); } }).catch(() => { if (active) { setMessages([]); messageKeysRef.current.clear(); setLoadedRoom(room.trim()); setNotice("Could not read this conversation from local storage."); setConversationReady(true); } });
     } else {
       setMessages([]);
       messageKeysRef.current.clear();
@@ -235,9 +248,12 @@ function App() {
           if (packet.room !== room.trim()) { setNotice("The hub confirmed a different room. Check the room code."); return; }
           setPeers(packet.peers);
           setLinkState("online");
-          setNotice("");
+          setNotice(packet.historyTruncated
+            ? "The hub could not replay the full room history. Older messages may be unavailable."
+            : hasHubInboundFailure(hubInboundFailuresRef.current, room.trim()) ? HUB_REPLAY_FAILURE_NOTICE : "");
           for (const item of messagesRef.current) {
-            if (item.direction === "outgoing" && item.delivery === "queued" && (item.transport ?? "hub") === "hub") {
+            const messageKey = `${item.packet.room}\u0000${item.packet.id}`;
+            if (item.direction === "outgoing" && item.delivery === "queued" && (item.transport ?? "hub") === "hub" && !conflictedHubMessageKeysRef.current.has(messageKey)) {
               try { socket.send(JSON.stringify(item.packet)); }
               catch { setNotice("Your queued messages are saved. The radio will retry."); socket.close(); break; }
             }
@@ -257,29 +273,84 @@ function App() {
           return;
         }
         if (packet.type === "error") {
-          const guidance = packet.code === "capacity_reached" ? "Try a different room or reconnect later." : packet.code === "rate_limited" ? "Wait a moment before sending again." : "Review the room and message details.";
+          const connectionRoom = room.trim();
+          const guidance = packet.code === "capacity_reached" ? "Try a different room or reconnect later."
+            : packet.code === "rate_limited" ? "Wait a moment before sending again."
+              : packet.code === "storage_unavailable" ? "The message can be retried when hub storage is available."
+                : packet.code === "message_conflict" ? "This message ID conflicts with saved content and was not accepted."
+                  : "Review the room and message details.";
           if (packet.id) {
-            const rejected = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === room.trim() && item.direction === "outgoing");
+            const rejected = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing");
             if (rejected) {
+              const rejectedKey = `${rejected.packet.room}\u0000${rejected.packet.id}`;
+              if (packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub") {
+                conflictedHubMessageKeysRef.current.add(rejectedKey);
+                setConflictedHubMessageKeys((current) => new Set(current).add(rejectedKey));
+              }
               let saved = true;
-              try { await updateDelivery(rejected.packet.room, packet.id, "failed"); }
+              try { await updateDelivery(rejected.packet.room, packet.id, "failed", packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub" ? "message_conflict" : undefined); }
               catch { saved = false; }
-              if (socketRef.current !== socket) return;
-              setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === rejected.packet.room ? { ...item, delivery: "failed" } : item));
-              if (!saved) setNotice("The hub rejected your message, but its status could not be saved on this device.");
+              setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === rejected.packet.room
+                ? { ...item, delivery: "failed", ...(packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub" ? { failure: "message_conflict" as const } : {}) }
+                : item));
+              if (!saved && socketRef.current === socket && currentRoomRef.current === rejected.packet.room) setNotice("The hub rejected your message, but its status could not be saved on this device.");
             }
           }
+          if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
           setNotice(`${packet.message} ${guidance} (${packet.code})`);
           return;
         }
         if (packet.type === "message") {
           if (packet.room !== room.trim()) return;
           const messageKey = `${packet.room}\u0000${packet.id}`;
-          if (messageKeysRef.current.has(messageKey)) return;
-          messageKeysRef.current.add(messageKey);
-          const item: StoredMessage = { packet, direction: packet.sender === identity.sender ? "outgoing" : "incoming", delivery: "sent" };
-          setMessages((current) => [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
-          void saveMessage(item).catch(() => setNotice("Message received, but could not be saved on this device."));
+          const connectionRoom = room.trim();
+          const previous = hubInboundOperationsRef.current.get(messageKey) ?? Promise.resolve();
+          const operation = previous.catch(() => undefined).then(async () => {
+            if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+            const persisted = await loadMessages(connectionRoom).catch(() => null);
+            if (!persisted || socketRef.current !== socket || currentRoomRef.current !== connectionRoom) {
+              if (!persisted && currentRoomRef.current === connectionRoom) {
+                hubInboundFailuresRef.current.add(messageKey);
+                setNotice(HUB_REPLAY_FAILURE_NOTICE);
+              }
+              return;
+            }
+            const existing = persisted.find((entry) => entry.packet.id === packet.id);
+            if (existing) {
+              if (!sameMessagePacket(existing.packet, packet)) {
+                setNotice("The hub replay used an ID that conflicts with saved message content. The saved message was kept and the replay was ignored.");
+                return;
+              }
+              hubInboundFailuresRef.current.delete(messageKey);
+              messageKeysRef.current.add(messageKey);
+              if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
+              setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id)
+                ? current
+                : [...current, existing].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+              return;
+            }
+            const item: StoredMessage = { packet, direction: packet.sender === identity.sender ? "outgoing" : "incoming", delivery: "sent", transport: "hub" };
+            try {
+              await saveMessage(item);
+            } catch {
+              if (currentRoomRef.current === connectionRoom) {
+                hubInboundFailuresRef.current.add(messageKey);
+                setNotice(HUB_REPLAY_FAILURE_NOTICE);
+              }
+              return;
+            }
+            if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+            hubInboundFailuresRef.current.delete(messageKey);
+            messageKeysRef.current.add(messageKey);
+            if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
+            setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id)
+              ? current
+              : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+          });
+          hubInboundOperationsRef.current.set(messageKey, operation);
+          void operation.finally(() => {
+            if (hubInboundOperationsRef.current.get(messageKey) === operation) hubInboundOperationsRef.current.delete(messageKey);
+          });
         }
       };
       socket.onerror = () => setNotice("The radio link reported a socket error. Retrying automatically.");
@@ -528,7 +599,7 @@ function App() {
     retryingMessageKeysRef.current.add(messageKey);
     setRetryingMessageKeys(new Set(retryingMessageKeysRef.current));
     try {
-      await updateDelivery(message.packet.room, message.packet.id, "queued");
+      await updateDelivery(message.packet.room, message.packet.id, "queued", null);
     } catch {
       setNotice("Could not queue this message for retry on this device.");
       return;
@@ -536,7 +607,13 @@ function App() {
       retryingMessageKeysRef.current.delete(messageKey);
       setRetryingMessageKeys(new Set(retryingMessageKeysRef.current));
     }
-    setMessages((current) => current.map((item) => item.packet.id === message.packet.id && item.packet.room === message.packet.room ? { ...item, delivery: "queued" } : item));
+    conflictedHubMessageKeysRef.current.delete(messageKey);
+    setConflictedHubMessageKeys((current) => {
+      const next = new Set(current);
+      next.delete(messageKey);
+      return next;
+    });
+    setMessages((current) => current.map((item) => item.packet.id === message.packet.id && item.packet.room === message.packet.room ? { ...item, delivery: "queued", failure: undefined } : item));
     if (activeRoomRef.current === message.packet.room) {
       if (message.transport === "direct") {
         sendDirectMessage(message);
@@ -722,7 +799,7 @@ function App() {
           ) : groups.map((group) => (
             <section className="message-day" key={group.label}>
               <div className="day-divider"><span>{group.label}</span><i /></div>
-              {group.items.map(({ packet, direction, delivery, transport }) => (
+              {group.items.map(({ packet, direction, delivery, transport, failure }) => (
                 <article key={`${packet.room}:${packet.id}`} className={`message-row ${direction === "outgoing" ? "message-outgoing" : "message-incoming"}`}>
                   <div className="message-avatar" aria-hidden="true">{(packet.senderName || "?").slice(0, 1).toUpperCase()}</div>
                   <div className="message-content">
@@ -730,7 +807,7 @@ function App() {
                     <div className="message-bubble">{packet.body}</div>
                     {direction === "outgoing" && <div className={`delivery-state ${delivery}`}>
                       <span className="delivery-glyph">{delivery === "sent" ? "✓" : delivery === "failed" ? "!" : "◷"}</span>
-                      {delivery === "sent" ? (transport === "direct" ? "Accepted by peer device" : "Accepted by hub") : delivery === "failed" ? <>Not accepted <button type="button" className="retry-button" disabled={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} aria-busy={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} onClick={() => void retryMessage({ packet, direction, delivery, transport })}>{retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "Retrying…" : "Retry"}</button></> : "Queued on this device"}
+                      {delivery === "sent" ? (transport === "direct" ? "Accepted by peer device" : "Accepted by hub") : delivery === "failed" ? failure === "message_conflict" || conflictedHubMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "This ID conflicts with saved content. Compose a new message to send with a new ID." : <>Not accepted <button type="button" className="retry-button" disabled={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} aria-busy={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} onClick={() => void retryMessage({ packet, direction, delivery, transport })}>{retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "Retrying…" : "Retry"}</button></> : "Queued on this device"}
                     </div>}
                   </div>
                 </article>

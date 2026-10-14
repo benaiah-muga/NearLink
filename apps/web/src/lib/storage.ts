@@ -7,6 +7,7 @@ export interface StoredMessage {
   direction: "outgoing" | "incoming";
   delivery: DeliveryState;
   transport?: "hub" | "direct";
+  failure?: "message_conflict";
 }
 
 export interface LocalIdentity {
@@ -207,7 +208,7 @@ export async function saveMessage(message: StoredMessage): Promise<void> {
   );
 }
 
-export async function updateDelivery(room: string, id: string, delivery: DeliveryState): Promise<void> {
+export async function updateDelivery(room: string, id: string, delivery: DeliveryState, failure?: StoredMessage["failure"] | null): Promise<void> {
   await withTransaction<void>(
     "Could not update message status",
     MESSAGE_STORE,
@@ -220,7 +221,10 @@ export async function updateDelivery(room: string, id: string, delivery: Deliver
           complete(undefined);
           return;
         }
-        observe(store.put({ ...found, delivery }), () => complete(undefined), setFailure);
+        const updated = { ...found, delivery };
+        if (failure === null) delete updated.failure;
+        else if (failure !== undefined) updated.failure = failure;
+        observe(store.put(updated), () => complete(undefined), setFailure);
       };
       request.onerror = () => setFailure(request.error ?? new Error("Could not read the message status."));
     },

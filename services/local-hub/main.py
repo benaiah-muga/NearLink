@@ -1,17 +1,20 @@
-"""Small in-memory WebSocket relay for the NearLink v1 draft protocol.
+"""Small SQLite-backed WebSocket relay for the NearLink v1 draft protocol.
 
 Messages are plaintext. Room codes provide routing only and do not authenticate
-participants. State exists only while clients are connected to this process.
+participants. Message history is retained locally within configured bounds.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
-from time import monotonic
+from pathlib import Path
+from time import monotonic, time
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -28,6 +31,17 @@ MAX_ROOM_MEMBERS = 32
 MAX_TOTAL_CLIENTS = 256
 MAX_MESSAGES_PER_MINUTE = 120
 SEND_TIMEOUT_SECONDS = 2
+MAX_REPLAY_MESSAGES = 100
+MAX_MESSAGES_PER_ROOM = 200
+MAX_TOTAL_STORED_MESSAGES = 2_000
+MAX_TRACKED_ROOMS = MAX_TOTAL_STORED_MESSAGES + MAX_ROOMS
+MAX_TOTAL_STORED_BYTES = 32 * 1024 * 1024
+MAX_DATABASE_BYTES = 64 * 1024 * 1024
+SQLITE_PAGE_BYTES = 4_096
+MAX_DATABASE_PAGES = MAX_DATABASE_BYTES // SQLITE_PAGE_BYTES
+MESSAGE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+MAX_STORED_PACKET_BYTES = MAX_FRAME_BYTES
+DEFAULT_DATABASE_PATH = "nearlink-hub.sqlite3"
 
 ROOM_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -59,6 +73,271 @@ class Client:
 
 rooms: dict[str, set[Client]] = {}
 active_connections = 0
+room_delivery_lock = asyncio.Lock()
+
+
+class MessageStore:
+    """Bounded local message history backed by SQLite.
+
+    Each operation opens its own connection so worker threads and app reloads
+    do not share a SQLite connection. Unique room and message IDs make retries
+    idempotent while a record is retained.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        replay_limit: int = MAX_REPLAY_MESSAGES,
+        per_room_limit: int = MAX_MESSAGES_PER_ROOM,
+        total_limit: int = MAX_TOTAL_STORED_MESSAGES,
+    ) -> None:
+        self.path = str(path) if str(path) == ":memory:" else str(Path(path).expanduser())
+        self.replay_limit = replay_limit
+        self.per_room_limit = per_room_limit
+        self.total_limit = total_limit
+
+    def _connect(self) -> sqlite3.Connection:
+        if self.path != ":memory:":
+            file_path = Path(self.path).resolve()
+            file_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = os.open(file_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+        connection = sqlite3.connect(self.path, timeout=2)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 2000")
+        connection.execute("PRAGMA wal_autocheckpoint = 100")
+        connection.execute(f"PRAGMA max_page_count = {MAX_DATABASE_PAGES}")
+        connection.execute("PRAGMA journal_mode = WAL")
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version > 2:
+            connection.close()
+            raise sqlite3.DatabaseError("database schema version is newer than this hub")
+        if version == 0:
+            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            try:
+                connection.executescript(
+                    """BEGIN IMMEDIATE;
+                    CREATE TABLE messages (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    packet TEXT NOT NULL,
+                    packet_bytes INTEGER NOT NULL,
+                    stored_at REAL NOT NULL,
+                    UNIQUE(room, message_id)
+                    );
+                    CREATE INDEX messages_room_sequence ON messages(room, sequence);
+                    CREATE TABLE room_state (
+                        room TEXT PRIMARY KEY,
+                        history_truncated INTEGER NOT NULL DEFAULT 0,
+                        touched_at REAL NOT NULL
+                    );
+                    CREATE TABLE store_state (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        marker_overflow INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO store_state(id, marker_overflow) VALUES (1, 0);
+                    PRAGMA user_version = 2;
+                    COMMIT;"""
+                )
+            except sqlite3.Error:
+                connection.rollback()
+                connection.close()
+                raise
+        elif version == 1:
+            try:
+                connection.executescript(
+                    """BEGIN IMMEDIATE;
+                    ALTER TABLE room_state ADD COLUMN touched_at REAL NOT NULL DEFAULT 0;
+                    UPDATE room_state SET touched_at = 0;
+                    CREATE TABLE store_state (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        marker_overflow INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO store_state(id, marker_overflow) VALUES (1, 0);
+                    PRAGMA user_version = 2;
+                    COMMIT;"""
+                )
+            except sqlite3.Error:
+                connection.rollback()
+                connection.close()
+                raise
+        elif version == 2:
+            for table in ("messages", "room_state", "store_state"):
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone()
+                if exists is None:
+                    connection.close()
+                    raise sqlite3.DatabaseError(f"version 2 database is missing {table}")
+        self._secure_sidecars()
+        return connection
+
+    @staticmethod
+    def _touch_room(connection: sqlite3.Connection, room: str, *, truncated: bool = False) -> None:
+        connection.execute(
+            """INSERT INTO room_state(room, history_truncated, touched_at) VALUES (?, ?, ?)
+               ON CONFLICT(room) DO UPDATE SET
+                 history_truncated = MAX(room_state.history_truncated, excluded.history_truncated),
+                 touched_at = excluded.touched_at""",
+            (room, int(truncated), time()),
+        )
+
+    @staticmethod
+    def _trim_room_markers(connection: sqlite3.Connection) -> None:
+        count = connection.execute("SELECT COUNT(*) FROM room_state").fetchone()[0]
+        overflow = count - MAX_TRACKED_ROOMS
+        if overflow <= 0:
+            return
+        removed = connection.execute(
+            """SELECT room FROM room_state
+               WHERE room NOT IN (SELECT DISTINCT room FROM messages)
+               ORDER BY touched_at ASC LIMIT ?""",
+            (overflow,),
+        ).fetchall()
+        if removed:
+            connection.executemany("DELETE FROM room_state WHERE room = ?", [(row["room"],) for row in removed])
+            connection.execute("UPDATE store_state SET marker_overflow = 1 WHERE id = 1")
+
+    def store(self, packet: dict[str, Any]) -> str:
+        encoded = json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
+        try:
+            packet_size = len(encoded.encode("utf-8"))
+        except UnicodeEncodeError:
+            return "invalid"
+        if packet_size > MAX_STORED_PACKET_BYTES:
+            return "too_large"
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT packet FROM messages WHERE room = ? AND message_id = ?",
+                (packet["room"], packet["id"]),
+            ).fetchone()
+            if existing is not None:
+                connection.rollback()
+                return "duplicate" if existing["packet"] == encoded else "conflict"
+
+            self._touch_room(connection, packet["room"])
+            cutoff = time() - MESSAGE_RETENTION_SECONDS
+            expired_rooms = connection.execute(
+                "SELECT DISTINCT room FROM messages WHERE stored_at < ?", (cutoff,)
+            ).fetchall()
+            connection.execute("DELETE FROM messages WHERE stored_at < ?", (cutoff,))
+            for expired_room in expired_rooms:
+                self._touch_room(connection, expired_room["room"], truncated=True)
+
+            connection.execute(
+                "INSERT INTO messages(room, message_id, packet, packet_bytes, stored_at) VALUES (?, ?, ?, ?, ?)",
+                (packet["room"], packet["id"], encoded, packet_size, time()),
+            )
+            room_before = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE room = ?", (packet["room"],)
+            ).fetchone()[0]
+            connection.execute(
+                """DELETE FROM messages WHERE room = ? AND sequence NOT IN (
+                    SELECT sequence FROM messages WHERE room = ?
+                    ORDER BY sequence DESC LIMIT ?
+                )""",
+                (packet["room"], packet["room"], self.per_room_limit),
+            )
+            room_after = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE room = ?", (packet["room"],)
+            ).fetchone()[0]
+            if room_before > room_after:
+                self._touch_room(connection, packet["room"], truncated=True)
+            while True:
+                totals = connection.execute(
+                    "SELECT COUNT(*) AS rows, COALESCE(SUM(packet_bytes), 0) AS bytes FROM messages"
+                ).fetchone()
+                if totals["rows"] <= self.total_limit and totals["bytes"] <= MAX_TOTAL_STORED_BYTES:
+                    break
+                oldest = connection.execute(
+                    "SELECT sequence, room FROM messages ORDER BY sequence LIMIT 1"
+                ).fetchone()
+                if oldest is None:
+                    break
+                connection.execute("DELETE FROM messages WHERE sequence = ?", (oldest["sequence"],))
+                self._touch_room(connection, oldest["room"], truncated=True)
+            self._trim_room_markers(connection)
+            connection.commit()
+            try:
+                self._post_commit_maintenance(connection)
+            except (OSError, sqlite3.Error):
+                # The message is already durable. Housekeeping cannot turn a
+                # committed message into a storage failure response.
+                pass
+            return "stored"
+        except sqlite3.Error:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _secure_sidecars(self) -> None:
+        if self.path == ":memory:":
+            return
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                os.chmod(f"{self.path}{suffix}", 0o600)
+            except FileNotFoundError:
+                pass
+
+    def _post_commit_maintenance(self, connection: sqlite3.Connection) -> None:
+        connection.execute("PRAGMA incremental_vacuum(16)")
+        self._secure_sidecars()
+
+    def recent(self, room: str) -> tuple[list[dict[str, Any]], bool]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cutoff = time() - MESSAGE_RETENTION_SECONDS
+            expired_rooms = connection.execute(
+                "SELECT DISTINCT room FROM messages WHERE stored_at < ?", (cutoff,)
+            ).fetchall()
+            connection.execute("DELETE FROM messages WHERE stored_at < ?", (cutoff,))
+            for expired_room in expired_rooms:
+                self._touch_room(connection, expired_room["room"], truncated=True)
+            self._trim_room_markers(connection)
+            count = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE room = ?", (room,)
+            ).fetchone()[0]
+            state = connection.execute(
+                "SELECT history_truncated FROM room_state WHERE room = ?", (room,)
+            ).fetchone()
+            marker_overflow = connection.execute(
+                "SELECT marker_overflow FROM store_state WHERE id = 1"
+            ).fetchone()[0]
+            rows = connection.execute(
+                """SELECT packet FROM messages WHERE room = ?
+                   ORDER BY sequence DESC LIMIT ?""",
+                (room, self.replay_limit),
+            ).fetchall()
+            truncated = (
+                count > self.replay_limit
+                or (state is not None and bool(state["history_truncated"]))
+                or bool(marker_overflow)
+            )
+            connection.commit()
+            return [json.loads(row["packet"]) for row in reversed(rows)], truncated
+        except sqlite3.Error:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+def database_path() -> str:
+    configured = os.environ.get("NEARLINK_HUB_DB_PATH", "").strip()
+    return configured or DEFAULT_DATABASE_PATH
+
+
+message_store = MessageStore(database_path())
 
 
 def packet_error(code: str, message: str, message_id: str | None = None) -> dict[str, Any]:
@@ -182,23 +461,64 @@ async def broadcast_presence(room: str) -> None:
     )
 
 
-async def relay(client: Client, packet: dict[str, Any]) -> None:
-    # Confirm hub acceptance before attempting best-effort delivery to peers.
-    await send_packet(client, {"version": PROTOCOL_VERSION, "type": "ack", "id": packet["id"]})
-    members = tuple(rooms.get(client.room, ()))
-    recipients = [member for member in members if member is not client]
-    if recipients:
-        results = await asyncio.gather(
-            *(send_packet(recipient, packet) for recipient in recipients),
-            return_exceptions=True,
-        )
-        for recipient, result in zip(recipients, results):
-            if isinstance(result, BaseException):
-                await remove_client(recipient)
-                try:
-                    await recipient.websocket.close(code=1013)
-                except Exception:
-                    pass
+async def relay(client: Client, packet: dict[str, Any]) -> bool:
+    # Serialize storage, ACK, fan-out, and room snapshots so a joining client
+    # sees either a message in history or after history, never in both or neither.
+    async with room_delivery_lock:
+        try:
+            result = await asyncio.to_thread(message_store.store, packet)
+        except (OSError, sqlite3.Error):
+            await send_packet(
+                client,
+                packet_error("storage_unavailable", "The local hub could not store this message.", packet["id"]),
+            )
+            return False
+        if result == "conflict":
+            await send_packet(
+                client,
+                packet_error(
+                    "message_conflict", "This message ID was already used for different content.", packet["id"]
+                ),
+            )
+            return False
+        if result == "too_large":
+            await send_packet(
+                client,
+                packet_error("message_too_large", "Packet exceeds the maximum size.", packet["id"]),
+            )
+            return False
+        if result == "invalid":
+            await send_packet(client, packet_error("invalid_packet", "Message contains invalid text.", packet["id"]))
+            return False
+
+        ack_failed = False
+        try:
+            await send_packet(client, {"version": PROTOCOL_VERSION, "type": "ack", "id": packet["id"]})
+        except Exception:
+            # The row is already durable. A broken sender socket must not
+            # prevent other connected room members from receiving the packet.
+            ack_failed = True
+        members = tuple(rooms.get(client.room, ()))
+        recipients = [member for member in members if member is not client]
+        if result != "duplicate" and recipients:
+            results = await asyncio.gather(
+                *(send_packet(recipient, packet) for recipient in recipients),
+                return_exceptions=True,
+            )
+            for recipient, send_result in zip(recipients, results):
+                if isinstance(send_result, BaseException):
+                    await remove_client(recipient)
+                    try:
+                        await recipient.websocket.close(code=1013)
+                    except Exception:
+                        pass
+        if ack_failed:
+            await remove_client(client)
+            try:
+                await client.websocket.close(code=1011)
+            except Exception:
+                pass
+        return ack_failed
 
 
 async def remove_client(client: Client) -> None:
@@ -241,24 +561,53 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             return
 
         room, sender, sender_name = join
-        total_clients = sum(len(members) for members in rooms.values())
-        current_room = rooms.get(room, set())
-        if (
-            total_clients >= MAX_TOTAL_CLIENTS
-            or (room not in rooms and len(rooms) >= MAX_ROOMS)
-            or len(current_room) >= MAX_ROOM_MEMBERS
-        ):
-            await send_error(websocket, "capacity_reached", "The local hub has reached its room capacity.")
-            await websocket.close(code=1013)
-            return
-        client = Client(websocket, room, sender, sender_name)
-        members = rooms.setdefault(room, set())
-        members.add(client)
-        await send_packet(
-            client,
-            {"version": PROTOCOL_VERSION, "type": "joined", "room": room, "peers": max(0, len(members) - 1)},
-        )
-        await broadcast_presence(room)
+        async with room_delivery_lock:
+            total_clients = sum(len(members) for members in rooms.values())
+            current_room = rooms.get(room, set())
+            if (
+                total_clients >= MAX_TOTAL_CLIENTS
+                or (room not in rooms and len(rooms) >= MAX_ROOMS)
+                or len(current_room) >= MAX_ROOM_MEMBERS
+            ):
+                await send_error(websocket, "capacity_reached", "The local hub has reached its room capacity.")
+                await websocket.close(code=1013)
+                return
+            client = Client(websocket, room, sender, sender_name)
+            members = rooms.setdefault(room, set())
+            members.add(client)
+            try:
+                history, truncated = await asyncio.to_thread(message_store.recent, room)
+            except (OSError, sqlite3.Error):
+                await send_packet(
+                    client,
+                    packet_error("storage_unavailable", "The local hub could not load room history."),
+                )
+                await websocket.close(code=1011)
+                return
+            await send_packet(
+                client,
+                {
+                    "version": PROTOCOL_VERSION,
+                    "type": "joined",
+                    "room": room,
+                    "peers": max(0, len(members) - 1),
+                    "historyTruncated": truncated,
+                },
+            )
+            try:
+                async def replay_history() -> None:
+                    for packet in history:
+                        await send_packet(client, packet)
+
+                await asyncio.wait_for(replay_history(), timeout=5)
+            except asyncio.TimeoutError:
+                await send_packet(
+                    client,
+                    packet_error("storage_unavailable", "The local hub could not replay room history."),
+                )
+                await websocket.close(code=1013)
+                return
+            await broadcast_presence(room)
 
         while True:
             raw = await websocket.receive_text()
@@ -291,7 +640,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     packet_error("rate_limited", "Please wait before sending more messages.", message_id),
                 )
                 continue
-            await relay(client, message)
+            if await relay(client, message):
+                break
     except WebSocketDisconnect:
         pass
     finally:

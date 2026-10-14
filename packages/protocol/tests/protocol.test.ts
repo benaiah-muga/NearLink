@@ -40,11 +40,14 @@ describe("NearLink protocol v1 validation", () => {
   it("accepts valid server packet variants", () => {
     const serverPackets = [
       { version: 1, type: "joined", room: "near_link-1", peers: 2 },
+      { version: 1, type: "joined", room: "near_link-1", peers: 2, historyTruncated: true },
       message,
       { version: 1, type: "ack", id: "message:one.1" },
       { version: 1, type: "presence", peers: 2 },
       { version: 1, type: "error", code: "invalid_packet", message: "Packet rejected." },
       { version: 1, type: "error", code: "invalid_packet", message: "Packet rejected.", id: "message:one.1" },
+      { version: 1, type: "error", code: "message_conflict", message: "Message ID conflict.", id: "message:one.1" },
+      { version: 1, type: "error", code: "storage_unavailable", message: "Storage unavailable.", id: "message:one.1" },
     ];
 
     for (const packet of serverPackets) expect(isServerPacket(packet)).toBe(true);
@@ -140,6 +143,7 @@ describe("NearLink protocol v1 validation", () => {
   it("rejects malformed server packet fields", () => {
     expect(isServerPacket({ version: 1, type: "joined", room: "bad room", peers: 0 })).toBe(false);
     expect(isServerPacket({ version: 1, type: "joined", room: "room", peers: -1 })).toBe(false);
+    expect(isServerPacket({ version: 1, type: "joined", room: "room", peers: 0, historyTruncated: "yes" })).toBe(false);
     expect(isServerPacket({ version: 1, type: "presence", peers: 1.5 })).toBe(false);
     expect(isServerPacket({ version: 1, type: "ack", id: "bad id" })).toBe(false);
     expect(isServerPacket({ version: 1, type: "error", code: "unknown", message: "no" })).toBe(false);

@@ -87,6 +87,7 @@ export interface JoinedPacket {
   type: "joined";
   room: string;
   peers: number;
+  historyTruncated?: boolean;
 }
 
 export interface AcknowledgmentPacket {
@@ -109,7 +110,9 @@ export interface ErrorPacket {
     | "room_required"
     | "message_too_large"
     | "capacity_reached"
-    | "rate_limited";
+    | "rate_limited"
+    | "message_conflict"
+    | "storage_unavailable";
   message: string;
   id?: string;
 }
@@ -153,7 +156,10 @@ export function isServerPacket(value: unknown): value is ServerPacket {
 
   switch (value.type) {
     case "joined":
-      return isProtocolRoom(value.room) && Number.isInteger(value.peers) && Number(value.peers) >= 0;
+      return isProtocolRoom(value.room)
+        && Number.isInteger(value.peers)
+        && Number(value.peers) >= 0
+        && (value.historyTruncated === undefined || typeof value.historyTruncated === "boolean");
     case "message":
       return isMessagePacket(value);
     case "ack":
@@ -161,7 +167,7 @@ export function isServerPacket(value: unknown): value is ServerPacket {
     case "presence":
       return Number.isInteger(value.peers) && Number(value.peers) >= 0;
     case "error":
-      return ["invalid_packet", "room_required", "message_too_large", "capacity_reached", "rate_limited"].includes(String(value.code))
+      return ["invalid_packet", "room_required", "message_too_large", "capacity_reached", "rate_limited", "message_conflict", "storage_unavailable"].includes(String(value.code))
         && typeof value.message === "string"
         && (value.id === undefined || isProtocolIdentifier(value.id));
     default:
