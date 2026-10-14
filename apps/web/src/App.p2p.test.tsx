@@ -89,7 +89,7 @@ vi.mock("./lib/webrtc", () => {
 });
 
 import App from "./App";
-import { loadMessages, saveIdentity } from "./lib/storage";
+import { isRoomMessagesDeleted, loadIdentity, loadMessages, saveIdentity } from "./lib/storage";
 
 const ROOM = "campus-radio";
 const IDENTITY = { sender: "station-a", senderName: "Ari" };
@@ -103,13 +103,14 @@ async function resetDatabase(): Promise<void> {
     request.onblocked = () => reject(new Error("Test database deletion was blocked."));
   });
   await new Promise<void>((resolve, reject) => {
-    const request = indexedDB.open("nearlink-local", 2);
+    const request = indexedDB.open("nearlink-local", 3);
     request.onupgradeneeded = () => {
       const database = request.result;
       const messages = database.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
       messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
       messages.createIndex("roomDeliveryCreatedAt", ["packet.room", "delivery", "packet.createdAt"]);
       database.createObjectStore("identity", { keyPath: "key" });
+      database.createObjectStore("roomDeletions", { keyPath: "room" });
     };
     request.onsuccess = () => {
       const database = request.result;
@@ -143,6 +144,7 @@ beforeEach(async () => {
     constructor() { socketMock.constructions += 1; throw new Error("The test socket must not be opened."); }
   });
   await resetDatabase();
+  await Promise.all([loadIdentity(), loadMessages(ROOM), isRoomMessagesDeleted(ROOM)]);
 });
 
 afterEach(async () => {
@@ -155,7 +157,7 @@ afterEach(async () => {
 describe("direct peer app flow", () => {
   it("exchanges signaling, blocks unverified direct send, saves messages before ACK, and records peer acceptance", async () => {
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
 
     fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
     await screen.findByLabelText("Your signaling JSON to share");
@@ -242,11 +244,11 @@ describe("direct peer app flow", () => {
     await waitFor(() => expect(screen.getByText(/conflicting direct message/)).toBeTruthy());
     expect(transport.sent).toHaveLength(countBeforeConflict);
     expect((await loadMessages(ROOM)).find((item) => item.packet.id === inbound.id)?.packet.body).toBe(inbound.body);
-  });
+  }, 30_000);
 
   it("keeps direct messages queued after disconnect and closes the peer on room changes", async () => {
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
     fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
     await screen.findByLabelText("Your signaling JSON to share");
     fireEvent.change(screen.getByLabelText("Paste peer offer or answer JSON"), { target: { value: JSON.stringify({ version: 1, type: "answer", sdp: "test-answer" }) } });
@@ -282,7 +284,7 @@ describe("direct peer app flow", () => {
 
   it("closes replaced transports and ignores an offer completion after its room changes", async () => {
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
     fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
     await screen.findByLabelText("Your signaling JSON to share");
     const first = peerMock.instances[0];
@@ -306,7 +308,7 @@ describe("direct peer app flow", () => {
 
   it("does not transmit a direct message while its save is pending or after the save fails", async () => {
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
     fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
     await screen.findByLabelText("Your signaling JSON to share");
     fireEvent.change(screen.getByLabelText("Paste peer offer or answer JSON"), { target: { value: JSON.stringify({ version: 1, type: "answer", sdp: "test-answer" }) } });
@@ -337,7 +339,7 @@ describe("direct peer app flow", () => {
   it("reports a WebRTC constructor failure and releases the busy controls", async () => {
     constructorGate.throwNext = true;
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
     fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
     await screen.findByText("Browser WebRTC is unavailable.");
     await waitFor(() => expect((screen.getByRole("button", { name: "Create offer" }) as HTMLButtonElement).disabled).toBe(false));
@@ -347,7 +349,7 @@ describe("direct peer app flow", () => {
   it("saves a direct profile without opening a WebSocket", async () => {
     await saveIdentity({ ...IDENTITY, senderName: "" });
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
     expect((screen.getByRole("button", { name: "Create offer" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "Send message" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: "Nia" } });

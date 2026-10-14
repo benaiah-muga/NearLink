@@ -51,4 +51,23 @@ test("saves a station profile and keeps a message queued through reload without 
   const restoredLog = page.getByRole("log", { name: "Messages in chromium-queue-check" });
   await expect(restoredLog.getByText(message)).toBeVisible();
   await expect(restoredLog.getByText("Queued on this device")).toBeVisible();
+
+  const clearConversation = page.getByRole("button", { name: "Clear this device's saved conversation" });
+  const confirmation = page.getByRole("dialog", { name: "Clear saved messages for chromium-queue-check?" });
+  await expect(confirmation).toBeHidden();
+  await clearConversation.click();
+  await expect(confirmation).toBeVisible();
+  await expectAccessible(page, "the local conversation deletion confirmation");
+  await page.keyboard.press("Escape");
+  await expect(confirmation).toBeHidden();
+  await expect(clearConversation).toBeFocused();
+
+  await clearConversation.click();
+  await confirmation.getByRole("button", { name: "Delete local messages" }).click();
+  await expect(confirmation).toBeHidden();
+  await expect(restoredLog.getByText(message)).toBeHidden();
+  await expect(page.getByLabel("Your call sign")).toHaveValue("Test Station");
+  await expect(page.getByLabel("Room frequency")).toHaveValue("chromium-queue-check");
+  await expect(page.getByText(/Hub history was not deleted and may appear after you reconnect/)).toBeVisible();
+  await expectAccessible(page, "the cleared local conversation screen");
 });

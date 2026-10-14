@@ -26,6 +26,9 @@ confidential, or otherwise sensitive communication.
   a separate trusted channel.
 - Queued outgoing messages, retry controls, connection status, and bounded
   history warnings.
+- A per-room control to delete that room's saved and queued messages from the
+  current browser. The local identity and settings stay saved. The action does
+  not delete hub-retained history, which may replay after reconnecting.
 
 The local hub ACK means that the hub accepted a message into its local store. It
 does not mean another participant received or read it. Direct peer acceptance

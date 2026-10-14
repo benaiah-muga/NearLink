@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
-import { loadIdentity, loadMessages, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, resumeRoomMessages, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const DATABASE_NAME = "nearlink-local";
 
@@ -57,6 +57,16 @@ describe("local IndexedDB storage", () => {
     await expect(loadMessages("missing")).resolves.toEqual([]);
   });
 
+  it("loads identity, room messages, and deletion status concurrently", async () => {
+    await saveIdentity({ sender: "device-1", senderName: "Ada" });
+    await saveMessage(message("parallel-read", "2026-10-14T09:00:00.000Z"));
+    await expect(Promise.all([loadIdentity(), loadMessages("alpha"), isRoomMessagesDeleted("alpha")])).resolves.toEqual([
+      { sender: "device-1", senderName: "Ada" },
+      [message("parallel-read", "2026-10-14T09:00:00.000Z")],
+      false,
+    ]);
+  });
+
   it("deduplicates repeated room and message identifiers by replacing the existing record", async () => {
     await saveMessage(message("same-id", "2026-10-14T09:00:00.000Z"));
     const duplicate = message("same-id", "2026-10-14T10:00:00.000Z", "sent");
@@ -83,6 +93,84 @@ describe("local IndexedDB storage", () => {
     await updateDelivery("alpha", "does-not-exist", "sent");
 
     await expect(loadMessages("alpha")).resolves.toEqual([message("delivery", "2026-10-14T09:00:00.000Z", "failed")]);
+  });
+
+  it("deletes all saved and queued messages from one room while preserving identity and other rooms", async () => {
+    const identity = { sender: "device-1", senderName: "Ada" };
+    await saveIdentity(identity);
+    await saveMessage(message("queued", "2026-10-14T09:00:00.000Z"));
+    await saveMessage({ ...message("accepted", "2026-10-14T10:00:00.000Z", "sent"), direction: "incoming" });
+    await saveMessage({ ...message("other-room", "2026-10-14T08:00:00.000Z"), packet: packet("other-room", "2026-10-14T08:00:00.000Z", "beta") });
+
+    await expect(deleteRoomMessages("alpha")).resolves.toBe(2);
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+    await expect(loadMessages("beta")).resolves.toHaveLength(1);
+    await expect(loadIdentity()).resolves.toEqual(identity);
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
+  });
+
+  it("blocks a stale cross-tab replay after deletion until the user resumes the room", async () => {
+    await saveMessage(message("before-delete", "2026-10-14T09:00:00.000Z"));
+    await deleteRoomMessages("alpha");
+
+    await expect(saveMessage(message("stale-replay", "2026-10-14T10:00:00.000Z"))).resolves.toBe(false);
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
+
+    await resumeRoomMessages("alpha");
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(false);
+    await expect(saveMessage(message("user-resumed", "2026-10-14T11:00:00.000Z"))).resolves.toBe(true);
+    await expect(loadMessages("alpha")).resolves.toHaveLength(1);
+  });
+
+  it("serializes deletion start against pending and later room resumes", async () => {
+    await saveMessage(message("before-delete", "2026-10-14T09:00:00.000Z"));
+    await deleteRoomMessages("alpha");
+
+    const resumeAlreadyStarted = resumeRoomMessages("alpha");
+    await beginRoomDeletion("alpha");
+    await resumeAlreadyStarted.catch(() => undefined);
+    await expect(resumeRoomMessages("alpha")).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("still being deleted"),
+    });
+    await expect(saveMessage(message("replay-during-delete", "2026-10-14T10:00:00.000Z"))).resolves.toBe(false);
+
+    await deleteRoomMessages("alpha");
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+    await expect(saveMessage(message("replay-after-delete", "2026-10-14T11:00:00.000Z"))).resolves.toBe(false);
+
+    await resumeRoomMessages("alpha");
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(false);
+    await expect(saveMessage(message("user-resumed", "2026-10-14T12:00:00.000Z"))).resolves.toBe(true);
+    await expect(loadMessages("alpha")).resolves.toHaveLength(1);
+  });
+
+  it("removes only an unfinished marker when a room deletion is cancelled", async () => {
+    await beginRoomDeletion("alpha");
+    await cancelRoomDeletion("alpha");
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(false);
+
+    await deleteRoomMessages("alpha");
+    await cancelRoomDeletion("alpha");
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
+  });
+
+  it("aborts a room deletion transaction without partially deleting the conversation", async () => {
+    await saveMessage(message("one", "2026-10-14T09:00:00.000Z"));
+    await saveMessage(message("two", "2026-10-14T10:00:00.000Z"));
+    vi.spyOn(IDBCursor.prototype, "delete").mockImplementation(function (this: IDBCursor) {
+      throw new Error("Injected cursor deletion failure.");
+    });
+
+    await expect(deleteRoomMessages("alpha")).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("Could not delete the local conversation"),
+    });
+    vi.restoreAllMocks();
+    await expect(loadMessages("alpha")).resolves.toHaveLength(2);
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(false);
   });
 
   it("persists a hub conflict failure and clears it when a message is manually retried", async () => {
@@ -125,8 +213,9 @@ describe("local IndexedDB storage", () => {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
-    expect(upgraded.version).toBe(2);
+    expect(upgraded.version).toBe(3);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDeliveryCreatedAt")).toBe(true);
+    expect(upgraded.objectStoreNames.contains("roomDeletions")).toBe(true);
     upgraded.close();
   });
 

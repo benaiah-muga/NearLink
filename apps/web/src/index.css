@@ -102,6 +102,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .room-ident .eyebrow { margin: 0 0 5px; color: #62645b; font-size: 8px; }
 .room-ident h1 { max-width: 44vw; margin: 0; overflow: hidden; color: #25312a; font-size: 15px; font-weight: 650; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
 .header-right { display: flex; align-items: center; gap: 23px; }
+.clear-room-button { min-height: 34px; padding: 7px 10px; border: 1px solid #b07a6d; border-radius: 3px; color: #70483f; background: transparent; font-size: 9px; }
+.clear-room-button:disabled { opacity: .45; cursor: not-allowed; }
 .connection-status { display: flex; align-items: center; gap: 9px; }
 .connection-status > span { width: 7px; height: 7px; border-radius: 50%; background: #b1b3a8; }
 .connection-status.status-online > span { background: #6a9b69; box-shadow: 0 0 0 3px #6a9b6924; }
@@ -118,8 +120,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .message-scroll { flex: 1; padding: 25px max(44px, calc((100% - 760px) / 2)); overflow-y: auto; scroll-behavior: smooth; }
 .message-scroll:focus-visible { outline: 3px solid #a47e2f; outline-offset: -4px; }
 .notice-banner { display: flex; align-items: center; gap: 9px; margin: 0 auto 20px; padding: 10px 12px; border: 1px solid #dbcfaa; border-radius: 3px; color: #5d533a; background: #f6f0da; font-size: 10px; line-height: 1.5; }
+.notice-banner:focus { outline: 2px solid #8b6a29; outline-offset: 2px; }
 .notice-banner > span { display: grid; flex: 0 0 17px; width: 17px; height: 17px; place-items: center; border-radius: 50%; color: white; background: #a58643; font-family: Georgia, serif; }
 .notice-banner button { margin-left: auto; padding: 0 3px; border: 0; color: inherit; background: transparent; font-size: 17px; }
+.delete-room-confirmation[open] { display: block; width: min(760px, calc(100vw - 32px)); max-width: 760px; margin: auto; padding: 16px; border: 1px solid #dbcfaa; border-radius: 3px; color: #5d533a; background: #f6f0da; }
+.delete-room-confirmation::backdrop { background: #17201d80; }
+.delete-room-confirmation h2 { margin: 0; color: #4e4430; font-size: 13px; }
+.delete-room-confirmation p { margin: 7px 0 12px; }
+.delete-room-confirmation button { min-height: 34px; margin-right: 8px; padding: 6px 10px; border: 1px solid #9b8859; border-radius: 3px; color: #514a35; background: #ffffff78; font-size: 10px; }
+.delete-room-confirmation button:last-child { color: #fff; border-color: #75554c; background: #75554c; }
 .empty-state { display: flex; max-width: 380px; flex-direction: column; align-items: center; margin: clamp(55px, 15vh, 150px) auto 35px; text-align: center; }
 .empty-icon { display: grid; width: 64px; height: 64px; margin-bottom: 25px; place-items: center; border: 1px solid #d9d8cc; border-radius: 50%; background: #f3f1e8; }
 .empty-icon .signal-mark { transform: scale(1.1); }
@@ -208,7 +217,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
   .local-note { margin: 0; font-size: 8px; text-align: right; }
   .install-button { width: auto; margin: 0; padding: 7px; }
   .conversation-panel { flex: 1 0 420px; min-height: 420px; }
-  .conversation-header { min-height: 64px; padding: 0 18px; }
+  .conversation-header { min-height: 64px; padding: 10px 18px; flex-wrap: wrap; gap: 8px; }
+  .clear-room-button { margin-left: auto; }
   .room-ident { gap: 9px; }.room-symbol { width: 30px; height: 30px; flex-basis: 30px; font-size: 21px; }
   .room-ident .eyebrow { font-size: 7px; }.room-ident h1 { max-width: 45vw; font-size: 13px; }
   .header-right { gap: 12px; }.connection-status { gap: 7px; }.connection-status strong { font-size: 9px; }.connection-status small { font-size: 8px; }

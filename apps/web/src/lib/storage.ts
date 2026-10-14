@@ -40,9 +40,10 @@ export async function requestStoragePersistence(): Promise<StoragePersistenceRes
 }
 
 const DATABASE_NAME = "nearlink-local";
-const DATABASE_VERSION = 2;
+const DATABASE_VERSION = 3;
 const MESSAGE_STORE = "messages";
 const IDENTITY_STORE = "identity";
+const ROOM_DELETION_STORE = "roomDeletions";
 const ROOM_CREATED_INDEX = "roomCreatedAt";
 const ROOM_DELIVERY_CREATED_INDEX = "roomDeliveryCreatedAt";
 const IDENTITY_KEY_PATH = "key";
@@ -98,6 +99,7 @@ function migrate(database: IDBDatabase, transaction: IDBTransaction): void {
   ensureIndex(messages, ROOM_CREATED_INDEX, ROOM_CREATED_KEY_PATH);
   ensureIndex(messages, ROOM_DELIVERY_CREATED_INDEX, ROOM_DELIVERY_CREATED_KEY_PATH);
   ensureStore(database, transaction, IDENTITY_STORE, IDENTITY_KEY_PATH);
+  ensureStore(database, transaction, ROOM_DELETION_STORE, "room");
 }
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -140,9 +142,9 @@ function openDatabase(): Promise<IDBDatabase> {
 
 function withTransaction<T>(
   operation: string,
-  storeName: string,
+  storeName: string | string[],
   mode: IDBTransactionMode,
-  action: (store: IDBObjectStore, complete: (value: T) => void, setFailure: (cause: unknown) => void) => void,
+  action: (store: IDBObjectStore, complete: (value: T) => void, setFailure: (cause: unknown) => void, transaction: IDBTransaction) => void,
 ): Promise<T> {
   return openDatabase().then((database) => new Promise<T>((resolve, reject) => {
     let result: T | undefined;
@@ -175,7 +177,8 @@ function withTransaction<T>(
     };
     const setFailure = (cause: unknown) => { failure ??= cause; };
     try {
-      action(transaction.objectStore(storeName), complete, setFailure);
+      const primaryStore = Array.isArray(storeName) ? storeName[0] : storeName;
+      action(transaction.objectStore(primaryStore), complete, setFailure, transaction);
     } catch (error) {
       failure = error;
       try {
@@ -223,13 +226,123 @@ export async function loadMessages(room: string): Promise<StoredMessage[]> {
   );
 }
 
-export async function saveMessage(message: StoredMessage): Promise<void> {
+/** Persist a deletion-in-progress marker before stopping live transports. */
+export async function beginRoomDeletion(room: string): Promise<void> {
   await withTransaction<IDBValidKey>(
-    "Could not save the local message",
-    MESSAGE_STORE,
+    "Could not begin deleting the local conversation",
+    ROOM_DELETION_STORE,
     "readwrite",
-    (store, complete, setFailure) => observe(store.put(message), complete, setFailure),
+    (store, complete, setFailure) => observe(store.put({ room, state: "deleting" }), complete, setFailure),
   );
+}
+
+/** Cancel only an unfinished deletion, leaving completed deletion markers intact. */
+export async function cancelRoomDeletion(room: string): Promise<void> {
+  await withTransaction<void>(
+    "Could not cancel deleting the local conversation",
+    ROOM_DELETION_STORE,
+    "readwrite",
+    (store, complete, setFailure) => {
+      const request = store.get(room);
+      request.onsuccess = () => {
+        if (request.result?.state !== "deleting") {
+          complete(undefined);
+          return;
+        }
+        observe(store.delete(room), () => complete(undefined), setFailure);
+      };
+      request.onerror = () => setFailure(request.error ?? new Error("Could not check the local deletion state."));
+    },
+  );
+}
+
+/** Remove selected room rows and atomically mark deletion complete. */
+export async function deleteRoomMessages(room: string): Promise<number> {
+  return withTransaction<number>(
+    "Could not delete the local conversation",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readwrite",
+    (store, complete, setFailure, transaction) => {
+      transaction.objectStore(ROOM_DELETION_STORE).put({ room, state: "deleted" });
+      const range = IDBKeyRange.bound([room, ""], [room, "\uffff"]);
+      const request = store.index(ROOM_CREATED_INDEX).openCursor(range);
+      let deleted = 0;
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          complete(deleted);
+          return;
+        }
+        let deletion: IDBRequest<undefined>;
+        try {
+          deletion = cursor.delete();
+        } catch (error) {
+          setFailure(error);
+          request.transaction?.abort();
+          return;
+        }
+        deletion.onerror = () => setFailure(deletion.error ?? new Error("Could not delete a local message."));
+        deleted += 1;
+        cursor.continue();
+      };
+      request.onerror = () => setFailure(request.error ?? new Error("Could not read the local conversation for deletion."));
+    },
+  );
+}
+
+export async function saveMessage(message: StoredMessage): Promise<boolean> {
+  return withTransaction<boolean>(
+    "Could not save the local message",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readwrite",
+    (store, complete, setFailure, transaction) => {
+      const tombstones = transaction.objectStore(ROOM_DELETION_STORE);
+      const request = tombstones.get(message.packet.room);
+      request.onsuccess = () => {
+        if (request.result) {
+          complete(false);
+          return;
+        }
+        try {
+          observe(store.put(message), () => complete(true), setFailure);
+        } catch (error) {
+          setFailure(error);
+          transaction.abort();
+        }
+      };
+      request.onerror = () => setFailure(request.error ?? new Error("Could not check whether the local conversation was cleared."));
+    },
+  );
+}
+
+/** Allow this browser to save or receive messages in a room after deliberate user action. */
+export async function resumeRoomMessages(room: string): Promise<void> {
+  await withTransaction<void>(
+    "Could not resume the local conversation",
+    ROOM_DELETION_STORE,
+    "readwrite",
+    (store, complete, setFailure) => {
+      const request = store.get(room);
+      request.onsuccess = () => {
+        if (request.result?.state === "deleting") {
+          setFailure(new Error("The local conversation is still being deleted."));
+          try { request.transaction?.abort(); } catch { /* The transaction may already be aborting. */ }
+          return;
+        }
+        observe(store.delete(room), () => complete(undefined), setFailure);
+      };
+      request.onerror = () => setFailure(request.error ?? new Error("Could not check the local deletion state."));
+    },
+  );
+}
+
+export async function isRoomMessagesDeleted(room: string): Promise<boolean> {
+  return withTransaction<{ room: string } | undefined>(
+    "Could not check the local conversation status",
+    ROOM_DELETION_STORE,
+    "readonly",
+    (store, complete, setFailure) => observe(store.get(room), complete, setFailure),
+  ).then(Boolean);
 }
 
 export async function updateDelivery(room: string, id: string, delivery: DeliveryState, failure?: StoredMessage["failure"] | null): Promise<void> {

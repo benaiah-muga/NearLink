@@ -1,19 +1,26 @@
 // @vitest-environment jsdom
 import "fake-indexeddb/auto";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const messageReadGate = vi.hoisted(() => ({
   room: null as string | null,
   pending: null as Promise<unknown> | null,
+  releaseRead: null as (() => void) | null,
   requestedRooms: [] as string[],
   failNextSaveIds: [] as string[],
+  failDeleteRoomMessages: false,
+  failCancelRoomDeletion: false,
   saveAttempts: new Map<string, number>(),
   deliveryUpdateId: null as string | null,
   deliveryUpdatePending: null as Promise<void> | null,
   releaseDeliveryUpdate: null as (() => void) | null,
   deliveryUpdateStarted: false,
   deliveryUpdateReject: false,
+  resumeRoom: null as string | null,
+  resumePending: null as Promise<void> | null,
+  releaseResume: null as (() => void) | null,
+  resumeStarted: false,
 }));
 const wasmGate = vi.hoisted(() => ({ fail: false }));
 
@@ -63,6 +70,21 @@ vi.mock("./lib/storage", async (importOriginal) => {
       }
       return actual.saveMessage(message);
     },
+    resumeRoomMessages: async (room: string) => {
+      if (room === messageReadGate.resumeRoom && messageReadGate.resumePending) {
+        messageReadGate.resumeStarted = true;
+        await messageReadGate.resumePending;
+      }
+      return actual.resumeRoomMessages(room);
+    },
+    deleteRoomMessages: async (room: string) => {
+      if (messageReadGate.failDeleteRoomMessages) throw new Error("Injected room deletion failure.");
+      return actual.deleteRoomMessages(room);
+    },
+    cancelRoomDeletion: async (room: string) => {
+      if (messageReadGate.failCancelRoomDeletion) throw new Error("Injected marker cleanup failure.");
+      return actual.cancelRoomDeletion(room);
+    },
     updateDelivery: async (...args: Parameters<typeof actual.updateDelivery>) => {
       const [, id] = args;
       if (id === messageReadGate.deliveryUpdateId && messageReadGate.deliveryUpdatePending) {
@@ -76,9 +98,11 @@ vi.mock("./lib/storage", async (importOriginal) => {
 });
 
 import App from "./App";
-import { loadMessages, saveMessage, type StoredMessage } from "./lib/storage";
+import { beginRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, saveMessage, type StoredMessage } from "./lib/storage";
 
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, "storage");
+const originalShowModalDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "showModal");
+const originalDialogCloseDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "close");
 
 function setStorageManager(storageManager: Partial<StorageManager> | undefined): void {
   Object.defineProperty(navigator, "storage", { configurable: true, value: storageManager });
@@ -126,6 +150,28 @@ class MockWebSocket {
   }
 }
 
+class MockBroadcastChannel {
+  static instances: MockBroadcastChannel[] = [];
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  closed = false;
+
+  constructor(readonly name: string) {
+    MockBroadcastChannel.instances.push(this);
+  }
+
+  postMessage(data: unknown): void {
+    for (const channel of MockBroadcastChannel.instances) {
+      if (channel !== this && !channel.closed && channel.name === this.name) {
+        queueMicrotask(() => channel.onmessage?.({ data } as MessageEvent<unknown>));
+      }
+    }
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
 const ROOM = "campus-radio";
 const IDENTITY = { sender: "station-a", senderName: "Ari" };
 
@@ -137,13 +183,14 @@ async function resetDatabase(): Promise<void> {
     request.onblocked = () => reject(new Error("Test database deletion was blocked."));
   });
   await new Promise<void>((resolve, reject) => {
-    const request = indexedDB.open("nearlink-local", 2);
+    const request = indexedDB.open("nearlink-local", 3);
     request.onupgradeneeded = () => {
       const database = request.result;
       const messages = database.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
       messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
       messages.createIndex("roomDeliveryCreatedAt", ["packet.room", "delivery", "packet.createdAt"]);
       database.createObjectStore("identity", { keyPath: "key" });
+      database.createObjectStore("roomDeletions", { keyPath: "room" });
     };
     request.onsuccess = () => {
       const database = request.result;
@@ -161,15 +208,26 @@ beforeEach(async () => {
   MockWebSocket.instances = [];
   messageReadGate.room = null;
   messageReadGate.pending = null;
+  messageReadGate.releaseRead = null;
   messageReadGate.requestedRooms = [];
   messageReadGate.failNextSaveIds = [];
+  messageReadGate.failDeleteRoomMessages = false;
+  messageReadGate.failCancelRoomDeletion = false;
   messageReadGate.saveAttempts = new Map();
   messageReadGate.deliveryUpdateId = null;
   messageReadGate.deliveryUpdatePending = null;
   messageReadGate.releaseDeliveryUpdate = null;
   messageReadGate.deliveryUpdateStarted = false;
   messageReadGate.deliveryUpdateReject = false;
+  messageReadGate.resumeRoom = null;
+  messageReadGate.resumePending = null;
+  messageReadGate.releaseResume = null;
+  messageReadGate.resumeStarted = false;
   vi.stubGlobal("WebSocket", MockWebSocket);
+  MockBroadcastChannel.instances = [];
+  vi.stubGlobal("BroadcastChannel", MockBroadcastChannel);
+  Object.defineProperty(HTMLDialogElement.prototype, "showModal", { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } });
+  Object.defineProperty(HTMLDialogElement.prototype, "close", { configurable: true, value: function (this: HTMLDialogElement) { this.open = false; } });
   Element.prototype.scrollIntoView = vi.fn();
   localStorage.clear();
   localStorage.setItem("nearlink.room", ROOM);
@@ -181,6 +239,10 @@ afterEach(() => {
   cleanup();
   if (originalStorageDescriptor) Object.defineProperty(navigator, "storage", originalStorageDescriptor);
   else Reflect.deleteProperty(navigator, "storage");
+  if (originalShowModalDescriptor) Object.defineProperty(HTMLDialogElement.prototype, "showModal", originalShowModalDescriptor);
+  else Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+  if (originalDialogCloseDescriptor) Object.defineProperty(HTMLDialogElement.prototype, "close", originalDialogCloseDescriptor);
+  else Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -251,6 +313,256 @@ describe("browser storage retention feedback", () => {
 });
 
 describe("browser app messaging flow", () => {
+  it("requires confirmation, clears only this room on this device, and closes live room transport", async () => {
+    const localMessage = {
+      packet: { version: 1 as const, type: "message" as const, id: "saved-local", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Saved locally" },
+      direction: "outgoing" as const,
+      delivery: "queued" as const,
+      transport: "hub" as const,
+    };
+    const otherRoomMessage = { ...localMessage, packet: { ...localMessage.packet, id: "other-room", room: "another-room", body: "Keep this room" } };
+    await saveMessage(localMessage);
+    await saveMessage(otherRoomMessage);
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    await screen.findByText("Saved locally");
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const socket = MockWebSocket.instances[0];
+    act(() => socket.open());
+    act(() => socket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await screen.findByText("On frequency");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear this device's saved conversation" }));
+    const confirmation = screen.getByRole("dialog", { name: `Clear saved messages for ${ROOM}?` });
+    const opener = screen.getByRole("button", { name: "Clear this device's saved conversation" });
+    opener.focus();
+    expect((confirmation as HTMLDialogElement).open).toBe(true);
+    fireEvent(confirmation, new Event("cancel", { bubbles: false, cancelable: true }));
+    await waitFor(() => expect((confirmation as HTMLDialogElement).open).toBe(false));
+    expect(document.activeElement).toBe(opener);
+
+    fireEvent.click(opener);
+    const reopenedConfirmation = screen.getByRole("dialog", { name: `Clear saved messages for ${ROOM}?` });
+    expect(reopenedConfirmation.textContent).toMatch(/only on this device/i);
+    expect(reopenedConfirmation.textContent).toMatch(/identity and settings stay saved/i);
+    expect(reopenedConfirmation.textContent).toMatch(/hub's retained history is not affected and may appear again after you reconnect/i);
+    expect(await loadMessages(ROOM)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Keep messages" }));
+    expect(await loadMessages(ROOM)).toHaveLength(1);
+
+    messageReadGate.room = ROOM;
+    messageReadGate.pending = new Promise((resolve) => { messageReadGate.releaseRead = () => resolve([]); });
+    const inFlightReplay = { version: 1, type: "message", id: "late-replay", room: ROOM, sender: "station-b", senderName: "Bea", createdAt: "2026-10-14T10:00:00.000Z", body: "Late hub replay" };
+    const readCountBeforeReplay = messageReadGate.requestedRooms.length;
+    act(() => socket.receive(inFlightReplay));
+    await waitFor(() => expect(messageReadGate.requestedRooms.length).toBeGreaterThan(readCountBeforeReplay));
+    fireEvent.click(screen.getByRole("button", { name: "Clear this device's saved conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete local messages" }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Send message" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(screen.queryByText(/were deleted from this device/i)).toBeNull();
+    messageReadGate.releaseRead?.();
+    await screen.findByText(/were deleted from this device/i);
+    await waitFor(() => expect(socket.readyState).toBe(MockWebSocket.CLOSED));
+    expect(await loadMessages(ROOM)).toEqual([]);
+    expect(document.activeElement).toBe(screen.getByText(/Saved and queued messages for this room were deleted/).closest('[role="status"]'));
+    expect(await loadMessages("another-room")).toEqual([otherRoomMessage]);
+    expect(await loadIdentity()).toEqual(IDENTITY);
+    expect(localStorage.getItem("nearlink.room")).toBe(ROOM);
+    expect(localStorage.getItem("nearlink.hub")).toBe("ws://localhost:8000/ws");
+
+    act(() => socket.receive({ ...inFlightReplay, id: "post-delete-replay" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(await loadMessages(ROOM)).toEqual([]);
+    expect(screen.queryByText("Late hub replay")).toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    expect(await isRoomMessagesDeleted(ROOM)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Save and join room" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    expect(await isRoomMessagesDeleted(ROOM)).toBe(false);
+    act(() => MockWebSocket.instances[1].open());
+    act(() => MockWebSocket.instances[1].receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await screen.findByText("On frequency");
+  });
+
+  it("notifies another open tab and blocks its stale replay from restoring the cleared room", async () => {
+    const saved = {
+      packet: { version: 1 as const, type: "message" as const, id: "shared-message", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Shared local history" },
+      direction: "incoming" as const,
+      delivery: "sent" as const,
+      transport: "hub" as const,
+    };
+    await saveMessage(saved);
+    await expect(Promise.all([loadIdentity(), loadMessages(ROOM), isRoomMessagesDeleted(ROOM)])).resolves.toMatchObject([IDENTITY, [saved], false]);
+    const firstTab = render(<App />);
+    await waitFor(() => expect((within(firstTab.container).getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    await within(firstTab.container).findByText("Shared local history");
+    const secondTab = render(<App />);
+    await waitFor(() => expect((within(secondTab.container).getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    await within(secondTab.container).findByText("Shared local history");
+
+    fireEvent.click(within(firstTab.container).getByRole("button", { name: "Connect radio" }));
+    fireEvent.click(within(secondTab.container).getByRole("button", { name: "Connect radio" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    const firstSocket = MockWebSocket.instances[0];
+    const secondSocket = MockWebSocket.instances[1];
+    act(() => { firstSocket.open(); secondSocket.open(); });
+    act(() => {
+      firstSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 });
+      secondSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 });
+    });
+
+    fireEvent.click(within(firstTab.container).getByRole("button", { name: "Clear this device's saved conversation" }));
+    fireEvent.click(within(firstTab.container).getByRole("button", { name: "Delete local messages" }));
+    await within(firstTab.container).findByText(/were deleted from this device/i);
+    await within(secondTab.container).findByText(/deleted from this device in another tab/i);
+    await waitFor(() => expect(secondSocket.readyState).toBe(MockWebSocket.CLOSED));
+    expect(await loadMessages(ROOM)).toEqual([]);
+    expect(await saveMessage({ ...saved, packet: { ...saved.packet, id: "stale-cross-tab-replay", body: "Late replay" } })).toBe(false);
+    expect(await loadMessages(ROOM)).toEqual([]);
+    expect(within(secondTab.container).queryByText("Shared local history")).toBeNull();
+  });
+
+  it("does not let a tab resume or reconnect while another tab is deleting the room", async () => {
+    await saveMessage({
+      packet: { version: 1, type: "message", id: "before-delete", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "History to clear" },
+      direction: "incoming",
+      delivery: "sent",
+      transport: "hub",
+    });
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    await screen.findByText("History to clear");
+
+    const externalTab = new MockBroadcastChannel("nearlink-room-deletion-v1");
+    messageReadGate.resumeRoom = ROOM;
+    messageReadGate.resumePending = new Promise<void>((resolve) => { messageReadGate.releaseResume = resolve; });
+    fireEvent.submit(screen.getByRole("button", { name: "Save and join room" }).closest("form")!);
+    await waitFor(() => expect(messageReadGate.resumeStarted).toBe(true));
+    await beginRoomDeletion(ROOM);
+    externalTab.postMessage({ version: 1, type: "deleting", room: ROOM, sender: "other-tab" });
+    await screen.findByText("Another open tab is clearing this room's local messages.");
+
+    fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
+    expect((screen.getByRole("button", { name: "Save and join room" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Create offer" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(MockWebSocket.instances).toHaveLength(0);
+    expect(await isRoomMessagesDeleted(ROOM)).toBe(true);
+    expect(await loadMessages(ROOM)).toHaveLength(1);
+
+    await deleteRoomMessages(ROOM);
+    expect(await loadMessages(ROOM)).toEqual([]);
+    externalTab.postMessage({ version: 1, type: "deleted", room: ROOM, sender: "other-tab" });
+    await screen.findByText(/deleted from this device in another tab/i);
+    await act(async () => {
+      messageReadGate.releaseResume?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(isRoomMessagesDeleted(ROOM)).resolves.toBe(true));
+    expect(await loadMessages(ROOM)).toEqual([]);
+    expect(MockWebSocket.instances).toHaveLength(0);
+    externalTab.close();
+  });
+
+  it("keeps a room locked and offers retry when failed deletion cannot clear its marker", async () => {
+    const saved = {
+      packet: { version: 1 as const, type: "message" as const, id: "locked-message", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Must remain saved" },
+      direction: "incoming" as const,
+      delivery: "sent" as const,
+      transport: "hub" as const,
+    };
+    await saveMessage(saved);
+    messageReadGate.failDeleteRoomMessages = true;
+    messageReadGate.failCancelRoomDeletion = true;
+    render(<App />);
+    await screen.findByText("Must remain saved");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear this device's saved conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete local messages" }));
+    await screen.findByText(/room remains locked on this device/i);
+    expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(true);
+    expect(await isRoomMessagesDeleted(ROOM)).toBe(true);
+    expect(await loadMessages(ROOM)).toEqual([saved]);
+    expect((screen.getByRole("button", { name: "Clear this device's saved conversation" }) as HTMLButtonElement).disabled).toBe(false);
+
+    messageReadGate.failDeleteRoomMessages = false;
+    messageReadGate.failCancelRoomDeletion = false;
+    fireEvent.click(screen.getByRole("button", { name: "Clear this device's saved conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete local messages" }));
+    await screen.findByText(/were deleted from this device/i);
+    expect(await isRoomMessagesDeleted(ROOM)).toBe(true);
+    expect(await loadMessages(ROOM)).toEqual([]);
+  });
+
+  it("ignores a delayed cancellation reload after a newer deletion event", async () => {
+    const saved = {
+      packet: { version: 1 as const, type: "message" as const, id: "stale-cancel-message", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Saved before delayed reload" },
+      direction: "incoming" as const,
+      delivery: "sent" as const,
+      transport: "hub" as const,
+    };
+    await saveMessage(saved);
+    render(<App />);
+    await screen.findByText(saved.packet.body);
+    const externalTab = new MockBroadcastChannel("nearlink-room-deletion-v1");
+    messageReadGate.room = ROOM;
+    messageReadGate.pending = new Promise((resolve) => { messageReadGate.releaseRead = () => resolve([]); });
+    const readCountBeforeCancel = messageReadGate.requestedRooms.length;
+
+    externalTab.postMessage({ version: 1, type: "cancelled", room: ROOM, sender: "other-tab" });
+    await waitFor(() => expect(messageReadGate.requestedRooms.length).toBeGreaterThan(readCountBeforeCancel));
+    externalTab.postMessage({ version: 1, type: "deleting", room: ROOM, sender: "other-tab" });
+    await screen.findByText("Another open tab is clearing this room's local messages.");
+    await beginRoomDeletion(ROOM);
+    await deleteRoomMessages(ROOM);
+    externalTab.postMessage({ version: 1, type: "deleted", room: ROOM, sender: "other-tab" });
+    await screen.findByText(/deleted from this device in another tab/i);
+
+    await act(async () => {
+      messageReadGate.releaseRead?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.queryByText(/Saved messages are shown again/i)).toBeNull();
+    expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(true);
+    expect(await isRoomMessagesDeleted(ROOM)).toBe(true);
+    expect(await loadMessages(ROOM)).toEqual([]);
+    externalTab.close();
+  });
+
+  it("ignores a delayed cancellation reload after switching rooms", async () => {
+    const saved = {
+      packet: { version: 1 as const, type: "message" as const, id: "old-room-message", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Old room history" },
+      direction: "incoming" as const,
+      delivery: "sent" as const,
+      transport: "hub" as const,
+    };
+    await saveMessage(saved);
+    render(<App />);
+    await screen.findByText(saved.packet.body);
+    const externalTab = new MockBroadcastChannel("nearlink-room-deletion-v1");
+    messageReadGate.room = ROOM;
+    messageReadGate.pending = new Promise((resolve) => { messageReadGate.releaseRead = () => resolve([saved]); });
+    const readCountBeforeCancel = messageReadGate.requestedRooms.length;
+
+    externalTab.postMessage({ version: 1, type: "cancelled", room: ROOM, sender: "other-tab" });
+    await waitFor(() => expect(messageReadGate.requestedRooms.length).toBeGreaterThan(readCountBeforeCancel));
+    fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "different-room" } });
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+
+    await act(async () => {
+      messageReadGate.releaseRead?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.queryByText("Old room history")).toBeNull();
+    expect(screen.queryByText(/The other tab could not delete the conversation/i)).toBeNull();
+    expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false);
+    externalTab.close();
+  });
+
   it("fails closed with an accessible action when Rust protocol checks cannot load", async () => {
     wasmGate.fail = true;
     render(<App />);

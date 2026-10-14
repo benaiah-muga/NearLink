@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
-import { loadIdentity, loadMessages, requestStoragePersistence, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
+import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, requestStoragePersistence, resumeRoomMessages, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
 import { initializeWasmProtocol, MAX_PROTOCOL_ENVELOPE_BYTES, validateJsonWithWasm, validateWithWasm } from "./lib/wasmProtocol";
 
@@ -9,6 +9,7 @@ type LinkState = "offline" | "connecting" | "linking" | "online" | "retrying" | 
 const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8000/ws`;
 const HUB_KEY = "nearlink.hub";
 const ROOM_KEY = "nearlink.room";
+const ROOM_DELETION_CHANNEL = "nearlink-room-deletion-v1";
 const HUB_REPLAY_FAILURE_NOTICE = "A hub message could not be saved or checked on this device. It was not accepted and can be retried after reconnecting.";
 const WASM_PROTOCOL_FAILURE_NOTICE = "Protocol checks could not start. NearLink will not connect, send messages, or accept peer packets. Reload the page. If this continues, update the browser and report this error.";
 
@@ -113,7 +114,14 @@ function App() {
   const [trustedFingerprint, setTrustedFingerprint] = useState("");
   const [fingerprintConfirmed, setFingerprintConfirmed] = useState(false);
   const [directBusy, setDirectBusy] = useState(false);
+  const [confirmRoomDeletion, setConfirmRoomDeletion] = useState(false);
+  const [deletingRoom, setDeletingRoom] = useState(false);
+  const [roomDeletedLocally, setRoomDeletedLocally] = useState(false);
   const [sendTransport, setSendTransport] = useState<"hub" | "direct">("hub");
+  const roomDeletionDialogRef = useRef<HTMLDialogElement>(null);
+  const roomDeletionOpenerRef = useRef<HTMLElement | null>(null);
+  const deletionStatusRef = useRef<HTMLDivElement>(null);
+  const focusDeletionStatusRef = useRef(false);
   const socketRef = useRef<WebSocket | null>(null);
   const directRef = useRef<DirectWebRtcTransport | null>(null);
   const messagesRef = useRef(messages);
@@ -122,6 +130,12 @@ function App() {
   const retryingMessageKeysRef = useRef(new Set<string>());
   const activeRoomRef = useRef(room.trim());
   const pendingSendRef = useRef(false);
+  const pendingSendOperationRef = useRef<Promise<void> | null>(null);
+  const deletionInProgressRef = useRef(false);
+  const deletionGenerationRef = useRef(0);
+  const deletionEventsRef = useRef(new Map<string, "deleting" | "deleted" | "cancelled">());
+  const tabIdRef = useRef(makeId());
+  const deletionChannelRef = useRef<BroadcastChannel | null>(null);
   const shouldReconnectRef = useRef(false);
   const attemptRef = useRef(0);
   const currentRoomRef = useRef(room.trim());
@@ -149,6 +163,37 @@ function App() {
     setLocalSignal("");
   }
 
+  function stopRoomTransports() {
+    shouldReconnectRef.current = false;
+    setLinkRequested(false);
+    setLinkState("offline");
+    const socket = socketRef.current;
+    socketRef.current = null;
+    socket?.close();
+    closeDirectTransport();
+  }
+
+  function publishRoomDeletion(type: "deleting" | "deleted" | "cancelled", selectedRoom: string) {
+    deletionChannelRef.current?.postMessage({
+      version: 1,
+      type,
+      room: selectedRoom,
+      sender: tabIdRef.current,
+    });
+  }
+
+  async function resumeRoomForUserAction(selectedRoom: string): Promise<void> {
+    const generation = deletionGenerationRef.current;
+    await resumeRoomMessages(selectedRoom);
+    if (deletionInProgressRef.current || deletingRoom || generation !== deletionGenerationRef.current) {
+      if (deletionEventsRef.current.get(selectedRoom) === "deleted") {
+        await beginRoomDeletion(selectedRoom);
+        await deleteRoomMessages(selectedRoom);
+      }
+      throw new Error("A room deletion took priority over resuming this room.");
+    }
+  }
+
   useEffect(() => {
     let active = true;
     void initializeWasmProtocol().then((ready) => {
@@ -166,6 +211,81 @@ function App() {
       }
     });
     return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    const dialog = roomDeletionDialogRef.current;
+    if (!confirmRoomDeletion || !dialog) return;
+    if (!dialog.open) dialog.showModal();
+    return () => {
+      if (dialog.open) dialog.close();
+      roomDeletionOpenerRef.current?.focus();
+      roomDeletionOpenerRef.current = null;
+    };
+  }, [confirmRoomDeletion]);
+
+  useEffect(() => {
+    if (deletingRoom || !focusDeletionStatusRef.current) return;
+    focusDeletionStatusRef.current = false;
+    deletionStatusRef.current?.focus();
+  }, [deletingRoom, notice]);
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === "undefined") return;
+    const channel = new BroadcastChannel(ROOM_DELETION_CHANNEL);
+    deletionChannelRef.current = channel;
+    channel.onmessage = (event: MessageEvent<unknown>) => {
+      const message = event.data as { version?: unknown; type?: unknown; room?: unknown; sender?: unknown };
+      if (message.version !== 1 || message.sender === tabIdRef.current || typeof message.room !== "string" || message.room !== currentRoomRef.current) return;
+      if (message.type === "deleting") {
+        deletionGenerationRef.current += 1;
+        deletionEventsRef.current.set(message.room, "deleting");
+        deletionInProgressRef.current = true;
+        setDeletingRoom(true);
+        stopRoomTransports();
+        setNotice("Another open tab is clearing this room's local messages.");
+        return;
+      }
+      if (message.type === "deleted") {
+        deletionGenerationRef.current += 1;
+        deletionEventsRef.current.set(message.room, "deleted");
+        deletionInProgressRef.current = true;
+        setDeletingRoom(true);
+        stopRoomTransports();
+        setMessages([]);
+        messageKeysRef.current.clear();
+        setConflictedHubMessageKeys((current) => new Set([...current].filter((key) => !key.startsWith(`${message.room}\u0000`))));
+        setRoomDeletedLocally(true);
+        setNotice("Saved messages for this room were deleted from this device in another tab. Hub-retained history may appear if you reconnect.");
+        deletionInProgressRef.current = false;
+        setDeletingRoom(false);
+        return;
+      }
+      if (message.type === "cancelled") {
+        const cancelledRoom = message.room as string;
+        deletionGenerationRef.current += 1;
+        deletionEventsRef.current.set(cancelledRoom, "cancelled");
+        const cancelledGeneration = deletionGenerationRef.current;
+        void Promise.all([loadMessages(cancelledRoom), isRoomMessagesDeleted(cancelledRoom)]).then(([stored, deleted]) => {
+          if (currentRoomRef.current !== cancelledRoom || deletionGenerationRef.current !== cancelledGeneration || deletionEventsRef.current.get(cancelledRoom) !== "cancelled") return;
+          setMessages(stored);
+          messageKeysRef.current = new Set(stored.map((item) => `${item.packet.room}\u0000${item.packet.id}`));
+          setRoomDeletedLocally(deleted);
+          deletionInProgressRef.current = false;
+          setDeletingRoom(false);
+          setNotice("The other tab could not delete the conversation. Saved messages are shown again.");
+        }).catch(() => {
+          if (currentRoomRef.current !== cancelledRoom || deletionGenerationRef.current !== cancelledGeneration || deletionEventsRef.current.get(cancelledRoom) !== "cancelled") return;
+          deletionInProgressRef.current = false;
+          setDeletingRoom(false);
+          setNotice("The other tab could not delete the conversation, and this tab could not reload its saved messages.");
+        });
+      }
+    };
+    return () => {
+      deletionChannelRef.current = null;
+      channel.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -207,16 +327,19 @@ function App() {
     if (room && !writeLocalSetting(ROOM_KEY, room)) {
       setNotice("Your room setting could not be saved. Re-enter it if you reload this page.");
     }
+    setRoomDeletedLocally(false);
     setConversationReady(false);
     setLoadedRoom(null);
     setMessages([]);
     messageKeysRef.current.clear();
     let active = true;
     if (room.trim()) {
-      loadMessages(room.trim()).then((stored) => { if (active) { setMessages(stored); messageKeysRef.current = new Set(stored.map((item) => `${item.packet.room}\u0000${item.packet.id}`)); for (const item of stored) if (item.failure === "message_conflict") conflictedHubMessageKeysRef.current.add(`${item.packet.room}\u0000${item.packet.id}`); setLoadedRoom(room.trim()); setConversationReady(true); } }).catch(() => { if (active) { setMessages([]); messageKeysRef.current.clear(); setLoadedRoom(room.trim()); setNotice("Could not read this conversation from local storage."); setConversationReady(true); } });
+      const selectedRoom = room.trim();
+      Promise.all([loadMessages(selectedRoom), isRoomMessagesDeleted(selectedRoom)]).then(([stored, deleted]) => { if (active) { setMessages(stored); messageKeysRef.current = new Set(stored.map((item) => `${selectedRoom}\u0000${item.packet.id}`)); for (const item of stored) if (item.failure === "message_conflict") conflictedHubMessageKeysRef.current.add(`${selectedRoom}\u0000${item.packet.id}`); setRoomDeletedLocally(deleted); setLoadedRoom(selectedRoom); setConversationReady(true); } }).catch(() => { if (active) { setMessages([]); messageKeysRef.current.clear(); setLoadedRoom(selectedRoom); setNotice("Could not read this conversation from local storage."); setConversationReady(true); } });
     } else {
       setMessages([]);
       messageKeysRef.current.clear();
+      setRoomDeletedLocally(false);
       setLoadedRoom("");
       setConversationReady(true);
     }
@@ -374,7 +497,11 @@ function App() {
             }
             const item: StoredMessage = { packet, direction: packet.sender === identity.sender ? "outgoing" : "incoming", delivery: "sent", transport: "hub" };
             try {
-              await saveMessage(item);
+              const saved = await saveMessage(item);
+              if (!saved) {
+                if (currentRoomRef.current === connectionRoom) setNotice("This room was cleared on this device. Reconnect to resume the room; hub-retained history may replay.");
+                return;
+              }
             } catch {
               if (currentRoomRef.current === connectionRoom) {
                 hubInboundFailuresRef.current.add(messageKey);
@@ -418,7 +545,8 @@ function App() {
 
   const sortedMessages = useMemo(() => loadedRoom === room.trim() ? [...messages].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)) : [], [loadedRoom, messages, room]);
   const normalizedName = displayName.trim();
-  const composerReady = storageReady && conversationReady && loadedRoom === room.trim();
+  const conversationLoaded = storageReady && conversationReady && loadedRoom === room.trim();
+  const composerReady = conversationLoaded && !roomDeletedLocally;
   const profileReady = Boolean(wasmReady && profileSaved && identity?.senderName.trim() && identity.senderName.trim() === normalizedName && validateWithWasm("identifier", identity.sender) && isValidCallSign(identity.senderName) && validateWithWasm("room", room.trim()));
   const canJoin = Boolean(profileReady && room.trim() && hubUrl.trim());
   const canSaveProfile = Boolean(wasmReady && identity && validateWithWasm("identifier", identity.sender) && isValidCallSign(normalizedName) && validateWithWasm("room", room.trim()) && (sendTransport === "direct" || hubUrl.trim()));
@@ -426,18 +554,29 @@ function App() {
 
   async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (deletionInProgressRef.current || deletingRoom) return;
     if (!wasmReady || !identity || !validateWithWasm("identifier", identity.sender) || !isValidCallSign(normalizedName) || !validateWithWasm("room", room.trim())) return;
     const nextIdentity = { ...identity, senderName: normalizedName };
     setIdentity(nextIdentity);
     let identitySaved = true;
     try { await saveIdentity(nextIdentity); }
     catch { identitySaved = false; }
+    if (deletionInProgressRef.current || deletingRoom) return;
     setProfileSaved(identitySaved && Boolean(nextIdentity.senderName.trim()));
     const settingsSaved = writeLocalSetting(HUB_KEY, hubUrl.trim());
     if (sendTransport === "direct") {
       setLinkRequested(false);
       setLinkState("offline");
     } else {
+      try {
+        await resumeRoomForUserAction(room.trim());
+        if (deletionInProgressRef.current || deletingRoom) return;
+        setRoomDeletedLocally(false);
+      } catch {
+        setLinkRequested(false);
+        setNotice("Could not resume this room after its local messages were cleared.");
+        return;
+      }
       setLinkRequested(true);
     }
     setNotice(!identitySaved ? "Your identity could not be saved. It may change if you reload this page." : !settingsSaved ? "Your station settings could not be saved. Re-enter them if you reload this page." : sendTransport === "direct" ? "Profile saved for direct peer setup. The hub remains disconnected." : "");
@@ -521,7 +660,11 @@ function App() {
       }
       const item: StoredMessage = { packet, direction: "incoming", delivery: "sent", transport: "direct" };
       try {
-        await saveMessage(item);
+        const saved = await saveMessage(item);
+        if (!saved) {
+          if (currentRoomRef.current === connectionRoom) setNotice("This room was cleared on this device. Reconnect to resume the room; hub-retained history may replay.");
+          return;
+        }
       } catch {
         if (currentRoomRef.current === connectionRoom) setNotice("The direct message arrived, but could not be saved. No acknowledgment was sent.");
         return;
@@ -542,7 +685,11 @@ function App() {
   }
 
   async function createDirectOffer() {
-    if (!wasmReady) return;
+    if (deletionInProgressRef.current || deletingRoom || !wasmReady) return;
+    try { await resumeRoomForUserAction(room.trim()); }
+    catch { setNotice("Could not resume this room after its local messages were cleared."); return; }
+    if (deletionInProgressRef.current || deletingRoom) return;
+    setRoomDeletedLocally(false);
     setDirectBusy(true);
     setLocalSignal("");
     const connectionRoom = room.trim();
@@ -562,7 +709,11 @@ function App() {
   }
 
   async function acceptDirectOffer() {
-    if (!wasmReady) return;
+    if (deletionInProgressRef.current || deletingRoom || !wasmReady) return;
+    try { await resumeRoomForUserAction(room.trim()); }
+    catch { setNotice("Could not resume this room after its local messages were cleared."); return; }
+    if (deletionInProgressRef.current || deletingRoom) return;
+    setRoomDeletedLocally(false);
     setDirectBusy(true);
     setLocalSignal("");
     const connectionRoom = room.trim();
@@ -584,7 +735,11 @@ function App() {
   }
 
   async function acceptDirectAnswer() {
-    if (!wasmReady) return;
+    if (deletionInProgressRef.current || deletingRoom || !wasmReady) return;
+    try { await resumeRoomForUserAction(room.trim()); }
+    catch { setNotice("Could not resume this room after its local messages were cleared."); return; }
+    if (deletionInProgressRef.current || deletingRoom) return;
+    setRoomDeletedLocally(false);
     const transport = directRef.current;
     if (!transport) { setNotice("Create a direct offer before accepting an answer."); return; }
     const connectionRoom = room.trim();
@@ -694,58 +849,136 @@ function App() {
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const body = draft.trim();
-    if (!wasmReady || !storageReady || !conversationReady || loadedRoom !== room.trim() || pendingSendRef.current || !profileReady || !identity || !body || !room.trim()) return;
+    if (deletionInProgressRef.current || !wasmReady || !storageReady || !conversationReady || loadedRoom !== room.trim() || pendingSendRef.current || !profileReady || !identity || !body || !room.trim()) return;
     pendingSendRef.current = true;
-    const submittedDraft = draft;
-    const messageRoom = room.trim();
-    const packet: MessagePacket = {
-      version: PROTOCOL_VERSION,
-      type: "message",
-      id: makeId(),
-      room: messageRoom,
-      sender: identity.sender,
-      senderName: identity.senderName,
-      createdAt: new Date().toISOString(),
-      body,
-    };
-    if (!validateWithWasm("message", packet)) {
-      setNotice("Check your saved call sign, room code, and message text. This message was not queued.");
-      pendingSendRef.current = false;
-      return;
-    }
-    const item: StoredMessage = { packet, direction: "outgoing", delivery: "queued", transport: sendTransport };
-    messageKeysRef.current.add(`${packet.room}\u0000${packet.id}`);
-    setMessages((current) => [...current, item]);
-    try { await saveMessage(item); }
-    catch {
-      messageKeysRef.current.delete(`${packet.room}\u0000${packet.id}`);
-      setMessages((current) => current.filter((entry) => entry.packet.id !== packet.id || entry.packet.room !== packet.room));
-      if (activeRoomRef.current === messageRoom) setNotice("Could not save this message on this device. It has not been queued for delivery.");
-      pendingSendRef.current = false;
-      return;
-    }
-    if (activeRoomRef.current === messageRoom) {
-      setDraft((current) => current === submittedDraft ? "" : current);
-      if (sendTransport === "direct") {
-        sendDirectMessage(item);
-      } else if (sendTransport === "hub" && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
-        try { socketRef.current.send(JSON.stringify(packet)); }
-        catch {
-          setNotice("The message is saved on this device. The radio will reconnect and retry it.");
-          socketRef.current.close();
+    let finishPendingSend!: () => void;
+    const pendingSendOperation = new Promise<void>((resolve) => { finishPendingSend = resolve; });
+    pendingSendOperationRef.current = pendingSendOperation;
+    try {
+      const submittedDraft = draft;
+      const messageRoom = room.trim();
+      const packet: MessagePacket = {
+        version: PROTOCOL_VERSION,
+        type: "message",
+        id: makeId(),
+        room: messageRoom,
+        sender: identity.sender,
+        senderName: identity.senderName,
+        createdAt: new Date().toISOString(),
+        body,
+      };
+      if (!validateWithWasm("message", packet)) {
+        setNotice("Check your saved call sign, room code, and message text. This message was not queued.");
+        return;
+      }
+      const item: StoredMessage = { packet, direction: "outgoing", delivery: "queued", transport: sendTransport };
+      messageKeysRef.current.add(`${packet.room}\u0000${packet.id}`);
+      setMessages((current) => [...current, item]);
+      try {
+        const saved = await saveMessage(item);
+        if (!saved) {
+          messageKeysRef.current.delete(`${packet.room}\u0000${packet.id}`);
+          setMessages((current) => current.filter((entry) => entry.packet.id !== packet.id || entry.packet.room !== packet.room));
+          setNotice("This room was cleared on this device. Reconnect to resume the room; hub-retained history may replay.");
+          return;
         }
       }
+      catch {
+        messageKeysRef.current.delete(`${packet.room}\u0000${packet.id}`);
+        setMessages((current) => current.filter((entry) => entry.packet.id !== packet.id || entry.packet.room !== packet.room));
+        if (activeRoomRef.current === messageRoom) setNotice("Could not save this message on this device. It has not been queued for delivery.");
+        return;
+      }
+      if (activeRoomRef.current === messageRoom) {
+        setDraft((current) => current === submittedDraft ? "" : current);
+        if (sendTransport === "direct") {
+          sendDirectMessage(item);
+        } else if (sendTransport === "hub" && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
+          try { socketRef.current.send(JSON.stringify(packet)); }
+          catch {
+            setNotice("The message is saved on this device. The radio will reconnect and retry it.");
+            socketRef.current.close();
+          }
+        }
+      }
+    } finally {
+      pendingSendRef.current = false;
+      if (pendingSendOperationRef.current === pendingSendOperation) pendingSendOperationRef.current = null;
+      finishPendingSend();
     }
-    pendingSendRef.current = false;
   }
 
-  function toggleLink() {
-    if (!wasmReady) return;
+  async function clearRoomConversation() {
+    const selectedRoom = room.trim();
+    if (!selectedRoom || !conversationReady || loadedRoom !== selectedRoom || deletionInProgressRef.current) return;
+    deletionInProgressRef.current = true;
+    deletionGenerationRef.current += 1;
+    deletionEventsRef.current.set(selectedRoom, "deleting");
+    focusDeletionStatusRef.current = true;
+    setDeletingRoom(true);
+    setConfirmRoomDeletion(false);
+    stopRoomTransports();
+    publishRoomDeletion("deleting", selectedRoom);
+    let deletionMarkerStarted = false;
+    try {
+      await beginRoomDeletion(selectedRoom);
+      deletionMarkerStarted = true;
+      const roomOperations = [
+        ...hubInboundOperationsRef.current.values(),
+        ...directInboundOperationsRef.current.values(),
+      ];
+      const pendingSend = pendingSendOperationRef.current;
+      await Promise.all([...roomOperations, ...(pendingSend ? [pendingSend] : [])].map((operation) => operation.catch(() => undefined)));
+      await deleteRoomMessages(selectedRoom);
+      if (currentRoomRef.current === selectedRoom) {
+        setMessages([]);
+        messageKeysRef.current.clear();
+        setRoomDeletedLocally(true);
+        for (const key of hubInboundFailuresRef.current) if (key.startsWith(`${selectedRoom}\u0000`)) hubInboundFailuresRef.current.delete(key);
+        for (const key of conflictedHubMessageKeysRef.current) if (key.startsWith(`${selectedRoom}\u0000`)) conflictedHubMessageKeysRef.current.delete(key);
+        setConflictedHubMessageKeys((current) => new Set([...current].filter((key) => !key.startsWith(`${selectedRoom}\u0000`))));
+        setNotice("Saved and queued messages for this room were deleted from this device. Hub history was not deleted and may appear after you reconnect.");
+      }
+      publishRoomDeletion("deleted", selectedRoom);
+      deletionEventsRef.current.set(selectedRoom, "deleted");
+    } catch {
+      let markerCleanupFailed = false;
+      if (deletionMarkerStarted) {
+        try { await cancelRoomDeletion(selectedRoom); }
+        catch { markerCleanupFailed = true; }
+      }
+      if (markerCleanupFailed) {
+        deletionEventsRef.current.set(selectedRoom, "deleting");
+        if (currentRoomRef.current === selectedRoom) {
+          setRoomDeletedLocally(true);
+          setNotice("The conversation could not be deleted or unlocked. This room remains locked on this device. Retry deletion or reload the app to try again.");
+        }
+      } else {
+        deletionEventsRef.current.set(selectedRoom, "cancelled");
+        publishRoomDeletion("cancelled", selectedRoom);
+        if (currentRoomRef.current === selectedRoom) setNotice("Could not delete the saved conversation. Your local messages were kept.");
+      }
+    } finally {
+      deletionInProgressRef.current = false;
+      setDeletingRoom(false);
+    }
+  }
+
+  async function toggleLink() {
+    if (deletionInProgressRef.current || deletingRoom || !wasmReady) return;
     if (linkRequested) {
       setLinkRequested(false);
       setLinkState("offline");
       setNotice("Radio switched to standby.");
     } else {
+      try {
+        await resumeRoomForUserAction(room.trim());
+      } catch {
+        setNotice("Could not resume this room after its local messages were cleared.");
+        return;
+      }
+      if (deletionInProgressRef.current || deletingRoom) return;
+      setRoomDeletedLocally(false);
       const settingsSaved = writeLocalSetting(HUB_KEY, hubUrl.trim());
       setLinkRequested(true);
       setNotice(settingsSaved ? "" : "Your station settings could not be saved. Re-enter them if you reload this page.");
@@ -782,13 +1015,13 @@ function App() {
             <input id="display-name" autoComplete="nickname" maxLength={48} placeholder="e.g. Sam" value={displayName} onChange={(event) => { setDisplayName(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
 
             <label htmlFor="room-code">Room frequency</label>
-            <input id="room-code" maxLength={64} placeholder="Enter a shared room code" value={room} onChange={(event) => { setConversationReady(false); setRoom(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
+            <input id="room-code" maxLength={64} placeholder="Enter a shared room code" value={room} disabled={deletingRoom} onChange={(event) => { setConversationReady(false); setRoom(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
 
             <label htmlFor="hub-address">Hub address</label>
-            <input id="hub-address" type="url" inputMode="url" spellCheck={false} placeholder="ws://192.168.1.20:8000/ws" value={hubUrl} onChange={(event) => { setHubUrl(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
+            <input id="hub-address" type="url" inputMode="url" spellCheck={false} placeholder="ws://192.168.1.20:8000/ws" value={hubUrl} disabled={deletingRoom} onChange={(event) => { setHubUrl(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
             <p className="field-hint">Use your hub’s LAN address on another device.</p>
 
-            <button className="primary-button" type="submit" disabled={!canSaveProfile || (linkRequested && sendTransport === "hub")}>
+            <button className="primary-button" type="submit" disabled={deletingRoom || !canSaveProfile || (linkRequested && sendTransport === "hub")}>
               <span className="button-dot" />{sendTransport === "direct" ? "Save profile for direct link" : linkRequested ? "Station settings saved" : "Save and join room"}
             </button>
           </form>
@@ -798,9 +1031,9 @@ function App() {
           <div className="section-label"><span>02</span><h2 id="direct-title">Direct peer link</h2></div>
           <p className="direct-description">Create an offer on one device, exchange the complete JSON, then accept it on the other device. Compare the fingerprint in person or through an authenticated channel different from the SDP exchange. Otherwise, an intermediary could replace both the signaling data and fingerprint. This host-only connection may require both devices to share a reachable local network. No public STUN or TURN server is configured.</p>
           <div className="direct-actions">
-            <button type="button" onClick={() => void createDirectOffer()} disabled={!wasmReady || !composerReady || !profileReady || directBusy}>Create offer</button>
-            <button type="button" onClick={() => void acceptDirectOffer()} disabled={!wasmReady || !composerReady || !profileReady || directBusy || !signalInput.trim()}>Accept offer</button>
-            <button type="button" onClick={() => void acceptDirectAnswer()} disabled={!wasmReady || !composerReady || !profileReady || directBusy || !signalInput.trim() || !directRef.current}>Accept answer</button>
+            <button type="button" onClick={() => void createDirectOffer()} disabled={deletingRoom || !wasmReady || !conversationLoaded || !profileReady || directBusy}>Create offer</button>
+            <button type="button" onClick={() => void acceptDirectOffer()} disabled={deletingRoom || !wasmReady || !conversationLoaded || !profileReady || directBusy || !signalInput.trim()}>Accept offer</button>
+            <button type="button" onClick={() => void acceptDirectAnswer()} disabled={deletingRoom || !wasmReady || !conversationLoaded || !profileReady || directBusy || !signalInput.trim() || !directRef.current}>Accept answer</button>
           </div>
           <label htmlFor="direct-signal-input">Paste peer offer or answer JSON</label>
           <textarea id="direct-signal-input" value={signalInput} onChange={(event) => setSignalInput(event.target.value)} rows={3} spellCheck={false} />
@@ -831,7 +1064,7 @@ function App() {
         </section>
 
         <div className="sidebar-bottom">
-          <button type="button" className={`link-toggle ${linkRequested ? "is-on" : ""}`} onClick={toggleLink} disabled={!canJoin}>
+          <button type="button" className={`link-toggle ${linkRequested ? "is-on" : ""}`} onClick={toggleLink} disabled={deletingRoom || !canJoin}>
             <span className="toggle-state"><i /></span><span>{linkRequested ? "Disconnect radio" : "Connect radio"}</span>
           </button>
           {isInstallable && <button type="button" className="install-button" onClick={() => void installApp()}>Install NearLink</button>}
@@ -849,7 +1082,15 @@ function App() {
             <div className={`connection-status status-${linkState}`} role="status" aria-live="polite"><span /><div><strong>{linkLabel}</strong><small>{linkState === "online" ? `${peers} connected` : linkState === "retrying" ? "Reconnecting" : linkState === "offline" ? "Local messages ready" : "Stand by"}</small></div></div>
             <SignalMark active={linkState === "online"} />
           </div>
+          <button type="button" className="clear-room-button" disabled={!room.trim() || !conversationReady || deletingRoom} onClick={(event) => { roomDeletionOpenerRef.current = event.currentTarget; setConfirmRoomDeletion(true); }}>Clear this device's saved conversation</button>
         </header>
+
+        <dialog ref={roomDeletionDialogRef} aria-labelledby="delete-room-title" aria-describedby="delete-room-description" className="delete-room-confirmation" onCancel={() => setConfirmRoomDeletion(false)}>
+          <h2 id="delete-room-title">Clear saved messages for {room.trim()}?</h2>
+          <p id="delete-room-description">This deletes saved and queued messages for this room only on this device. Your identity and settings stay saved. The hub's retained history is not affected and may appear again after you reconnect.</p>
+          <button type="button" disabled={deletingRoom} onClick={() => setConfirmRoomDeletion(false)}>Keep messages</button>
+          <button type="button" disabled={deletingRoom} onClick={() => void clearRoomConversation()}>{deletingRoom ? "Clearing messages…" : "Delete local messages"}</button>
+        </dialog>
 
         {wasmFailed && <div className="notice-banner" role="alert"><span aria-hidden="true">!</span>{WASM_PROTOCOL_FAILURE_NOTICE}</div>}
         <div className="notice-banner" role="status" aria-live="polite"><span aria-hidden="true">!</span>{storagePersistence === "checking"
@@ -858,7 +1099,7 @@ function App() {
             ? "The browser reports that NearLink storage is persistent. This may reduce automatic clearing, but it does not guarantee retention. Messages may still be lost through user action, device loss, or browser behavior. This is not a backup."
             : "This browser cannot assure that saved messages will be retained. Messages may still be lost through user action, device loss, or browser behavior. This is not a backup."}</div>
         <div className="message-scroll" role="log" aria-label={`Messages in ${room.trim() || "the selected room"}`} aria-live="polite" aria-relevant="additions" tabIndex={0}>
-          {notice && <div className="notice-banner" role="status"><span>!</span>{notice}<button type="button" aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
+          {notice && <div ref={deletionStatusRef} className="notice-banner" role="status" tabIndex={-1}><span>!</span>{notice}<button type="button" aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
           {sortedMessages.length === 0 ? (
             <div className="empty-state">
               <div className="empty-icon"><SignalMark active={false} /></div>
@@ -891,8 +1132,8 @@ function App() {
         <footer className="composer-wrap">
           <form className="composer" aria-busy={!composerReady} onSubmit={sendMessage}>
             <label className="sr-only" htmlFor="message-draft">Write a message</label>
-            <textarea id="message-draft" rows={1} maxLength={4000} placeholder={!composerReady ? "Loading saved messages…" : room.trim() ? "Write a message to this room…" : "Choose a room to start a message"} value={draft} disabled={!composerReady || !room.trim()} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return; if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
-            <div className="composer-tools"><label className="transport-choice">Send via <select aria-label="Message transport" value={sendTransport} onChange={(event) => setSendTransport(event.target.value as "hub" | "direct")}><option value="hub">Local hub</option><option value="direct">Direct peer</option></select></label><span><kbd>↵</kbd> send <span className="tool-divider">·</span> <kbd>⇧ ↵</kbd> new line</span><span className="char-count">{draft.length}/4000</span><button type="submit" className="send-button" disabled={!composerReady || !profileReady || !draft.trim() || !room.trim()} aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.75 12h14.5m0 0-6-6m6 6-6 6" /></svg></button></div>
+            <textarea id="message-draft" rows={1} maxLength={4000} placeholder={!composerReady ? "Loading saved messages…" : room.trim() ? "Write a message to this room…" : "Choose a room to start a message"} value={draft} disabled={!composerReady || !room.trim() || deletingRoom} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return; if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+            <div className="composer-tools"><label className="transport-choice">Send via <select aria-label="Message transport" value={sendTransport} onChange={(event) => setSendTransport(event.target.value as "hub" | "direct")}><option value="hub">Local hub</option><option value="direct">Direct peer</option></select></label><span><kbd>↵</kbd> send <span className="tool-divider">·</span> <kbd>⇧ ↵</kbd> new line</span><span className="char-count">{draft.length}/4000</span><button type="submit" className="send-button" disabled={deletingRoom || !composerReady || !profileReady || !draft.trim() || !room.trim()} aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.75 12h14.5m0 0-6-6m6 6-6 6" /></svg></button></div>
           </form>
           <div className="composer-foot"><span role="status" aria-live="polite"><i className={sendTransport === "direct" ? (directState === "connected" && fingerprintConfirmed ? "foot-live" : "") : linkState === "online" ? "foot-live" : ""} />{!composerReady ? "Loading saved messages" : sendTransport === "direct" ? directState === "connected" && fingerprintConfirmed ? "Session fingerprint compared" : "Direct messages remain queued until session confirmation" : linkState === "online" ? "Connected to local hub" : "Messages save locally until a hub is connected"}</span><span>NEARLINK <b>·</b> LOCAL FIRST</span></div>
         </footer>
