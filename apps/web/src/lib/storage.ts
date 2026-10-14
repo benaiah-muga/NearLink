@@ -15,6 +15,30 @@ export interface LocalIdentity {
   senderName: string;
 }
 
+export type StoragePersistenceResult = "granted" | "denied" | "unavailable";
+
+/** Ask the browser to protect this site's storage from automatic eviction. */
+export async function requestStoragePersistence(): Promise<StoragePersistenceResult> {
+  if (typeof navigator === "undefined" || !navigator.storage) return "unavailable";
+
+  const storageManager = navigator.storage;
+  if (typeof storageManager.persisted === "function") {
+    try {
+      if (await storageManager.persisted()) return "granted";
+    } catch {
+      // A failed status check should not prevent the persistence request.
+    }
+  }
+
+  if (typeof storageManager.persist !== "function") return "unavailable";
+
+  try {
+    return await storageManager.persist() ? "granted" : "denied";
+  } catch {
+    return "denied";
+  }
+}
+
 const DATABASE_NAME = "nearlink-local";
 const DATABASE_VERSION = 2;
 const MESSAGE_STORE = "messages";

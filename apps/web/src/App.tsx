@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { isMessagePacket, isProtocolRoom, isServerPacket, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
-import { loadIdentity, loadMessages, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoredMessage } from "./lib/storage";
+import { loadIdentity, loadMessages, requestStoragePersistence, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
 
 type LinkState = "offline" | "connecting" | "linking" | "online" | "retrying" | "error";
@@ -95,6 +95,7 @@ function App() {
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState("");
   const [storageReady, setStorageReady] = useState(false);
+  const [storagePersistence, setStoragePersistence] = useState<StoragePersistenceResult | "checking">("checking");
   const [conversationReady, setConversationReady] = useState(false);
   const [loadedRoom, setLoadedRoom] = useState<string | null>(null);
   const [isInstallable, setIsInstallable] = useState(false);
@@ -161,6 +162,14 @@ function App() {
         setProfileSaved(false);
         setStorageReady(true);
       }
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void requestStoragePersistence().then((result) => {
+      if (active) setStoragePersistence(result);
     });
     return () => { active = false; };
   }, []);
@@ -786,6 +795,11 @@ function App() {
           </div>
         </header>
 
+        <div className="notice-banner" role="status" aria-live="polite"><span aria-hidden="true">!</span>{storagePersistence === "checking"
+          ? "Checking this browser's storage retention setting."
+          : storagePersistence === "granted"
+            ? "The browser reports that NearLink storage is persistent. This may reduce automatic clearing, but it does not guarantee retention. Messages may still be lost through user action, device loss, or browser behavior. This is not a backup."
+            : "This browser cannot assure that saved messages will be retained. Messages may still be lost through user action, device loss, or browser behavior. This is not a backup."}</div>
         <div className="message-scroll" role="log" aria-label={`Messages in ${room.trim() || "the selected room"}`} aria-live="polite" aria-relevant="additions" tabIndex={0}>
           {notice && <div className="notice-banner" role="status"><span>!</span>{notice}<button type="button" aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
           {sortedMessages.length === 0 ? (

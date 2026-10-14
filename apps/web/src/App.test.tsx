@@ -52,6 +52,12 @@ vi.mock("./lib/storage", async (importOriginal) => {
 import App from "./App";
 import { loadMessages, saveMessage, type StoredMessage } from "./lib/storage";
 
+const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, "storage");
+
+function setStorageManager(storageManager: Partial<StorageManager> | undefined): void {
+  Object.defineProperty(navigator, "storage", { configurable: true, value: storageManager });
+}
+
 class MockWebSocket {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
@@ -146,8 +152,75 @@ beforeEach(async () => {
 
 afterEach(() => {
   cleanup();
+  if (originalStorageDescriptor) Object.defineProperty(navigator, "storage", originalStorageDescriptor);
+  else Reflect.deleteProperty(navigator, "storage");
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("browser storage retention feedback", () => {
+  it("reports when persistent storage is granted", async () => {
+    const persisted = vi.fn().mockResolvedValue(false);
+    const persist = vi.fn().mockResolvedValue(true);
+    setStorageManager({ persisted, persist });
+
+    render(<App />);
+
+    expect(await screen.findByText(/browser reports that NearLink storage is persistent/i)).toBeTruthy();
+    expect(screen.getByText(/does not guarantee retention/i)).toBeTruthy();
+    expect(screen.getByText(/user action, device loss, or browser behavior/i)).toBeTruthy();
+    expect(screen.getByText(/this is not a backup/i)).toBeTruthy();
+    expect(persisted).toHaveBeenCalledOnce();
+    expect(persist).toHaveBeenCalledOnce();
+  });
+
+  it("recognizes storage that is already persistent when the request API is missing", async () => {
+    const persisted = vi.fn().mockResolvedValue(true);
+    setStorageManager({ persisted });
+
+    render(<App />);
+
+    expect(await screen.findByText(/browser reports that NearLink storage is persistent/i)).toBeTruthy();
+    expect(persisted).toHaveBeenCalledOnce();
+  });
+
+  it("explains a denied request and still lets the user save messages locally", async () => {
+    const persist = vi.fn().mockResolvedValue(false);
+    setStorageManager({ persisted: vi.fn().mockResolvedValue(false), persist });
+
+    render(<App />);
+
+    expect(await screen.findByText(/cannot assure that saved messages will be retained/i)).toBeTruthy();
+    const draft = await screen.findByRole("textbox", { name: "Write a message" });
+    await waitFor(() => expect((draft as HTMLTextAreaElement).disabled).toBe(false));
+    fireEvent.change(draft, { target: { value: "Still available locally" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await screen.findByText("Queued on this device");
+    expect(await loadMessages(ROOM)).toHaveLength(1);
+    expect(persist).toHaveBeenCalledOnce();
+  });
+
+  it("explains when persistent storage APIs are unavailable", async () => {
+    setStorageManager(undefined);
+
+    render(<App />);
+
+    expect(await screen.findByText(/cannot assure that saved messages will be retained/i)).toBeTruthy();
+    const draft = await screen.findByRole("textbox", { name: "Write a message" });
+    await waitFor(() => expect((draft as HTMLTextAreaElement).disabled).toBe(false));
+  });
+
+  it("treats a rejected persistence request as unprotected storage", async () => {
+    setStorageManager({
+      persisted: vi.fn().mockResolvedValue(false),
+      persist: vi.fn().mockRejectedValue(new Error("Permission denied")),
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(/cannot assure that saved messages will be retained/i)).toBeTruthy();
+  });
 });
 
 describe("browser app messaging flow", () => {
