@@ -47,18 +47,24 @@ parsing or constructing that value.
 
 ## Boundaries and remaining work
 
-This module is not yet called by the browser or hub. It has no JavaScript/WASM
-binding, persistent index, resumable peer cursor, synchronization packet type,
-or wire compatibility contract. The caller is responsible for storing
-synchronization progress and exchanging IDs and pages. The current message
-format does not authenticate the peer or bind an inventory to a trusted
-identity. A malicious peer can omit messages from its inventory, provide
-misleading IDs, or send conflicting packets. This primitive does not encrypt,
-authenticate, or prove completeness.
+`crates/protocol-wasm` exposes the structural validators and reconciliation
+operations through JSON-string functions and a `WasmMessageIndex` class. The
+facade checks JSON byte lengths before parsing, returns stable content-free
+error codes, and uses the same shared protocol vectors as the native core
+tests. `npm run test:wasm` builds the wasm-bindgen artifact and exercises it in
+Chromium. The web application's messaging flow does not yet call this binding.
+
+The core has no persistent index, resumable peer cursor, synchronization
+packet type, or wire compatibility contract. The caller is responsible for
+storing synchronization progress and exchanging IDs and pages. The current
+message format does not authenticate the peer or bind an inventory to a
+trusted identity. A malicious peer can omit messages from its inventory,
+provide misleading IDs, or send conflicting packets. This primitive does not
+encrypt, authenticate, or prove completeness.
 
 Before the application relies on this behavior across devices, define a
 versioned transport-independent synchronization exchange, persist progress
 safely, bind accepted data to the selected identity and security design, and
-add TypeScript/WASM interoperability tests. Retain the existing rule that
+connect the tested binding to the application. Retain the existing rule that
 timestamps are presentation hints and that exactly-once delivery is not
 promised.

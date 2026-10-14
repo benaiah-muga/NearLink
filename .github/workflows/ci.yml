@@ -35,6 +35,11 @@ jobs:
       - run: cargo +1.84.1 test --manifest-path crates/protocol-core/Cargo.toml --locked
       - run: cargo +1.84.1 check --target wasm32-unknown-unknown --manifest-path crates/protocol-core/Cargo.toml --locked
       - run: cargo +1.84.1 clippy --manifest-path crates/protocol-core/Cargo.toml --locked -- -D warnings
+      - run: cargo +1.84.1 fmt --manifest-path crates/protocol-wasm/Cargo.toml -- --check
+      - run: cargo +1.84.1 test --manifest-path crates/protocol-wasm/Cargo.toml --locked
+      - run: cargo +1.84.1 clippy --manifest-path crates/protocol-wasm/Cargo.toml --locked -- -D warnings
+      - run: cargo +1.84.1 install wasm-bindgen-cli --version 0.2.103 --locked
+      - run: npm run test:wasm
 
   security-audit:
     runs-on: ubuntu-24.04
@@ -63,3 +68,9 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: crates/protocol-core
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: crates/protocol-wasm

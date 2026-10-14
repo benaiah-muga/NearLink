@@ -11,6 +11,7 @@
     "build": "npm run build --workspace @nearlink/web",
     "test:unit": "node scripts/run-unit-tests.mjs",
     "test:e2e": "npm run build && playwright test",
+    "test:wasm": "node scripts/test-protocol-wasm.mjs",
     "verify:all": "node scripts/verify-foundation.mjs",
     "verify:foundation": "node scripts/verify-foundation.mjs"
   },
