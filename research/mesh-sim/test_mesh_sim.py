@@ -14,6 +14,17 @@ class MeshSimulationTests(unittest.TestCase):
                 result = Simulation(scenario).run()
                 assert_invariants(scenario, result)
 
+    def test_scenarios_are_byte_deterministic_json(self) -> None:
+        import json
+
+        for scenario in scenarios().values():
+            with self.subTest(scenario=scenario.name):
+                first = json.dumps(Simulation(scenario).run(), sort_keys=True,
+                                   separators=(",", ":"))
+                second = json.dumps(Simulation(scenario).run(), sort_keys=True,
+                                    separators=(",", ":"))
+                self.assertEqual(first, second)
+
     def test_connected_line_delivers_with_hop_latency(self) -> None:
         result = Simulation(scenarios()["connected_line"]).run()
         metrics = result["metrics"]
@@ -120,6 +131,102 @@ class MeshSimulationTests(unittest.TestCase):
         self.assertEqual(metrics["delivery_ticks"], {"to_d": 2})
         self.assertIn("held", simulation.states["D"].pending)
         self.assertNotIn("to_d", simulation.states["D"].pending)
+
+    def test_shortest_path_uses_deterministic_tie_break_and_fewer_transmissions(self) -> None:
+        links = {tick: (("A", "B"), ("B", "D"), ("A", "C"), ("C", "D"))
+                 for tick in range(5)}
+        scenario = Scenario(
+            name="shortest_diamond", nodes=("A", "B", "C", "D"), ticks=5,
+            injections=(Injection(0, message("route", "A", "D")),),
+            links_by_tick=links, forwarding_policy="shortest_path",
+        )
+        simulation = Simulation(scenario)
+        first = simulation.run()
+        second = Simulation(scenario).run()
+        self.assertEqual(first, second)
+        self.assertEqual(first["metrics"]["delivery_ticks"], {"route": 2})
+        self.assertEqual(first["metrics"]["transmissions"], 2)
+        self.assertIn("route", simulation.states["B"].seen_until)
+        self.assertNotIn("route", simulation.states["C"].seen_until)
+
+    def test_boundary_admission_retains_copy_while_receiver_is_inactive(self) -> None:
+        scenario = Scenario(
+            name="inactive_boundary_receiver", nodes=("A", "B", "D"), ticks=5,
+            injections=(Injection(0, message("held", "A", "D")),),
+            links_by_tick={
+                0: (("A", "B"),),
+                1: (("A", "B"), ("B", "D")),
+                2: (("B", "D"),),
+                3: (),
+                4: (),
+            },
+            active_by_tick={1: ("A", "D")},
+        )
+        simulation = Simulation(scenario)
+        metrics = simulation.run()["metrics"]
+        self.assertEqual(metrics["delivery_ticks"], {"held": 3})
+        self.assertEqual(metrics["transmissions"], 2)
+        self.assertIn("held", simulation.states["B"].pending)
+
+    def test_shortest_path_recomputes_after_route_becomes_available(self) -> None:
+        scenario = Scenario(
+            name="route_restore", nodes=("A", "B", "C", "D"), ticks=5,
+            injections=(Injection(0, message("restore", "A", "D", ttl=4)),),
+            links_by_tick={
+                0: (("A", "B"),),
+                1: (("A", "C"), ("C", "D")),
+                2: (("A", "C"), ("C", "D")),
+                3: (), 4: (),
+            },
+            forwarding_policy="shortest_path",
+        )
+        metrics = Simulation(scenario).run()["metrics"]
+        self.assertEqual(metrics["delivery_ticks"], {"restore": 3})
+        self.assertEqual(metrics["transmissions"], 2)
+
+    def test_per_node_tick_budget_prioritizes_queued_messages(self) -> None:
+        scenario = Scenario(
+            name="priority_budget", nodes=("A", "B", "C"), ticks=3,
+            injections=(
+                Injection(0, message("low", "A", "B", priority=0)),
+                Injection(0, message("high", "A", "C", priority=9)),
+            ),
+            links_by_tick={0: (("A", "B"), ("A", "C")), 1: (), 2: ()},
+            forwarding_policy="shortest_path",
+            node_transmission_budgets={"A": 1},
+        )
+        metrics = Simulation(scenario).run()["metrics"]
+        self.assertEqual(metrics["delivery_ticks"], {"high": 1})
+        self.assertEqual(metrics["transmissions"], 1)
+        self.assertEqual(metrics["budget_suppressions"], 1)
+
+    def test_blackhole_retains_received_copy_and_does_not_forward(self) -> None:
+        scenario = Scenario(
+            name="blackhole", nodes=("A", "B", "D"), ticks=5,
+            injections=(Injection(0, message("blocked", "A", "D")),),
+            links_by_tick={tick: (("A", "B"), ("B", "D")) for tick in range(5)},
+            forwarding_policy="shortest_path", blackhole_relays=("B",),
+        )
+        simulation = Simulation(scenario)
+        metrics = simulation.run()["metrics"]
+        self.assertEqual(metrics["delivered"], 0)
+        self.assertEqual(metrics["malicious_relay_drops"], 1)
+        self.assertEqual(metrics["transmissions"], 1)
+        self.assertIn("blocked", simulation.states["B"].pending)
+
+    def test_policy_budget_and_blackhole_scenario_validation(self) -> None:
+        for overrides in (
+            {"forwarding_policy": "random"},
+            {"node_transmission_budgets": {"missing": 1}},
+            {"node_transmission_budgets": {"A": 0}},
+            {"blackhole_relays": ("missing",)},
+        ):
+            scenario = Scenario(
+                name="invalid_policy", nodes=("A",), ticks=1,
+                injections=(), links_by_tick={}, **overrides,
+            )
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                Simulation(scenario)
 
 
 if __name__ == "__main__":
