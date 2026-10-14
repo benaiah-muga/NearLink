@@ -31,6 +31,8 @@ MAX_ROOM_MEMBERS = 32
 MAX_TOTAL_CLIENTS = 256
 MAX_MESSAGES_PER_MINUTE = 120
 MAX_HISTORY_REQUESTS_PER_MINUTE = 30
+MAX_SYNC_CONTROLS_PER_MINUTE = 2_700
+MAX_SYNC_RATE_BUCKETS = MAX_TOTAL_CLIENTS
 SEND_TIMEOUT_SECONDS = 2
 MAX_REPLAY_MESSAGES = 100
 MAX_HISTORY_PAGE_MESSAGES = 100
@@ -88,7 +90,14 @@ class Client:
         return True
 
 
+@dataclass
+class SyncRateBucket:
+    window_started: float
+    requests: int = 0
+
+
 rooms: dict[str, set[Client]] = {}
+sync_rate_buckets: dict[tuple[str, str], SyncRateBucket] = {}
 active_connections = 0
 room_delivery_lock = asyncio.Lock()
 
@@ -613,6 +622,120 @@ def validate_history_request(packet: Any) -> dict[str, Any] | None:
     return {"requestId": request_id, "room": room, "cursor": cursor, "limit": limit}
 
 
+SYNC_PACKET_FIELDS = {
+    "sync_inventory_page": {
+        "version", "type", "room", "syncId", "sender", "cursor", "messageIds",
+        "nextCursor", "hasMore", "limitReached",
+    },
+    "sync_missing_request": {
+        "version", "type", "room", "syncId", "requestId", "sender", "targetSender", "messageIds",
+    },
+    "sync_page_complete": {
+        "version", "type", "room", "syncId", "requestId", "sender", "targetSender", "messageIds",
+    },
+}
+
+
+def sorted_unique_ids(value: Any, *, allow_empty: bool) -> bool:
+    if not isinstance(value, list) or len(value) > 100 or (not allow_empty and not value):
+        return False
+    if not all(valid_identifier(item) for item in value):
+        return False
+    return all(value[index - 1] < value[index] for index in range(1, len(value)))
+
+
+def validate_sync_control(packet: Any, client: Client) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(packet, dict) or not valid_version(packet):
+        return None, "invalid_packet"
+    packet_type = packet.get("type")
+    expected_fields = SYNC_PACKET_FIELDS.get(packet_type)
+    if expected_fields is None or packet.keys() != expected_fields:
+        return None, "invalid_packet"
+    if not valid_room(packet.get("room")):
+        return None, "invalid_packet"
+    if packet["room"] != client.room:
+        return None, "not_joined"
+    if not valid_identifier(packet.get("sender"), MAX_SENDER_LENGTH) or packet["sender"] != client.sender:
+        return None, "invalid_packet"
+    if not valid_identifier(packet.get("syncId")):
+        return None, "invalid_packet"
+
+    if packet_type == "sync_inventory_page":
+        cursor = packet["cursor"]
+        next_cursor = packet["nextCursor"]
+        message_ids = packet["messageIds"]
+        if (
+            (cursor is not None and not valid_identifier(cursor))
+            or (next_cursor is not None and not valid_identifier(next_cursor))
+            or not sorted_unique_ids(message_ids, allow_empty=True)
+            or type(packet["hasMore"]) is not bool
+            or type(packet["limitReached"]) is not bool
+        ):
+            return None, "invalid_packet"
+        if not message_ids:
+            if cursor is not None or next_cursor is not None or packet["hasMore"] or packet["limitReached"]:
+                return None, "invalid_packet"
+        elif next_cursor != message_ids[-1] or (cursor is not None and message_ids[0] <= cursor):
+            return None, "invalid_packet"
+        if packet["limitReached"] and packet["hasMore"]:
+            return None, "invalid_packet"
+    elif packet_type == "sync_missing_request":
+        if (
+            not valid_identifier(packet.get("requestId"))
+            or not valid_identifier(packet.get("targetSender"), MAX_SENDER_LENGTH)
+            or not sorted_unique_ids(packet.get("messageIds"), allow_empty=False)
+        ):
+            return None, "invalid_packet"
+    else:
+        if (
+            not valid_identifier(packet.get("requestId"))
+            or not valid_identifier(packet.get("targetSender"), MAX_SENDER_LENGTH)
+            or not sorted_unique_ids(packet.get("messageIds"), allow_empty=True)
+        ):
+            return None, "invalid_packet"
+
+    if len(compact_json_bytes(packet) or b"") > MAX_PROTOCOL_PACKET_BYTES:
+        return None, "message_too_large"
+    return packet, None
+
+
+def consume_sync_control(client: Client) -> bool:
+    now = monotonic()
+    expired = [key for key, bucket in sync_rate_buckets.items() if now - bucket.window_started >= 60]
+    for key in expired:
+        del sync_rate_buckets[key]
+    key = (client.room, client.sender)
+    bucket = sync_rate_buckets.get(key)
+    if bucket is None:
+        if len(sync_rate_buckets) >= MAX_SYNC_RATE_BUCKETS:
+            return False
+        bucket = SyncRateBucket(now)
+        sync_rate_buckets[key] = bucket
+    if bucket.requests >= MAX_SYNC_CONTROLS_PER_MINUTE:
+        return False
+    bucket.requests += 1
+    return True
+
+
+async def relay_sync_control(client: Client, packet: dict[str, Any]) -> None:
+    async with room_delivery_lock:
+        members = tuple(rooms.get(client.room, ()))
+        recipients = [member for member in members if member is not client]
+        if not recipients:
+            return
+        results = await asyncio.gather(
+            *(send_packet(recipient, packet) for recipient in recipients),
+            return_exceptions=True,
+        )
+        for recipient, result in zip(recipients, results):
+            if isinstance(result, BaseException):
+                await remove_client(recipient)
+                try:
+                    await recipient.websocket.close(code=1013)
+                except Exception:
+                    pass
+
+
 async def broadcast_presence(room: str) -> None:
     members = tuple(rooms.get(room, ()))
     await asyncio.gather(
@@ -694,7 +817,7 @@ async def send_history_page(client: Client, request: dict[str, Any]) -> None:
             await send_packet(client, packet_error("not_joined", "Join this room before requesting history."))
             return
         if not client.consume_history_request():
-            await send_packet(client, packet_error("rate_limited", "Please wait before requesting more history."))
+            await send_packet(client, packet_error("history_rate_limited", "Please wait before requesting more history."))
             return
         try:
             packets, page_bytes, next_cursor, has_more, truncated, error = await asyncio.to_thread(
@@ -863,6 +986,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await send_packet(client, packet_error("invalid_packet", "History request does not match protocol version 1."))
                     continue
                 await send_history_page(client, request)
+                continue
+            if isinstance(incoming, dict) and incoming.get("type") in SYNC_PACKET_FIELDS:
+                control, error = validate_sync_control(incoming, client)
+                if error is not None:
+                    text = "Join this room before sending synchronization controls." if error == "not_joined" else (
+                        "Synchronization packet exceeds the maximum packet size." if error == "message_too_large" else
+                        "Synchronization packet does not match protocol version 1."
+                    )
+                    await send_packet(client, packet_error(error, text))
+                    continue
+                if client not in rooms.get(client.room, set()):
+                    await send_packet(client, packet_error("not_joined", "Join this room before sending synchronization controls."))
+                    continue
+                if not consume_sync_control(client):
+                    await send_packet(client, packet_error("sync_rate_limited", "Please wait before sending more synchronization controls."))
+                    continue
+                await relay_sync_control(client, control)
                 continue
             message, error = validate_message(incoming, client)
             if error is not None:

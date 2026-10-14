@@ -7,6 +7,8 @@ export const MAX_DISPLAY_NAME_LENGTH = 64;
 export const MAX_HISTORY_PAGE_MESSAGES = 100;
 export const MAX_HISTORY_PAGE_BYTES = 512 * 1024;
 export const MAX_PROTOCOL_ENVELOPE_BYTES = 18 * 1024;
+export const MAX_SYNC_INVENTORY_IDS = 4096;
+export const MAX_SYNC_PACKET_IDS = 100;
 const HUB_WHITESPACE = "\u0009-\u000d\u001c-\u001f\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000";
 const HUB_WHITESPACE_AT_EDGES = new RegExp(`^[${HUB_WHITESPACE}]+|[${HUB_WHITESPACE}]+$`, "gu");
 
@@ -66,6 +68,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasExactFields(value: Record<string, unknown>, fields: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === fields.length && actual.every((field) => fields.includes(field));
+}
+
 function isEnvelopeWithinLimit(value: unknown): boolean {
   try {
     const encoded = JSON.stringify(value);
@@ -116,6 +123,43 @@ export interface HistoryPageCompletePacket {
   historyTruncated: boolean;
 }
 
+export interface SyncInventoryPagePacket {
+  version: typeof PROTOCOL_VERSION;
+  type: "sync_inventory_page";
+  room: string;
+  syncId: string;
+  sender: string;
+  cursor: string | null;
+  messageIds: string[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  limitReached: boolean;
+}
+
+export interface SyncMissingRequestPacket {
+  version: typeof PROTOCOL_VERSION;
+  type: "sync_missing_request";
+  room: string;
+  syncId: string;
+  requestId: string;
+  sender: string;
+  targetSender: string;
+  messageIds: string[];
+}
+
+export interface SyncPageCompletePacket {
+  version: typeof PROTOCOL_VERSION;
+  type: "sync_page_complete";
+  room: string;
+  syncId: string;
+  requestId: string;
+  sender: string;
+  targetSender: string;
+  messageIds: string[];
+}
+
+export type SyncPacket = SyncInventoryPagePacket | SyncMissingRequestPacket | SyncPageCompletePacket;
+
 export interface JoinedPacket {
   version: typeof PROTOCOL_VERSION;
   type: "joined";
@@ -145,6 +189,8 @@ export interface ErrorPacket {
     | "message_too_large"
     | "capacity_reached"
     | "rate_limited"
+    | "history_rate_limited"
+    | "sync_rate_limited"
     | "message_conflict"
     | "storage_unavailable"
     | "not_joined"
@@ -155,14 +201,80 @@ export interface ErrorPacket {
   id?: string;
 }
 
-export type ClientPacket = JoinPacket | MessagePacket | HistoryRequestPacket;
+export type ClientPacket = JoinPacket | MessagePacket | HistoryRequestPacket | SyncPacket;
 export type ServerPacket =
   | JoinedPacket
   | MessagePacket
   | AcknowledgmentPacket
   | PresencePacket
   | ErrorPacket
-  | HistoryPageCompletePacket;
+  | HistoryPageCompletePacket
+  | SyncPacket;
+
+function isSortedUniqueIdentifiers(value: unknown, allowEmpty: boolean): value is string[] {
+  if (!Array.isArray(value)
+    || value.length > MAX_SYNC_PACKET_IDS
+    || (!allowEmpty && value.length === 0)
+    || !value.every(isProtocolIdentifier)) return false;
+  for (let index = 1; index < value.length; index += 1) {
+    if (value[index - 1] >= value[index]) return false;
+  }
+  return true;
+}
+
+export function isSyncInventoryPagePacket(value: unknown): value is SyncInventoryPagePacket {
+  if (!isRecord(value) || !hasExactFields(value, [
+    "version", "type", "room", "syncId", "sender", "cursor", "messageIds", "nextCursor", "hasMore", "limitReached",
+  ]) || !isEnvelopeWithinLimit(value)
+    || value.version !== PROTOCOL_VERSION
+    || value.type !== "sync_inventory_page"
+    || !isProtocolRoom(value.room)
+    || !isProtocolIdentifier(value.syncId)
+    || !isProtocolIdentifier(value.sender)
+    || !(value.cursor === null || isProtocolIdentifier(value.cursor))
+    || !isSortedUniqueIdentifiers(value.messageIds, true)
+    || !(value.nextCursor === null || isProtocolIdentifier(value.nextCursor))
+    || typeof value.hasMore !== "boolean"
+    || typeof value.limitReached !== "boolean") return false;
+  const ids = value.messageIds;
+  if (ids.length === 0) return value.cursor === null && value.nextCursor === null && !value.hasMore && !value.limitReached;
+  if (value.nextCursor !== ids[ids.length - 1] || (value.cursor !== null && ids[0] <= value.cursor)) return false;
+  return !value.limitReached || !value.hasMore;
+}
+
+export function isSyncMissingRequestPacket(value: unknown): value is SyncMissingRequestPacket {
+  return isRecord(value) && hasExactFields(value, [
+    "version", "type", "room", "syncId", "requestId", "sender", "targetSender", "messageIds",
+  ]) && isEnvelopeWithinLimit(value)
+    && value.version === PROTOCOL_VERSION
+    && value.type === "sync_missing_request"
+    && isProtocolRoom(value.room)
+    && isProtocolIdentifier(value.syncId)
+    && isProtocolIdentifier(value.requestId)
+    && isProtocolIdentifier(value.sender)
+    && isProtocolIdentifier(value.targetSender)
+    && isSortedUniqueIdentifiers(value.messageIds, false);
+}
+
+export function isSyncPageCompletePacket(value: unknown): value is SyncPageCompletePacket {
+  return isRecord(value) && hasExactFields(value, [
+    "version", "type", "room", "syncId", "requestId", "sender", "targetSender", "messageIds",
+  ]) && isEnvelopeWithinLimit(value)
+    && value.version === PROTOCOL_VERSION
+    && value.type === "sync_page_complete"
+    && isProtocolRoom(value.room)
+    && isProtocolIdentifier(value.syncId)
+    && isProtocolIdentifier(value.requestId)
+    && isProtocolIdentifier(value.sender)
+    && isProtocolIdentifier(value.targetSender)
+    && isSortedUniqueIdentifiers(value.messageIds, true);
+}
+
+function isSyncPacket(value: unknown): value is SyncPacket {
+  return isSyncInventoryPagePacket(value)
+    || isSyncMissingRequestPacket(value)
+    || isSyncPageCompletePacket(value);
+}
 
 export function isJoinPacket(value: unknown): value is JoinPacket {
   if (!isRecord(value) || !isEnvelopeWithinLimit(value)) return false;
@@ -232,6 +344,10 @@ export function isServerPacket(value: unknown): value is ServerPacket {
   switch (value.type) {
     case "history_page_complete":
       return isHistoryPageCompletePacket(value);
+    case "sync_inventory_page":
+    case "sync_missing_request":
+    case "sync_page_complete":
+      return isSyncPacket(value);
     case "joined":
       return isProtocolRoom(value.room)
         && Number.isInteger(value.peers)
@@ -251,6 +367,8 @@ export function isServerPacket(value: unknown): value is ServerPacket {
           "message_too_large",
           "capacity_reached",
           "rate_limited",
+          "history_rate_limited",
+          "sync_rate_limited",
           "message_conflict",
           "storage_unavailable",
           "not_joined",
@@ -266,5 +384,5 @@ export function isServerPacket(value: unknown): value is ServerPacket {
 }
 
 export function isClientPacket(value: unknown): value is ClientPacket {
-  return isJoinPacket(value) || isMessagePacket(value) || isHistoryRequestPacket(value);
+  return isJoinPacket(value) || isMessagePacket(value) || isHistoryRequestPacket(value) || isSyncPacket(value);
 }

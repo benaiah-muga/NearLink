@@ -1,6 +1,8 @@
 # Protocol v1 test vectors
 
-The shared vectors in `../vectors/v1.json` define the current version 1 packet boundary and run in both the TypeScript validator tests and the native Rust protocol-core tests. They cover valid join, message, joined, acknowledgment, presence, error, retained-history request, and history-page-complete packets, plus invalid identifiers, cursors, page limits, timestamps, envelopes, and message bodies. History error vectors include `not_joined`, `invalid_cursor`, `history_packet_too_large`, and `history_page_too_large`.
+The shared vectors in `../vectors/v1.json` define the current version 1 packet boundary and run in TypeScript, native Rust protocol-core tests, the WASM facade tests, and a real browser WebAssembly check. They cover valid join, message, joined, acknowledgment, presence, error, retained-history request and completion, and synchronization inventory, missing-request, and completion packets. Invalid vectors include identifiers, cursors, unsorted or duplicate sync IDs, page limits, timestamps, envelopes, and message bodies. History error vectors include `not_joined`, `invalid_cursor`, `history_packet_too_large`, and `history_page_too_large`.
+
+The synchronization helpers retain at most 4,096 inventory IDs, 100 IDs per control packet, and 64 request records. They check ordered cursor progression, stable exchange identity, duplicate packet replay, request conflicts, and completion subsets. They do not establish peer identity, message provenance, or inventory completeness.
 
 The Rust core is pinned to Rust 1.84.1 and uses `serde_json` for parsed JSON values. The WASM facade exposes the same validators to browser code through the generated JavaScript bindings. Native Rust tests check core and facade behavior, and CI cross-compiles the crate for `wasm32-unknown-unknown`. The protocol crates do not implement cryptography, authentication, or transport behavior.
 

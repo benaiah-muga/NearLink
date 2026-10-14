@@ -7,12 +7,15 @@
 ## Current project state
 
 The repository contains a React and TypeScript browser application in
-`apps/web`, a protocol package in `packages/protocol`, and a Rust crate in
-`crates/protocol-core`. The Rust crate validates protocol v1 JSON structures
-and has a bounded, in-memory message reconciliation primitive. It does not
-implement persistent synchronization, transport, identity, or encryption.
-There is no Tauri configuration, Tauri dependency, native UI, platform
-adapter, WebAssembly binding, or Android project in the repository.
+`apps/web`, a protocol package in `packages/protocol`, and Rust crates in
+`crates/protocol-core` and `crates/protocol-wasm`. The core validates protocol
+v1 JSON structures and has a bounded, in-memory message reconciliation
+primitive. The WASM facade exposes validation and reconciliation APIs to
+JavaScript. Generated browser bindings are built by the checked-in script, and
+the browser app uses the validator at packet boundaries. The app does not yet
+use the reconciliation API for persistent synchronization. Neither crate
+implements identity or encryption. There is no Tauri configuration, Tauri
+dependency, native UI, platform adapter, or Android project in the repository.
 
 The browser UI currently uses browser facilities directly. For example,
 `apps/web/src/App.tsx` reads and writes `localStorage`, and the storage and
@@ -28,7 +31,7 @@ development host only.
 
 | Area | Observed state | Meaning |
 | --- | --- | --- |
-| Rust | `rust-toolchain.toml` pins 1.84.1. The local Rust compiler and Cargo report 1.84.1. | A host compiler exists. Its installed target list contains only `x86_64-unknown-linux-gnu`. Android and WebAssembly targets are not installed. |
+| Rust | `rust-toolchain.toml` pins 1.84.1. The local Rust compiler and Cargo report 1.84.1. | The installed target list contains `x86_64-unknown-linux-gnu` and `wasm32-unknown-unknown`. Android targets are not installed. |
 | Android SDK | `$HOME/Android/Sdk` exists with platforms 31, 34, and 35, build-tools versions 29.0.2, 31.0.0, 34.0.0, 35.0.0, and 35.0.1, plus command-line tools and platform-tools. | Some SDK components are present. This does not establish that a NearLink Android project builds. |
 | ADB | The SDK-local `platform-tools/adb` executable reports version 35.0.2. It is not on the shell `PATH`. An ADB device listing showed no connected devices. | Physical-device validation was not available in this check. |
 | Android emulators | The SDK emulator lists `Medium_Phone_API_35` and `Pixel_2_API_35`. | Emulator definitions exist. They have not been used to build or exercise NearLink. |
@@ -136,9 +139,10 @@ reliability from a native build, an emulator run, or a shared portable core.
 
 ## Current decision
 
-Native readiness is **not established**. The repository has a small Rust
-protocol validator and an existing browser prototype, but no native application
-or platform adapters. Android SDK pieces are present on this host, but the NDK,
+Native readiness is **not established**. The repository has a Rust protocol
+validator, bounded in-memory reconciliation primitive, tested WebAssembly
+binding, and an existing browser prototype, but no native application or
+platform adapters. Android SDK pieces are present on this host, but the NDK,
 Android Rust targets, environment configuration, and connected device are
 missing. Linux Tauri webview dependencies were not found by the checks above.
 Treat desktop and Android support as pending until the relevant readiness and

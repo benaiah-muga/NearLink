@@ -54,7 +54,7 @@ try {
     `<!doctype html>
 <meta charset="utf-8">
 <script type="module">
-  import init, { validate_json, WasmMessageIndex } from "./nearlink_protocol_wasm.js";
+  import init, { validate_json, WasmMessageIndex, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
 
   const check = (condition, label) => {
     if (!condition) throw new Error(label);
@@ -90,6 +90,45 @@ try {
     const second = result(index.page_json("[]", "a", 1));
     check(second.messages[0].id === "b" && !second.hasMore, "second page mismatch");
     check(result(index.insert_json(" ".repeat(18 * 1024 + 1))).code === "input_too_large", "input limit missing");
+
+    const inventory = new WasmSyncInventoryReceiver();
+    const inventoryPage = {
+      version: 1,
+      type: "sync_inventory_page",
+      room: "room1",
+      syncId: "sync-1",
+      sender: "device-a",
+      cursor: null,
+      messageIds: ["a", "b"],
+      nextCursor: "b",
+      hasMore: true,
+      limitReached: false,
+    };
+    check(result(inventory.accept_page_json(JSON.stringify(inventoryPage))).ids.join(",") === "a,b", "inventory state mismatch");
+    check(result(inventory.accept_page_json(JSON.stringify(inventoryPage))).outcome === "duplicate", "inventory replay mismatch");
+    const request = {
+      version: 1,
+      type: "sync_missing_request",
+      room: "room1",
+      syncId: "sync-1",
+      requestId: "request-1",
+      sender: "device-a",
+      targetSender: "device-b",
+      messageIds: ["a", "c"],
+    };
+    const requestBook = new WasmSyncRequestBook();
+    check(result(requestBook.register_request_json(JSON.stringify(request))).outcome === "accepted", "request state mismatch");
+    const completion = {
+      version: 1,
+      type: "sync_page_complete",
+      room: "room1",
+      syncId: "sync-1",
+      requestId: "request-1",
+      sender: "device-b",
+      targetSender: "device-a",
+      messageIds: ["c"],
+    };
+    check(result(requestBook.accept_completion_json(JSON.stringify(completion))).outcome === "accepted", "completion mismatch");
     window.__protocolWasmResult = { ok: true, vectorCount: vectors.length };
   } catch (error) {
     window.__protocolWasmResult = { ok: false, error: String(error) };

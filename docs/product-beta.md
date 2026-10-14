@@ -21,6 +21,14 @@ confidential, or otherwise sensitive communication.
   history in browser storage.
 - Local hub messaging over WebSocket. The hub can keep bounded SQLite room
   history and replay recent messages when clients reconnect.
+- Bounded message-ID reconciliation runs over the joined local hub relay or a
+  confirmed direct WebRTC session. It exchanges at most 4,096 accepted local
+  IDs per inventory and requests missing ordinary messages in batches of 100.
+  Large hub exchanges can take many minutes because message replies are paced
+  under the relay's message budget. Transfers are bounded to 4,096 IDs per
+  inventory. Rate-limit contention or unavailable messages can leave an
+  exchange partial, especially in large rooms with many peer inventories;
+  reconnecting restarts from messages saved on the device.
 - Direct browser peer messaging over a WebRTC data channel after manually
   exchanging signaling JSON and comparing the full session fingerprint through
   a separate trusted channel.
@@ -213,6 +221,10 @@ specific safe process and the data has been reviewed for sensitive values.
   relay. Connectivity is limited to network paths those candidates can reach.
 - Signaling data and network metadata should be treated as sensitive. Message
   acceptance indicators do not establish reading or availability.
+- Message reconciliation uses untrusted IDs and peer-provided inventories, so
+  it cannot prove message authorship or that a conversation is complete. It
+  stops on conflicting session data or storage failure and restarts from new
+  inventories after a reconnect.
 - NearLink has no validated emergency service level, guaranteed availability,
   background delivery guarantee, or independently audited cryptographic
   integration.

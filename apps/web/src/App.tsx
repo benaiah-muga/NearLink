@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
-import { MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket } from "@nearlink/protocol";
+import { MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPacket } from "@nearlink/protocol";
 import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, requestStoragePersistence, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
+import { SyncCoordinator, type SyncState } from "./lib/sync";
 import { buildDiagnosticsSummary, formatDiagnosticsSummary } from "./lib/diagnostics";
 import { initializeWasmProtocol, MAX_PROTOCOL_ENVELOPE_BYTES, validateJsonWithWasm, validateWithWasm } from "./lib/wasmProtocol";
 
@@ -82,6 +83,16 @@ function hasHubInboundFailure(failures: Set<string>, room: string): boolean {
   return [...failures].some((key) => key.startsWith(prefix));
 }
 
+function noteInvalidSyncPacket(value: unknown, coordinator: SyncCoordinator | null): void {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !coordinator) return;
+  const packet = value as Record<string, unknown>;
+  if (packet.type === "sync_inventory_page" || packet.type === "sync_missing_request" || packet.type === "sync_page_complete") {
+    coordinator.abort("A malformed synchronization control arrived. Reconnect to restart with fresh inventories.");
+  } else if (packet.type === "message" && typeof packet.room === "string" && typeof packet.id === "string") {
+    coordinator.rejectMessageId(packet.room, packet.id, "A requested message failed protocol checks. Reconnect to restart synchronization.");
+  }
+}
+
 function formatTime(timestamp: string): string {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return "time unknown";
@@ -135,6 +146,7 @@ function App() {
   const [historyPagingState, setHistoryPagingState] = useState<HistoryPagingState>("unavailable");
   const [historyPagingMessage, setHistoryPagingMessage] = useState("");
   const [historyTruncated, setHistoryTruncated] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<{ state: SyncState; detail: string }>({ state: "idle", detail: "" });
   const [sendTransport, setSendTransport] = useState<"hub" | "direct">("hub");
   const [diagnosticsCopyStatus, setDiagnosticsCopyStatus] = useState("");
   const [manualDiagnosticsText, setManualDiagnosticsText] = useState<string | null>(null);
@@ -144,6 +156,8 @@ function App() {
   const focusDeletionStatusRef = useRef(false);
   const socketRef = useRef<WebSocket | null>(null);
   const directRef = useRef<DirectWebRtcTransport | null>(null);
+  const hubSyncRef = useRef<SyncCoordinator | null>(null);
+  const directSyncRef = useRef<SyncCoordinator | null>(null);
   const messagesRef = useRef(messages);
   const callSignEditedRef = useRef(false);
   const messageKeysRef = useRef(new Set<string>());
@@ -163,6 +177,7 @@ function App() {
   const fingerprintConfirmedRef = useRef(fingerprintConfirmed);
   const directInFlightRef = useRef(new Set<string>());
   const directInboundOperationsRef = useRef(new Map<string, Promise<void>>());
+  const directInboundTailRef = useRef<Promise<void>>(Promise.resolve());
   const hubInboundOperationsRef = useRef(new Map<string, Promise<void>>());
   const hubInboundTailRef = useRef<Promise<void>>(Promise.resolve());
   const hubInboundFailuresRef = useRef(new Set<string>());
@@ -171,6 +186,7 @@ function App() {
   const historyLimitRef = useRef(MAX_HISTORY_PAGE_MESSAGES);
   const historyRestartedRef = useRef(false);
   const joinedHistoryHubUrlRef = useRef<string | null>(null);
+  const lastHubPeersRef = useRef<number | null>(null);
   const hubReplayOrderRef = useRef<{ socket: WebSocket; room: string; ids: string[] } | null>(null);
   const skipHistoryAutoScrollRef = useRef(false);
   const messageScrollRef = useRef<HTMLDivElement>(null);
@@ -249,7 +265,53 @@ function App() {
     setHistoryPagingMessage(message);
   }
 
+  function makeSyncCoordinator(transport: "hub" | "direct", connectionRoom: string, send: (packet: SyncPacket | MessagePacket) => void): SyncCoordinator {
+    return new SyncCoordinator({
+      room: connectionRoom,
+      sender: identity?.sender ?? "",
+      makeId,
+      send: (packet) => {
+        if (!validateWithWasm("client", packet)) throw new Error("The synchronization packet failed protocol checks.");
+        send(packet);
+      },
+      loadAccepted: () => loadMessages(connectionRoom),
+      validateMessage: (packet) => validateWithWasm("message", packet),
+      rebroadcastOnPeerInventory: true,
+      messageIntervalMs: transport === "hub" ? 700 : 0,
+      onState: (state, detail) => {
+        const active = transport === "hub"
+          ? currentRoomRef.current === connectionRoom && socketRef.current?.readyState === WebSocket.OPEN
+          : currentRoomRef.current === connectionRoom && directRef.current?.currentState === "connected" && fingerprintConfirmedRef.current;
+        if (active) setSyncStatus({ state, detail });
+      },
+    });
+  }
+
+  function startHubSync(socket: WebSocket, connectionRoom: string): void {
+    hubSyncRef.current?.stop();
+    const coordinator = makeSyncCoordinator("hub", connectionRoom, (packet) => {
+      if (socketRef.current !== socket || socket.readyState !== WebSocket.OPEN || currentRoomRef.current !== connectionRoom) throw new Error("The hub session ended.");
+      socket.send(JSON.stringify(packet));
+    });
+    hubSyncRef.current = coordinator;
+    setSyncStatus({ state: "syncing", detail: "Exchanging bounded local message inventories over the hub." });
+    void coordinator.start();
+  }
+
+  function startDirectSync(transport: DirectWebRtcTransport, connectionRoom: string): void {
+    directSyncRef.current?.stop();
+    const coordinator = makeSyncCoordinator("direct", connectionRoom, (packet) => {
+      if (directRef.current !== transport || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || currentRoomRef.current !== connectionRoom) throw new Error("The direct session ended.");
+      transport.send(JSON.stringify(packet));
+    });
+    directSyncRef.current = coordinator;
+    setSyncStatus({ state: "syncing", detail: "Exchanging bounded local message inventories over the confirmed direct session." });
+    void coordinator.start();
+  }
+
   function closeDirectTransport() {
+    directSyncRef.current?.stop();
+    directSyncRef.current = null;
     directRef.current?.close();
     directRef.current = null;
     directInFlightRef.current.clear();
@@ -273,6 +335,8 @@ function App() {
       setHistoryPagingMessage("The connection closed before this history page finished. Retry the same cursor after reconnecting.");
     }
     const socket = socketRef.current;
+    hubSyncRef.current?.stop();
+    hubSyncRef.current = null;
     socketRef.current = null;
     socket?.close();
     closeDirectTransport();
@@ -430,7 +494,10 @@ function App() {
   }, []);
 
   useEffect(() => {
+    hubSyncRef.current?.stop();
+    hubSyncRef.current = null;
     closeDirectTransport();
+    setSyncStatus({ state: "idle", detail: "" });
     setSignalInput("");
     setSendTransport("hub");
     if (!hasHubInboundFailure(hubInboundFailuresRef.current, room.trim())) {
@@ -447,6 +514,7 @@ function App() {
     historyLimitRef.current = MAX_HISTORY_PAGE_MESSAGES;
     historyRestartedRef.current = false;
     joinedHistoryHubUrlRef.current = null;
+    lastHubPeersRef.current = null;
     hubReplayOrderRef.current = null;
     setHistoryPagingState("unavailable");
     setHistoryPagingMessage("");
@@ -532,10 +600,13 @@ function App() {
       socket.onmessage = async (event) => {
         if (socketRef.current !== socket) return;
         const rawPacket = String(event.data);
-        if (!validateJsonWithWasm("server", rawPacket)) { setNotice("The hub sent an invalid or oversized packet. It was ignored."); return; }
         let packet: unknown;
         try { packet = JSON.parse(rawPacket); } catch { setNotice("The hub sent unreadable data. It was ignored."); return; }
-        if (!validateWithWasm("server", packet)) { setNotice("The hub sent an invalid packet. It was ignored."); return; }
+        if (!validateJsonWithWasm("server", rawPacket) || !validateWithWasm("server", packet)) {
+          noteInvalidSyncPacket(packet, hubSyncRef.current);
+          setNotice("The hub sent an invalid or oversized packet. It was ignored.");
+          return;
+        }
         if (packet.type === "joined") {
           if (packet.room !== room.trim()) { setNotice("The hub confirmed a different room. Check the room code."); return; }
           const joinedHubUrl = socket.url;
@@ -551,6 +622,7 @@ function App() {
             setHistoryTruncated(Boolean(packet.historyTruncated));
           }
           joinedHistoryHubUrlRef.current = joinedHubUrl;
+          lastHubPeersRef.current = packet.peers;
           hubReplayOrderRef.current = { socket, room: packet.room, ids: [] };
           setPeers(packet.peers);
           setLinkState("online");
@@ -570,14 +642,25 @@ function App() {
           }
           return;
         }
+        if (packet.type === "sync_inventory_page" || packet.type === "sync_missing_request" || packet.type === "sync_page_complete") {
+          const coordinator = hubSyncRef.current;
+          if (!coordinator) return;
+          const operation = hubInboundTailRef.current.catch(() => undefined).then(() => coordinator.receive(packet));
+          hubInboundTailRef.current = operation.then(() => undefined, () => undefined);
+          return;
+        }
         if (packet.type === "presence") {
           const replayOrder = hubReplayOrderRef.current;
           if (replayOrder?.socket === socket && replayOrder.room === room.trim()) {
             const barrier = hubInboundTailRef.current.catch(() => undefined).then(() => {
               if (hubReplayOrderRef.current === replayOrder) hubReplayOrderRef.current = null;
+              if (socketRef.current === socket && currentRoomRef.current === replayOrder.room) startHubSync(socket, replayOrder.room);
             });
             hubInboundTailRef.current = barrier.then(() => undefined, () => undefined);
+          } else if (lastHubPeersRef.current !== null && packet.peers > lastHubPeersRef.current) {
+            startHubSync(socket, room.trim());
           }
+          lastHubPeersRef.current = packet.peers;
           setPeers(packet.peers);
           return;
         }
@@ -595,8 +678,14 @@ function App() {
         if (packet.type === "error") {
           const connectionRoom = room.trim();
           const pendingHistory = historyRequestRef.current;
+          const historyRateLimited = packet.code === "history_rate_limited"
+            || (packet.code === "rate_limited" && packet.message.toLowerCase().includes("history"));
           if (pendingHistory?.socket === socket && pendingHistory.room === connectionRoom
-            && ["invalid_cursor", "history_packet_too_large", "history_page_too_large", "not_joined", "invalid_packet"].includes(packet.code)) {
+            && (historyRateLimited || ["invalid_cursor", "history_packet_too_large", "history_page_too_large", "not_joined", "invalid_packet"].includes(packet.code))) {
+            if (historyRateLimited) {
+              failHistoryRequest(pendingHistory, "The hub rate-limited this history request. Wait briefly, then retry the same page.");
+              return;
+            }
             if (packet.code === "invalid_cursor") {
               window.clearTimeout(pendingHistory.timeout);
               historyRequestRef.current = null;
@@ -635,6 +724,11 @@ function App() {
               : packet.code === "storage_unavailable" ? "The message can be retried when hub storage is available."
                 : packet.code === "message_conflict" ? "This message ID conflicts with saved content and was not accepted."
                   : "Review the room and message details.";
+          if (packet.code === "rate_limited" && packet.id) {
+            hubSyncRef.current?.noteMessageRateLimited("The hub rate-limited a sync message. This exchange is incomplete. Reconnect to restart from saved messages.");
+          } else if (packet.code === "sync_rate_limited" || (packet.code === "rate_limited" && !historyRateLimited)) {
+            hubSyncRef.current?.noteControlRateLimited("The hub rate-limited a synchronization control. This exchange is incomplete. Reconnect to restart from saved messages.");
+          }
           if (packet.id) {
             const rejected = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing");
             if (rejected) {
@@ -741,6 +835,7 @@ function App() {
             const persisted = await loadMessages(connectionRoom).catch(() => null);
             if (!persisted || socketRef.current !== socket || currentRoomRef.current !== connectionRoom) {
               if (!persisted && currentRoomRef.current === connectionRoom) {
+                hubSyncRef.current?.rejectMessage(packet, "A requested sync message could not be read from storage. Reconnect to restart synchronization.");
                 hubInboundFailuresRef.current.add(messageKey);
                 setNotice(HUB_REPLAY_FAILURE_NOTICE);
               }
@@ -749,6 +844,7 @@ function App() {
             const existing = persisted.find((entry) => entry.packet.id === packet.id);
             if (existing) {
               if (!sameMessagePacket(existing.packet, packet)) {
+                hubSyncRef.current?.rejectMessage(packet, "A requested sync message conflicted with saved content. Reconnect to restart synchronization.");
                 setNotice("The hub replay used an ID that conflicts with saved message content. The saved message was kept and the replay was ignored.");
                 return;
               }
@@ -757,6 +853,7 @@ function App() {
                   const saved = await saveMessage({ ...existing, transport: "hub", delivery: "sent" });
                   if (!saved) throw new Error("Room deletion blocked this replay.");
                 } catch {
+              hubSyncRef.current?.rejectMessage(packet, "A requested sync message could not be saved. Reconnect to restart synchronization.");
                   hubInboundFailuresRef.current.add(messageKey);
                   setNotice(HUB_REPLAY_FAILURE_NOTICE);
                   return;
@@ -771,6 +868,7 @@ function App() {
                 return;
               }
               hubInboundFailuresRef.current.delete(messageKey);
+              hubSyncRef.current?.observeAcceptedMessage(packet);
               messageKeysRef.current.add(messageKey);
               if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
               const refreshed = await loadMessages(connectionRoom);
@@ -786,6 +884,7 @@ function App() {
                 return;
               }
             } catch {
+              hubSyncRef.current?.rejectMessage(packet, "A requested sync message could not be saved. Reconnect to restart synchronization.");
               if (currentRoomRef.current === connectionRoom) {
                 hubInboundFailuresRef.current.add(messageKey);
                 setNotice(HUB_REPLAY_FAILURE_NOTICE);
@@ -804,6 +903,7 @@ function App() {
             }
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
             hubInboundFailuresRef.current.delete(messageKey);
+            hubSyncRef.current?.observeAcceptedMessage(packet);
             messageKeysRef.current.add(messageKey);
             if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
             const refreshed = await loadMessages(connectionRoom);
@@ -820,6 +920,11 @@ function App() {
       socket.onerror = () => setNotice("The radio link reported a socket error. Retrying automatically.");
       socket.onclose = () => {
         if (socketRef.current === socket) socketRef.current = null;
+        if (hubSyncRef.current) {
+          hubSyncRef.current.stop();
+          hubSyncRef.current = null;
+          setSyncStatus({ state: "partial", detail: "The connection ended. Reconnect to restart message synchronization from fresh inventories." });
+        }
         const pendingHistory = historyRequestRef.current;
         if (pendingHistory?.socket === socket) failHistoryRequest(pendingHistory, "The connection closed before this history page finished. Reconnect, then retry the same cursor.");
         if (cancelled || !shouldReconnectRef.current) return;
@@ -921,6 +1026,11 @@ function App() {
       if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
       setDirectState(state);
       if (state !== "connected") {
+        if (directSyncRef.current) {
+          directSyncRef.current.stop();
+          directSyncRef.current = null;
+          setSyncStatus({ state: "partial", detail: "The direct session ended. Reconnect and confirm the session fingerprint to restart synchronization." });
+        }
         fingerprintConfirmedRef.current = false;
         directInFlightRef.current.clear();
         setFingerprintConfirmed(false);
@@ -929,19 +1039,24 @@ function App() {
     transport.onError = (error) => {
       if (directRef.current === transport && currentRoomRef.current === connectionRoom) setNotice(error.message);
     };
-    transport.onMessage = (data) => { void processDirectData(transport, connectionRoom, data); };
+    directInboundTailRef.current = Promise.resolve();
+    transport.onMessage = (data) => {
+      const operation = directInboundTailRef.current.catch(() => undefined).then(() => processDirectData(transport, connectionRoom, data));
+      directInboundTailRef.current = operation.then(() => undefined, () => undefined);
+    };
     setDirectState("new");
     return transport;
   }
 
   async function processDirectData(transport: DirectWebRtcTransport, connectionRoom: string, data: unknown) {
     if (directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || typeof data !== "string") return;
+    let packet: unknown;
+    try { packet = JSON.parse(data); } catch { setNotice("The direct peer sent unreadable data. It was ignored."); return; }
     if (data.length > MAX_PROTOCOL_ENVELOPE_BYTES || (!validateJsonWithWasm("server", data) && !validateJsonWithWasm("message", data))) {
+      noteInvalidSyncPacket(packet, directSyncRef.current);
       setNotice("The direct peer sent an invalid or oversized packet. It was ignored.");
       return;
     }
-    let packet: unknown;
-    try { packet = JSON.parse(data); } catch { setNotice("The direct peer sent unreadable data. It was ignored."); return; }
     if (validateWithWasm("server", packet) && packet.type === "ack") {
       const key = `${connectionRoom}\u0000${packet.id}`;
       if (!directInFlightRef.current.has(key)) return;
@@ -959,6 +1074,15 @@ function App() {
       }
       return;
     }
+    if (validateWithWasm("server", packet)
+      && (packet.type === "sync_inventory_page" || packet.type === "sync_missing_request" || packet.type === "sync_page_complete")) {
+      await directSyncRef.current?.receive(packet);
+      return;
+    }
+    if (validateWithWasm("server", packet) && packet.type === "error" && packet.code === "rate_limited" && packet.id) {
+      directSyncRef.current?.noteMessageRateLimited("A peer rejected a sync message. This exchange is incomplete. Reconnect to restart from saved messages.");
+      return;
+    }
     if (!validateWithWasm("message", packet) || packet.room !== connectionRoom) return;
     const messageKey = `${packet.room}\u0000${packet.id}`;
     const previous = directInboundOperationsRef.current.get(messageKey) ?? Promise.resolve();
@@ -966,15 +1090,20 @@ function App() {
       if (directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
       const existing = await loadMessages(connectionRoom).catch(() => null);
       if (!existing || directRef.current !== transport || currentRoomRef.current !== connectionRoom) {
-        if (!existing && currentRoomRef.current === connectionRoom) setNotice("The direct message could not be checked against local storage, so it was not accepted.");
+        if (!existing && currentRoomRef.current === connectionRoom) {
+          directSyncRef.current?.rejectMessage(packet, "A requested sync message could not be checked in storage. Reconnect to restart synchronization.");
+          setNotice("The direct message could not be checked against local storage, so it was not accepted.");
+        }
         return;
       }
       const duplicate = existing.find((item) => item.packet.id === packet.id);
       if (duplicate) {
         if (!sameMessagePacket(duplicate.packet, packet)) {
+          directSyncRef.current?.rejectMessage(packet, "A requested sync message conflicted with saved content. Reconnect to restart synchronization.");
           if (currentRoomRef.current === connectionRoom) setNotice("A conflicting direct message used an already saved message ID. It was ignored.");
           return;
         }
+        directSyncRef.current?.observeAcceptedMessage(packet);
         messageKeysRef.current.add(messageKey);
         if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
           const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
@@ -991,10 +1120,12 @@ function App() {
           return;
         }
       } catch {
+        directSyncRef.current?.rejectMessage(packet, "A requested sync message could not be saved. Reconnect to restart synchronization.");
         if (currentRoomRef.current === connectionRoom) setNotice("The direct message arrived, but could not be saved. No acknowledgment was sent.");
         return;
       }
       if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
+      directSyncRef.current?.observeAcceptedMessage(packet);
       messageKeysRef.current.add(messageKey);
       setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id) ? current : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
       if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
@@ -1095,6 +1226,7 @@ function App() {
     }
     fingerprintConfirmedRef.current = true;
     setFingerprintConfirmed(true);
+    if (directRef.current?.currentState === "connected") startDirectSync(directRef.current, currentRoomRef.current);
     setNotice("Fingerprint matches this DTLS session. It does not verify a lasting identity or a real-world person.");
     flushQueuedDirectMessages();
   }
@@ -1427,6 +1559,8 @@ function App() {
           </div>
           <button type="button" className="clear-room-button" disabled={!room.trim() || !conversationReady || deletingRoom} onClick={(event) => { roomDeletionOpenerRef.current = event.currentTarget; setConfirmRoomDeletion(true); }}>Clear this device's saved conversation</button>
         </header>
+
+        {syncStatus.state !== "idle" && <p className={`sync-status sync-${syncStatus.state}`} role="status" aria-live="polite">Message sync: {syncStatus.detail}</p>}
 
         <details className="diagnostics-panel">
           <summary>Connection diagnostics</summary>

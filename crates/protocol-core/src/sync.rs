@@ -31,6 +31,13 @@ use std::ops::Bound::{Excluded, Unbounded};
 use serde_json::Value;
 
 use crate::{is_message_packet, is_protocol_identifier, is_protocol_room};
+use crate::{
+    is_sync_inventory_page_packet, is_sync_missing_request_packet, is_sync_page_complete_packet,
+    MAX_SYNC_INVENTORY_IDS,
+};
+
+/// Maximum request IDs retained by one ephemeral sync exchange.
+pub const MAX_SYNC_REQUESTS: usize = 64;
 
 /// Maximum number of unique message packets retained by one index.
 pub const MAX_INDEX_MESSAGES: usize = 4_096;
@@ -98,6 +105,22 @@ pub enum SyncError {
     InvalidIdentifier,
     /// Requested page size is zero or exceeds [`MAX_PAGE_MESSAGES`].
     InvalidPageLimit,
+    /// An inventory page failed structural validation.
+    InvalidInventoryPage,
+    /// Inventory pages changed exchange identity or broke cursor/order rules.
+    InvalidInventorySequence,
+    /// A repeated inventory cursor carried different contents.
+    InventoryConflict,
+    /// An inventory exceeded the 4,096 ID bound.
+    InventoryLimit,
+    /// A missing-message request failed structural validation.
+    InvalidSyncRequest,
+    /// The bounded set of outstanding sync requests is full.
+    SyncRequestLimit,
+    /// A request ID was reused with different contents.
+    SyncRequestConflict,
+    /// A completion did not match its request or contained unrequested IDs.
+    InvalidSyncCompletion,
 }
 
 impl fmt::Display for SyncError {
@@ -114,12 +137,282 @@ impl fmt::Display for SyncError {
             Self::KnownIdLimit => "peer ID list exceeds count limit",
             Self::InvalidIdentifier => "invalid message identifier",
             Self::InvalidPageLimit => "page size is outside the allowed range",
+            Self::InvalidInventoryPage => "invalid synchronization inventory page",
+            Self::InvalidInventorySequence => "synchronization inventory sequence is invalid",
+            Self::InventoryConflict => "synchronization inventory cursor conflicts",
+            Self::InventoryLimit => "synchronization inventory exceeds count limit",
+            Self::InvalidSyncRequest => "invalid synchronization request",
+            Self::SyncRequestLimit => "outstanding synchronization requests exceed count limit",
+            Self::SyncRequestConflict => "synchronization request ID conflicts",
+            Self::InvalidSyncCompletion => "synchronization completion does not match its request",
         };
         formatter.write_str(message)
     }
 }
 
 impl std::error::Error for SyncError {}
+
+/// Result of accepting a synchronization inventory page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryPageOutcome {
+    /// A new page was added to the inventory.
+    Accepted,
+    /// An exact retransmission of an already accepted page was ignored.
+    Duplicate,
+}
+
+/// Bounded receiver for one lexicographically paged message-ID inventory.
+///
+/// Construct a fresh receiver for each `(room, sender, syncId)` exchange.
+/// Pages are accepted only in cursor order. The receiver retains at most 4,096
+/// IDs and 4,096 page envelopes, and exact retransmissions are idempotent.
+#[derive(Debug, Clone)]
+pub struct SyncInventoryReceiver {
+    room: Option<String>,
+    sync_id: Option<String>,
+    sender: Option<String>,
+    expected_cursor: Option<String>,
+    ids: Vec<String>,
+    pages: BTreeMap<Option<String>, Value>,
+    complete: bool,
+    limit_reached: bool,
+}
+
+impl Default for SyncInventoryReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyncInventoryReceiver {
+    pub fn new() -> Self {
+        Self {
+            room: None,
+            sync_id: None,
+            sender: None,
+            expected_cursor: None,
+            ids: Vec::new(),
+            pages: BTreeMap::new(),
+            complete: false,
+            limit_reached: false,
+        }
+    }
+
+    /// Accept one validated inventory page or an exact duplicate.
+    pub fn accept_page(&mut self, page: Value) -> Result<InventoryPageOutcome, SyncError> {
+        if !is_sync_inventory_page_packet(&page) {
+            return Err(SyncError::InvalidInventoryPage);
+        }
+        let room = page["room"].as_str().expect("validated room");
+        let sync_id = page["syncId"].as_str().expect("validated sync ID");
+        let sender = page["sender"].as_str().expect("validated sender");
+        let cursor = page["cursor"].as_str().map(str::to_owned);
+
+        if let Some(previous) = self.pages.get(&cursor) {
+            return if previous == &page {
+                Ok(InventoryPageOutcome::Duplicate)
+            } else {
+                Err(SyncError::InventoryConflict)
+            };
+        }
+        if self.complete {
+            return Err(SyncError::InvalidInventorySequence);
+        }
+        if self.room.as_deref().is_some_and(|value| value != room)
+            || self
+                .sync_id
+                .as_deref()
+                .is_some_and(|value| value != sync_id)
+            || self.sender.as_deref().is_some_and(|value| value != sender)
+            || cursor != self.expected_cursor
+        {
+            return Err(SyncError::InvalidInventorySequence);
+        }
+
+        let page_ids = page["messageIds"]
+            .as_array()
+            .expect("validated message IDs");
+        let page_len = page_ids.len();
+        let has_more = page["hasMore"].as_bool().expect("validated flag");
+        let new_inventory_len = self.ids.len().saturating_add(page_len);
+        if new_inventory_len > MAX_SYNC_INVENTORY_IDS
+            || (new_inventory_len == MAX_SYNC_INVENTORY_IDS && has_more)
+        {
+            return Err(SyncError::InventoryLimit);
+        }
+        let last_existing = self.ids.last().map(String::as_str);
+        if page_ids.iter().any(|value| {
+            let id = value.as_str().expect("validated ID");
+            last_existing.is_some_and(|last| id <= last)
+        }) {
+            return Err(SyncError::InvalidInventorySequence);
+        }
+
+        if self.room.is_none() {
+            self.room = Some(room.to_owned());
+            self.sync_id = Some(sync_id.to_owned());
+            self.sender = Some(sender.to_owned());
+        }
+        self.ids.extend(
+            page_ids
+                .iter()
+                .map(|value| value.as_str().expect("validated ID").to_owned()),
+        );
+        self.limit_reached = page["limitReached"].as_bool().expect("validated flag");
+        self.expected_cursor = if has_more {
+            page["nextCursor"].as_str().map(str::to_owned)
+        } else {
+            None
+        };
+        self.complete = !has_more;
+        self.pages.insert(cursor, page);
+        Ok(InventoryPageOutcome::Accepted)
+    }
+
+    pub fn ids(&self) -> &[String] {
+        &self.ids
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn limit_reached(&self) -> bool {
+        self.complete && self.limit_reached
+    }
+}
+
+/// Result of recording a missing-message request or completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncRequestOutcome {
+    Accepted,
+    Duplicate,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedRequest {
+    packet: Value,
+    completion: Option<Value>,
+}
+
+/// Bounded validator for requests and their completion packets in one exchange.
+///
+/// Each request contains at most 100 sorted IDs. Up to 64 request packets and
+/// their completion packets are retained, preventing unbounded replay state.
+#[derive(Debug, Clone, Default)]
+pub struct SyncRequestBook {
+    requests: BTreeMap<String, TrackedRequest>,
+    session: Option<(String, String, String, String)>,
+}
+
+impl SyncRequestBook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_request(&mut self, packet: Value) -> Result<SyncRequestOutcome, SyncError> {
+        if !is_sync_missing_request_packet(&packet) {
+            return Err(SyncError::InvalidSyncRequest);
+        }
+        let request_id = packet["requestId"].as_str().expect("validated request ID");
+        let identity = (
+            packet["room"].as_str().expect("validated room").to_owned(),
+            packet["syncId"]
+                .as_str()
+                .expect("validated sync ID")
+                .to_owned(),
+            packet["sender"]
+                .as_str()
+                .expect("validated sender")
+                .to_owned(),
+            packet["targetSender"]
+                .as_str()
+                .expect("validated target sender")
+                .to_owned(),
+        );
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session != &identity)
+        {
+            return Err(SyncError::InvalidSyncRequest);
+        }
+        if let Some(existing) = self.requests.get(request_id) {
+            return if existing.packet == packet {
+                Ok(SyncRequestOutcome::Duplicate)
+            } else {
+                Err(SyncError::SyncRequestConflict)
+            };
+        }
+        if self.requests.len() >= MAX_SYNC_REQUESTS {
+            return Err(SyncError::SyncRequestLimit);
+        }
+        self.requests.insert(
+            request_id.to_owned(),
+            TrackedRequest {
+                packet,
+                completion: None,
+            },
+        );
+        self.session.get_or_insert(identity);
+        Ok(SyncRequestOutcome::Accepted)
+    }
+
+    pub fn accept_completion(&mut self, packet: Value) -> Result<SyncRequestOutcome, SyncError> {
+        if !is_sync_page_complete_packet(&packet) {
+            return Err(SyncError::InvalidSyncCompletion);
+        }
+        let request_id = packet["requestId"].as_str().expect("validated request ID");
+        let tracked = self
+            .requests
+            .get_mut(request_id)
+            .ok_or(SyncError::InvalidSyncCompletion)?;
+        if let Some(previous) = &tracked.completion {
+            return if previous == &packet {
+                Ok(SyncRequestOutcome::Duplicate)
+            } else {
+                Err(SyncError::SyncRequestConflict)
+            };
+        }
+        let request = &tracked.packet;
+        if packet["room"] != request["room"]
+            || packet["syncId"] != request["syncId"]
+            || packet["sender"] != request["targetSender"]
+            || packet["targetSender"] != request["sender"]
+        {
+            return Err(SyncError::InvalidSyncCompletion);
+        }
+        let requested = request["messageIds"]
+            .as_array()
+            .expect("validated request IDs");
+        let mut request_offset = 0usize;
+        for completed_id in packet["messageIds"]
+            .as_array()
+            .expect("validated completion IDs")
+        {
+            let completed_id = completed_id.as_str().expect("validated ID");
+            while request_offset < requested.len()
+                && requested[request_offset].as_str() != Some(completed_id)
+            {
+                request_offset += 1;
+            }
+            if request_offset == requested.len() {
+                return Err(SyncError::InvalidSyncCompletion);
+            }
+            request_offset += 1;
+        }
+        tracked.completion = Some(packet);
+        Ok(SyncRequestOutcome::Accepted)
+    }
+
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+}
 
 struct CappedCounter {
     bytes: usize,
@@ -347,6 +640,221 @@ impl MessageIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inventory_page(
+        sync_id: &str,
+        cursor: Option<&str>,
+        ids: &[&str],
+        has_more: bool,
+        limit_reached: bool,
+    ) -> Value {
+        serde_json::json!({
+            "version": 1,
+            "type": "sync_inventory_page",
+            "room": "room1",
+            "syncId": sync_id,
+            "sender": "device-a",
+            "cursor": cursor,
+            "messageIds": ids,
+            "nextCursor": ids.last().copied(),
+            "hasMore": has_more,
+            "limitReached": limit_reached,
+        })
+    }
+
+    fn sync_request(request_id: &str, ids: &[&str]) -> Value {
+        serde_json::json!({
+            "version": 1,
+            "type": "sync_missing_request",
+            "room": "room1",
+            "syncId": "sync-1",
+            "requestId": request_id,
+            "sender": "device-a",
+            "targetSender": "device-b",
+            "messageIds": ids,
+        })
+    }
+
+    fn sync_completion(request_id: &str, ids: &[&str]) -> Value {
+        serde_json::json!({
+            "version": 1,
+            "type": "sync_page_complete",
+            "room": "room1",
+            "syncId": "sync-1",
+            "requestId": request_id,
+            "sender": "device-b",
+            "targetSender": "device-a",
+            "messageIds": ids,
+        })
+    }
+
+    #[test]
+    fn inventory_receiver_enforces_cursor_identity_order_and_idempotency() {
+        let first = inventory_page("sync-1", None, &["a", "b"], true, false);
+        let second = inventory_page("sync-1", Some("b"), &["c"], false, true);
+        let mut receiver = SyncInventoryReceiver::new();
+
+        assert_eq!(
+            receiver.accept_page(first.clone()),
+            Ok(InventoryPageOutcome::Accepted)
+        );
+        assert_eq!(
+            receiver.accept_page(first.clone()),
+            Ok(InventoryPageOutcome::Duplicate)
+        );
+        assert_eq!(receiver.ids(), &["a", "b"]);
+        assert!(!receiver.is_complete());
+        assert_eq!(
+            receiver.accept_page(inventory_page("other", Some("b"), &["c"], false, false)),
+            Err(SyncError::InvalidInventorySequence)
+        );
+        assert_eq!(
+            receiver.accept_page(inventory_page("sync-1", Some("a"), &["c"], false, false)),
+            Err(SyncError::InvalidInventorySequence)
+        );
+        assert_eq!(
+            receiver.accept_page(second.clone()),
+            Ok(InventoryPageOutcome::Accepted)
+        );
+        assert_eq!(
+            receiver.accept_page(second),
+            Ok(InventoryPageOutcome::Duplicate)
+        );
+        assert!(receiver.is_complete());
+        assert!(receiver.limit_reached());
+        assert_eq!(receiver.ids(), &["a", "b", "c"]);
+        assert_eq!(
+            receiver.accept_page(inventory_page("sync-1", Some("c"), &["d"], false, false)),
+            Err(SyncError::InvalidInventorySequence)
+        );
+    }
+
+    #[test]
+    fn inventory_receiver_rejects_changed_page_for_same_cursor_and_count_overflow() {
+        let first = inventory_page("sync-1", None, &["a"], true, false);
+        let mut receiver = SyncInventoryReceiver::new();
+        receiver.accept_page(first).unwrap();
+        assert_eq!(
+            receiver.accept_page(inventory_page("sync-1", None, &["a"], false, false)),
+            Err(SyncError::InventoryConflict)
+        );
+
+        let mut receiver = SyncInventoryReceiver::new();
+        for page_index in 0..40 {
+            let start = page_index * 100;
+            let end = (start + 100).min(MAX_SYNC_INVENTORY_IDS);
+            let ids = (start..end)
+                .map(|index| format!("id-{index:04}"))
+                .collect::<Vec<_>>();
+            let cursor = if start == 0 {
+                None
+            } else {
+                Some(format!("id-{:04}", start - 1))
+            };
+            let value = serde_json::json!({
+                "version": 1,
+                "type": "sync_inventory_page",
+                "room": "room1",
+                "syncId": "sync-max",
+                "sender": "device-a",
+                "cursor": cursor,
+                "messageIds": ids,
+                "nextCursor": format!("id-{:04}", end - 1),
+                "hasMore": true,
+                "limitReached": false,
+            });
+            receiver.accept_page(value).unwrap();
+        }
+        assert_eq!(receiver.ids().len(), 4_000);
+        assert!(!receiver.is_complete());
+        let overflowing_ids = (4_000..4_100)
+            .map(|index| format!("id-{index:04}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receiver.accept_page(serde_json::json!({
+                "version": 1,
+                "type": "sync_inventory_page",
+                "room": "room1",
+                "syncId": "sync-max",
+                "sender": "device-a",
+                "cursor": "id-3999",
+                "messageIds": overflowing_ids,
+                "nextCursor": "id-4099",
+                "hasMore": false,
+                "limitReached": true,
+            })),
+            Err(SyncError::InventoryLimit)
+        );
+        assert_eq!(receiver.ids().len(), 4_000);
+    }
+
+    #[test]
+    fn request_book_bounds_and_matches_completion_to_requested_subset() {
+        let mut book = SyncRequestBook::new();
+        let request = sync_request("request-1", &["a", "c", "e"]);
+        assert_eq!(
+            book.register_request(request.clone()),
+            Ok(SyncRequestOutcome::Accepted)
+        );
+        assert_eq!(
+            book.register_request(request),
+            Ok(SyncRequestOutcome::Duplicate)
+        );
+        assert_eq!(
+            book.register_request(sync_request("request-1", &["a", "b"])),
+            Err(SyncError::SyncRequestConflict)
+        );
+        assert_eq!(
+            book.register_request(sync_request("request-2", &["a", "c"])),
+            Ok(SyncRequestOutcome::Accepted)
+        );
+        assert_eq!(
+            book.register_request({
+                let mut other = sync_request("request-3", &["a"]);
+                other["syncId"] = Value::String("different-sync".to_owned());
+                other
+            }),
+            Err(SyncError::InvalidSyncRequest)
+        );
+
+        let completion = sync_completion("request-1", &["a", "e"]);
+        assert_eq!(
+            book.accept_completion(completion.clone()),
+            Ok(SyncRequestOutcome::Accepted)
+        );
+        assert_eq!(
+            book.accept_completion(completion),
+            Ok(SyncRequestOutcome::Duplicate)
+        );
+        assert_eq!(
+            book.accept_completion(sync_completion("request-1", &["b"])),
+            Err(SyncError::SyncRequestConflict)
+        );
+        assert_eq!(
+            book.accept_completion(sync_completion("request-2", &["b"])),
+            Err(SyncError::InvalidSyncCompletion)
+        );
+        assert_eq!(
+            book.accept_completion(sync_completion("unknown", &["a"])),
+            Err(SyncError::InvalidSyncCompletion)
+        );
+    }
+
+    #[test]
+    fn request_book_has_a_hard_outstanding_request_bound() {
+        let mut book = SyncRequestBook::new();
+        for index in 0..MAX_SYNC_REQUESTS {
+            assert_eq!(
+                book.register_request(sync_request(&format!("request-{index}"), &["a"])),
+                Ok(SyncRequestOutcome::Accepted)
+            );
+        }
+        assert_eq!(book.len(), MAX_SYNC_REQUESTS);
+        assert_eq!(
+            book.register_request(sync_request("one-too-many", &["a"])),
+            Err(SyncError::SyncRequestLimit)
+        );
+    }
 
     fn packet(id: &str, body: &str, created_at: &str) -> Value {
         serde_json::json!({

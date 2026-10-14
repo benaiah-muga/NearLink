@@ -10,6 +10,9 @@ import {
   isProtocolRoom,
   isProtocolTimestamp,
   isServerPacket,
+  isSyncInventoryPagePacket,
+  isSyncMissingRequestPacket,
+  isSyncPageCompletePacket,
   PROTOCOL_VERSION,
   MAX_HISTORY_PAGE_MESSAGES,
   MAX_PROTOCOL_ENVELOPE_BYTES,
@@ -48,6 +51,9 @@ describe("NearLink protocol v1 validation", () => {
       join: isJoinPacket,
       message: isMessagePacket,
       server: isServerPacket,
+      sync_inventory_page: isSyncInventoryPagePacket,
+      sync_missing_request: isSyncMissingRequestPacket,
+      sync_page_complete: isSyncPageCompletePacket,
       history_page_complete: isHistoryPageCompletePacket,
       timestamp: isProtocolTimestamp,
       identifier: isProtocolIdentifier,
@@ -78,6 +84,8 @@ describe("NearLink protocol v1 validation", () => {
       { version: 1, type: "error", code: "invalid_packet", message: "Packet rejected.", id: "message:one.1" },
       { version: 1, type: "error", code: "message_conflict", message: "Message ID conflict.", id: "message:one.1" },
       { version: 1, type: "error", code: "storage_unavailable", message: "Storage unavailable.", id: "message:one.1" },
+      { version: 1, type: "error", code: "history_rate_limited", message: "History rate limit." },
+      { version: 1, type: "error", code: "sync_rate_limited", message: "Sync rate limit." },
     ];
 
     for (const packet of serverPackets) expect(isServerPacket(packet)).toBe(true);
@@ -221,5 +229,41 @@ describe("NearLink protocol v1 validation", () => {
     expect(isServerPacket({ version: 1, type: "ack", id: "bad id" })).toBe(false);
     expect(isServerPacket({ version: 1, type: "error", code: "unknown", message: "no" })).toBe(false);
     expect(isServerPacket({ version: 1, type: "error", code: "invalid_packet", message: 1 })).toBe(false);
+  });
+
+  it("bounds sync packet ID counts and rejects unstable packet identity fields", () => {
+    const inventory = {
+      version: 1,
+      type: "sync_inventory_page",
+      room: "room1",
+      syncId: "sync-1",
+      sender: "device-a",
+      cursor: null,
+      messageIds: ["a", "b"],
+      nextCursor: "b",
+      hasMore: true,
+      limitReached: false,
+    };
+    expect(isSyncInventoryPagePacket(inventory)).toBe(true);
+    expect(isSyncInventoryPagePacket({ ...inventory, messageIds: Array.from({ length: 101 }, (_, i) => `id-${String(i).padStart(3, "0")}`), nextCursor: "id-100" })).toBe(false);
+    expect(isSyncInventoryPagePacket({ ...inventory, syncId: "bad id" })).toBe(false);
+
+    const request = {
+      version: 1,
+      type: "sync_missing_request",
+      room: "room1",
+      syncId: "sync-1",
+      requestId: "request-1",
+      sender: "device-a",
+      targetSender: "device-b",
+      messageIds: ["a", "b"],
+    };
+    expect(isSyncMissingRequestPacket(request)).toBe(true);
+    expect(isSyncMissingRequestPacket({ ...request, messageIds: [] })).toBe(false);
+    expect(isSyncMissingRequestPacket({ ...request, messageIds: Array.from({ length: 101 }, (_, i) => `id-${String(i).padStart(3, "0")}`) })).toBe(false);
+
+    const complete = { ...request, type: "sync_page_complete", sender: "device-b", targetSender: "device-a", messageIds: ["a"] };
+    expect(isSyncPageCompletePacket(complete)).toBe(true);
+    expect(isServerPacket(complete)).toBe(true);
   });
 });

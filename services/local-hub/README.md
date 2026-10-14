@@ -11,6 +11,18 @@ grade reliability. Anyone with access to the database files can read message
 contents. Protect the data directory and remove its database, WAL, and SHM files
 when deleting local history.
 
+The hub relays the three sync-v1 control packet types
+(`sync_inventory_page`, `sync_missing_request`, and `sync_page_complete`) to
+other active sockets in the same joined room. It requires each packet's room
+and sender to match the connection's join, validates the packet shape, and
+limits controls to 2,700 per minute per `(room, sender)` pair, about 45 per
+second. Rate history survives socket disconnects until its 60-second window expires, with a fixed
+maximum of 256 tracked pairs. Controls are ephemeral: they are not
+acknowledged, stored, or replayed as chat history.
+When the control limit is reached, the hub returns `sync_rate_limited`.
+Room and sender values are routing claims only. The hub does not authenticate
+participants or the inventories they send, and hub relays remain plaintext.
+
 ## Run locally
 
 From this directory, create and activate a Python virtual environment, then
@@ -52,7 +64,8 @@ packets, `pageBytes` counts their compact UTF-8 JSON envelopes, `nextCursor` is
 the oldest page message ID when `hasMore` is true, and `historyTruncated` reports
 retention or storage loss independently of `hasMore`. Each message packet is
 limited to 18 KiB, and a page is limited to 100 packets and 512 KiB total.
-History requests are limited to 30 per connection per minute.
+History requests are limited to 30 per connection per minute. A rejected
+request returns `history_rate_limited`.
 
 `requestId` is a correlation value, not a server-side pagination session. A
 retry with a null cursor starts from the newest retained edge again and may
@@ -75,9 +88,10 @@ acknowledging the message.
 
 The hub caps incoming WebSocket frames at 32 KiB and message bodies at 16 KiB.
 It limits each room to 32 active clients, the process to 64 rooms or 256 clients,
-and each connection to 120 messages per minute. Sends to a slow client time out
-after two seconds. Local history expires after 30 days, with at most 200
-messages per room, 2,000 messages and 32 MiB of message data globally, a
+and each connection to 120 messages per minute. Message throttling returns
+`rate_limited`. Sends to a slow client time out after two seconds. Local
+history expires after 30 days, with at most 200 messages per room, 2,000
+messages and 32 MiB of message data globally, a
 64 MiB SQLite database, and 100 replayed messages per join. Old history is
 deleted to honor those limits, and `historyTruncated` signals that a room's
 history has a gap. Room codes use letters, digits, `_`, and `-`, with a maximum

@@ -362,6 +362,158 @@ describe("browser storage retention feedback", () => {
 });
 
 describe("browser app messaging flow", () => {
+  it("exchanges a hub inventory and serves a missing-message batch from accepted local storage", async () => {
+    const accepted: StoredMessage = {
+      packet: { version: 1, type: "message", id: "saved-sync-message", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Saved sync body" },
+      direction: "outgoing",
+      delivery: "sent",
+      transport: "hub",
+    };
+    await saveMessage(accepted);
+    render(<App />);
+    const socket = await connectTestHub();
+    await waitFor(() => expect(socket.sent.some((value) => JSON.parse(value).type === "sync_inventory_page")).toBe(true));
+    const inventory = JSON.parse(socket.sent.find((value) => JSON.parse(value).type === "sync_inventory_page")!);
+    expect(inventory).toMatchObject({ sender: IDENTITY.sender, room: ROOM, messageIds: [accepted.packet.id], hasMore: false });
+
+    act(() => socket.receive({
+      version: 1,
+      type: "sync_missing_request",
+      room: ROOM,
+      syncId: inventory.syncId,
+      requestId: "remote-request",
+      sender: "station-b",
+      targetSender: IDENTITY.sender,
+      messageIds: [accepted.packet.id],
+    }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_page_complete" && value.requestId === "remote-request")).toBe(true));
+    expect(socket.sent.map((value) => JSON.parse(value))).toContainEqual(accepted.packet);
+  });
+
+  it("re-advertises once when a hub peer inventory arrives after local join readiness", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    const inventory = { version: 1, type: "sync_inventory_page", room: ROOM, syncId: "existing-session", sender: "station-b", cursor: null, messageIds: ["older-message"], nextCursor: "older-message", hasMore: false, limitReached: false };
+    act(() => socket.receive(inventory));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).filter((value) => value.type === "sync_inventory_page")).toHaveLength(2));
+    act(() => socket.receive(inventory));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(socket.sent.map((value) => JSON.parse(value)).filter((value) => value.type === "sync_inventory_page")).toHaveLength(2);
+  });
+
+  it("shows partial and stops waiting when the hub rate-limits a sync control without an ID", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    await waitFor(() => expect(socket.sent.some((value) => JSON.parse(value).type === "sync_inventory_page")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "sync_inventory_page", room: ROOM, syncId: "peer-session", sender: "station-b", cursor: null, messageIds: ["older-message"], nextCursor: "older-message", hasMore: false, limitReached: false }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_missing_request")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "error", code: "rate_limited", message: "Please wait before sending more synchronization controls." }));
+    await screen.findByText(/Message sync: The hub rate-limited a synchronization control/i);
+    act(() => socket.receive({ version: 1, type: "sync_page_complete", room: ROOM, syncId: "peer-session", requestId: JSON.parse(socket.sent.find((value) => JSON.parse(value).type === "sync_missing_request")!).requestId, sender: "station-b", targetSender: IDENTITY.sender, messageIds: [] }));
+    await screen.findByText(/Message sync: The hub rate-limited a synchronization control/i);
+  });
+
+  it("keeps a rate-limited history request retryable when the hub error has no ID", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    const boundary = hubMessage("history-rate-boundary", "2026-10-14T08:00:00.000Z");
+    act(() => socket.receive(boundary));
+    await screen.findByText(boundary.body);
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "history_request")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "error", code: "rate_limited", message: "Please wait before requesting more history." }));
+    await screen.findByText(/The hub rate-limited this history request/i);
+    expect(screen.getByRole("button", { name: "Retry loading older messages" })).toBeTruthy();
+  });
+
+  it("routes sync rate rejection to sync while a history page is pending", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    const boundary = hubMessage("overlap-sync-rate-boundary", "2026-10-14T08:00:00.000Z");
+    act(() => socket.receive(boundary));
+    await screen.findByText(boundary.body);
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "history_request")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "sync_inventory_page", room: ROOM, syncId: "sync-overlap-a", sender: "station-c", cursor: null, messageIds: ["older-sync-message"], nextCursor: "older-sync-message", hasMore: false, limitReached: false }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_missing_request")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "error", code: "sync_rate_limited", message: "Sync controls are rate-limited." }));
+    await screen.findByText(/Message sync: The hub rate-limited a synchronization control/i);
+    expect(screen.getByText("Loading older messages…")).toBeTruthy();
+    const historyRequest = socket.sent.map((value) => JSON.parse(value)).filter((value) => value.type === "history_request").at(-1)!;
+    act(() => socket.receive({ version: 1, type: "history_page_complete", requestId: historyRequest.requestId, room: ROOM, messageIds: [], pageBytes: 0, nextCursor: null, hasMore: false, historyTruncated: false }));
+    await screen.findByText("No more retained hub history is available.");
+  });
+
+  it("routes history rate rejection to history while a sync request is pending", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    const boundary = hubMessage("overlap-history-rate-boundary", "2026-10-14T08:00:00.000Z");
+    act(() => socket.receive(boundary));
+    await screen.findByText(boundary.body);
+    fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "history_request")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "sync_inventory_page", room: ROOM, syncId: "sync-overlap-b", sender: "station-c", cursor: null, messageIds: ["older-sync-message"], nextCursor: "older-sync-message", hasMore: false, limitReached: false }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_missing_request")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "error", code: "history_rate_limited", message: "History requests are rate-limited." }));
+    await screen.findByText(/The hub rate-limited this history request/i);
+    expect(screen.getByText(/Message sync: Exchanging bounded local message inventories/)).toBeTruthy();
+    const request = socket.sent.map((value) => JSON.parse(value)).find((value) => value.type === "sync_missing_request")!;
+    act(() => socket.receive({ version: 1, type: "sync_page_complete", room: ROOM, syncId: request.syncId, requestId: request.requestId, sender: "station-c", targetSender: IDENTITY.sender, messageIds: [] }));
+    await screen.findByText(/Message sync: Requested pages were verified, but an inventory or page was incomplete/);
+  });
+
+  it("does not treat a legacy history rate error as sync rejection when no history request is pending", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+    act(() => socket.receive({ version: 1, type: "sync_inventory_page", room: ROOM, syncId: "legacy-rate-session", sender: "station-c", cursor: null, messageIds: ["older-sync-message"], nextCursor: "older-sync-message", hasMore: false, limitReached: false }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_missing_request")).toBe(true));
+    act(() => socket.receive({ version: 1, type: "error", code: "rate_limited", message: "Please wait before requesting more history." }));
+    expect(screen.getByText(/Message sync: Exchanging bounded local message inventories/)).toBeTruthy();
+    const request = socket.sent.map((value) => JSON.parse(value)).find((value) => value.type === "sync_missing_request")!;
+    act(() => socket.receive({ version: 1, type: "sync_page_complete", room: ROOM, syncId: request.syncId, requestId: request.requestId, sender: "station-c", targetSender: IDENTITY.sender, messageIds: [] }));
+    await screen.findByText(/Message sync: Requested pages were verified, but an inventory or page was incomplete/);
+  });
+
+  it("does not finish an active sync response after room deletion starts", async () => {
+    const accepted: StoredMessage = {
+      packet: { version: 1, type: "message", id: "delete-during-sync", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Saved before deletion" },
+      direction: "outgoing",
+      delivery: "sent",
+      transport: "hub",
+    };
+    await saveMessage(accepted);
+    render(<App />);
+    const socket = await connectTestHub();
+    await waitFor(() => expect(socket.sent.some((value) => JSON.parse(value).type === "sync_inventory_page")).toBe(true));
+    const inventory = JSON.parse(socket.sent.find((value) => JSON.parse(value).type === "sync_inventory_page")!);
+    messageReadGate.room = ROOM;
+    messageReadGate.pending = new Promise((resolve) => { messageReadGate.releaseRead = () => resolve([accepted]); });
+    const readCount = messageReadGate.requestedRooms.length;
+    act(() => socket.receive({
+      version: 1,
+      type: "sync_missing_request",
+      room: ROOM,
+      syncId: inventory.syncId,
+      requestId: "delete-request",
+      sender: "station-b",
+      targetSender: IDENTITY.sender,
+      messageIds: [accepted.packet.id],
+    }));
+    await waitFor(() => expect(messageReadGate.requestedRooms.length).toBeGreaterThan(readCount));
+    fireEvent.click(screen.getByRole("button", { name: "Clear this device's saved conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete local messages" }));
+    await screen.findByText(/were deleted from this device/i);
+    messageReadGate.releaseRead?.();
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    messageReadGate.pending = null;
+    messageReadGate.room = null;
+    const sent = socket.sent.map((value) => JSON.parse(value));
+    expect(sent.some((value) => value.type === "message" && value.id === accepted.packet.id)).toBe(false);
+    expect(sent.some((value) => value.type === "sync_page_complete" && value.requestId === "delete-request")).toBe(false);
+    expect(await loadMessages(ROOM)).toEqual([]);
+    expect(await isRoomMessagesDeleted(ROOM)).toBe(true);
+  });
+
   it("preserves a call sign typed before the saved identity finishes loading", async () => {
     let finishIdentity!: (identity: LocalIdentity | null) => void;
     messageReadGate.identityPending = new Promise((resolve) => { finishIdentity = resolve; });

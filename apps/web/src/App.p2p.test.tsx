@@ -2,6 +2,15 @@
 import "fake-indexeddb/auto";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { StoredMessage } from "./lib/storage";
+
+interface MockPeerTransport {
+  currentState: string;
+  peerFingerprint: string | null;
+  sent: string[];
+  emit(data: unknown): void;
+  setState(state: string): void;
+}
 
 const peerMock = vi.hoisted(() => ({ instances: [] as Array<any> }));
 const storageGate = vi.hoisted(() => ({ packetId: null as string | null, body: null as string | null, reject: false, finish: null as null | (() => void) }));
@@ -89,7 +98,7 @@ vi.mock("./lib/webrtc", () => {
 });
 
 import App from "./App";
-import { isRoomMessagesDeleted, loadIdentity, loadMessages, saveIdentity } from "./lib/storage";
+import { isRoomMessagesDeleted, loadIdentity, loadMessages, saveIdentity, saveMessage } from "./lib/storage";
 
 const ROOM = "campus-radio";
 const IDENTITY = { sender: "station-a", senderName: "Ari" };
@@ -155,6 +164,40 @@ afterEach(async () => {
 });
 
 describe("direct peer app flow", () => {
+  it("serves bounded synchronization requests over the confirmed direct transport", async () => {
+    const accepted: StoredMessage = {
+      packet: { version: 1, type: "message", id: "direct-sync-saved", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Direct sync saved body" },
+      direction: "outgoing",
+      delivery: "sent",
+      transport: "direct",
+    };
+    await saveMessage(accepted);
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
+    fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
+    await screen.findByLabelText("Your signaling JSON to share");
+    fireEvent.change(screen.getByLabelText("Paste peer offer or answer JSON"), { target: { value: JSON.stringify({ version: 1, type: "answer", sdp: "test-answer" }) } });
+    fireEvent.click(screen.getByRole("button", { name: "Accept answer" }));
+    await screen.findByLabelText("Remote SDP DTLS fingerprint");
+    fireEvent.change(screen.getByLabelText(/Fingerprint compared in person/), { target: { value: FINGERPRINT } });
+    fireEvent.click(screen.getByRole("button", { name: "Compare fingerprints" }));
+    const transport = peerMock.instances[0] as MockPeerTransport;
+    await waitFor(() => expect(transport.sent.map((entry) => JSON.parse(entry)).some((packet) => packet.type === "sync_inventory_page" && packet.messageIds.includes(accepted.packet.id))).toBe(true));
+    const inventory = transport.sent.map((entry) => JSON.parse(entry)).find((packet) => packet.type === "sync_inventory_page");
+    act(() => transport.emit({
+      version: 1,
+      type: "sync_missing_request",
+      room: ROOM,
+      syncId: inventory.syncId,
+      requestId: "direct-peer-request",
+      sender: "station-b",
+      targetSender: IDENTITY.sender,
+      messageIds: [accepted.packet.id],
+    }));
+    await waitFor(() => expect(transport.sent.map((entry) => JSON.parse(entry)).some((packet) => packet.type === "sync_page_complete" && packet.requestId === "direct-peer-request")).toBe(true));
+    expect(transport.sent.map((entry) => JSON.parse(entry))).toContainEqual(accepted.packet);
+  });
+
   it("exchanges signaling, blocks unverified direct send, saves messages before ACK, and records peer acceptance", async () => {
     render(<App />);
     await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
@@ -174,7 +217,7 @@ describe("direct peer app flow", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Do not send before verification" } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await screen.findByText("Queued on this device");
-    const transport = peerMock.instances[0];
+    const transport = peerMock.instances[0] as MockPeerTransport;
     expect(transport.sent).toHaveLength(0);
     const unverifiedQueued = (await loadMessages(ROOM)).find((item) => item.packet.body === "Do not send before verification");
     expect(unverifiedQueued).toMatchObject({ transport: "direct", delivery: "queued" });
@@ -196,12 +239,12 @@ describe("direct peer app flow", () => {
     await screen.findByText(/Fingerprint matches this DTLS session/);
     fireEvent.change(screen.getByLabelText("Message transport"), { target: { value: "direct" } });
     expect(screen.getByText("Session fingerprint compared")).toBeTruthy();
-    await waitFor(() => expect(transport.sent).toHaveLength(1));
-    expect(JSON.parse(transport.sent[0])).toEqual(unverifiedQueued?.packet);
+    await waitFor(() => expect(transport.sent.map((entry) => JSON.parse(entry)).filter((packet) => packet.type === "message")).toHaveLength(1));
+    expect(transport.sent.map((entry) => JSON.parse(entry)).find((packet) => packet.type === "message")).toEqual(unverifiedQueued?.packet);
     fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Hello peer" } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(transport.sent).toHaveLength(2));
-    const sentPacket = JSON.parse(transport.sent[1]);
+    await waitFor(() => expect(transport.sent.map((entry) => JSON.parse(entry)).filter((packet) => packet.type === "message")).toHaveLength(2));
+    const sentPacket = transport.sent.map((entry) => JSON.parse(entry)).filter((packet) => packet.type === "message")[1];
     expect(sentPacket).toMatchObject({ type: "message", body: "Hello peer", room: ROOM });
     act(() => transport.emit({ version: 1, type: "ack", id: sentPacket.id }));
     await screen.findByText("Accepted by peer device");
@@ -257,7 +300,7 @@ describe("direct peer app flow", () => {
     fireEvent.change(screen.getByLabelText(/Fingerprint compared in person/), { target: { value: FINGERPRINT } });
     fireEvent.click(screen.getByRole("button", { name: "Compare fingerprints" }));
     await screen.findByText(/Fingerprint matches this DTLS session/);
-    const transport = peerMock.instances[0];
+    const transport = peerMock.instances[0] as MockPeerTransport;
     act(() => transport.setState("disconnected"));
     fireEvent.change(screen.getByLabelText("Message transport"), { target: { value: "direct" } });
     fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Keep this queued" } });
@@ -271,10 +314,9 @@ describe("direct peer app flow", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect((await loadMessages(ROOM)).find((item) => item.packet.id === queued?.packet.id)?.delivery).toBe("queued");
-    expect(transport.sent).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Compare fingerprints" }));
-    await waitFor(() => expect(transport.sent).toHaveLength(1));
-    expect(JSON.parse(transport.sent[0])).toEqual(queued?.packet);
+    await waitFor(() => expect(transport.sent.map((entry) => JSON.parse(entry)).filter((packet) => packet.type === "message")).toHaveLength(1));
+    expect(transport.sent.map((entry) => JSON.parse(entry)).find((packet) => packet.type === "message")).toEqual(queued?.packet);
 
     fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "new-room" } });
     await waitFor(() => expect(transport.currentState).toBe("closed"));
@@ -317,14 +359,14 @@ describe("direct peer app flow", () => {
     fireEvent.change(screen.getByLabelText(/Fingerprint compared in person/), { target: { value: FINGERPRINT } });
     fireEvent.click(screen.getByRole("button", { name: "Compare fingerprints" }));
     await screen.findByText(/Fingerprint matches this DTLS session/);
-    const transport = peerMock.instances[0];
+    const transport = peerMock.instances[0] as MockPeerTransport;
     fireEvent.change(screen.getByLabelText("Message transport"), { target: { value: "direct" } });
     storageGate.body = "Reject this unsaved message";
     storageGate.reject = true;
     fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: storageGate.body } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(storageGate.finish).toBeTruthy());
-    expect(transport.sent).toHaveLength(0);
+    expect(transport.sent.map((entry) => JSON.parse(entry)).filter((packet) => packet.type === "message")).toHaveLength(0);
     await act(async () => {
       const finish = storageGate.finish;
       storageGate.finish = null;
@@ -333,7 +375,7 @@ describe("direct peer app flow", () => {
     });
     await screen.findByText(/It has not been queued for delivery/);
     expect((await loadMessages(ROOM)).some((item) => item.packet.body === storageGate.body)).toBe(false);
-    expect(transport.sent).toHaveLength(0);
+    expect(transport.sent.map((entry) => JSON.parse(entry)).filter((packet) => packet.type === "message")).toHaveLength(0);
   });
 
   it("reports a WebRTC constructor failure and releases the busy controls", async () => {

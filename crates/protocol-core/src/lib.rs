@@ -14,6 +14,8 @@ pub const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_PROTOCOL_ENVELOPE_BYTES: usize = 18 * 1024;
 pub const MAX_HISTORY_PAGE_MESSAGES: u64 = 100;
 pub const MAX_HISTORY_PAGE_BYTES: u64 = 512 * 1024;
+pub const MAX_SYNC_INVENTORY_IDS: usize = 4_096;
+pub const MAX_SYNC_PACKET_IDS: usize = 100;
 
 const HUB_WHITESPACE: &[char] = &[
     '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{001c}', '\u{001d}', '\u{001e}',
@@ -24,6 +26,13 @@ const HUB_WHITESPACE: &[char] = &[
 
 fn record(value: &Value) -> bool {
     value.is_object()
+}
+
+fn has_exact_fields(value: &Value, expected: &[&str]) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == expected.len() && object.keys().all(|key| expected.contains(&key.as_str()))
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
@@ -273,6 +282,133 @@ pub fn is_history_page_complete_packet(value: &Value) -> bool {
     }
 }
 
+fn sorted_unique_sync_ids(value: Option<&Value>, allow_empty: bool) -> Option<Vec<&str>> {
+    let ids = value?.as_array()?;
+    if ids.len() > MAX_SYNC_PACKET_IDS || (!allow_empty && ids.is_empty()) {
+        return None;
+    }
+    let mut previous = None;
+    let mut output = Vec::with_capacity(ids.len());
+    for item in ids {
+        let id = item.as_str()?;
+        if !is_protocol_identifier(id) || previous.is_some_and(|previous| previous >= id) {
+            return None;
+        }
+        output.push(id);
+        previous = Some(id);
+    }
+    Some(output)
+}
+
+pub fn is_sync_inventory_page_packet(value: &Value) -> bool {
+    if !record(value)
+        || !has_exact_fields(
+            value,
+            &[
+                "version",
+                "type",
+                "room",
+                "syncId",
+                "sender",
+                "cursor",
+                "messageIds",
+                "nextCursor",
+                "hasMore",
+                "limitReached",
+            ],
+        )
+        || !is_envelope_within_limit(value)
+        || !has_v1(value)
+        || !has_type(value, "sync_inventory_page")
+        || !text_field(value, "room").is_some_and(is_protocol_room)
+        || !text_field(value, "syncId").is_some_and(is_protocol_identifier)
+        || !text_field(value, "sender").is_some_and(is_protocol_identifier)
+        || !field(value, "cursor").is_some_and(|cursor| {
+            cursor.is_null() || cursor.as_str().is_some_and(is_protocol_identifier)
+        })
+    {
+        return false;
+    }
+    let Some(ids) = sorted_unique_sync_ids(field(value, "messageIds"), true) else {
+        return false;
+    };
+    let Some(next_cursor) = field(value, "nextCursor") else {
+        return false;
+    };
+    if !next_cursor.is_null() && !next_cursor.as_str().is_some_and(is_protocol_identifier) {
+        return false;
+    }
+    let Some(cursor) = field(value, "cursor") else {
+        return false;
+    };
+    let Some(has_more) = field(value, "hasMore").and_then(Value::as_bool) else {
+        return false;
+    };
+    let Some(limit_reached) = field(value, "limitReached").and_then(Value::as_bool) else {
+        return false;
+    };
+    if ids.is_empty() {
+        return cursor.is_null() && next_cursor.is_null() && !has_more && !limit_reached;
+    }
+    next_cursor.as_str() == ids.last().copied()
+        && cursor
+            .as_str()
+            .is_none_or(|cursor| ids.first().is_some_and(|first| *first > cursor))
+        && (!limit_reached || !has_more)
+}
+
+pub fn is_sync_missing_request_packet(value: &Value) -> bool {
+    record(value)
+        && has_exact_fields(
+            value,
+            &[
+                "version",
+                "type",
+                "room",
+                "syncId",
+                "requestId",
+                "sender",
+                "targetSender",
+                "messageIds",
+            ],
+        )
+        && is_envelope_within_limit(value)
+        && has_v1(value)
+        && has_type(value, "sync_missing_request")
+        && text_field(value, "room").is_some_and(is_protocol_room)
+        && text_field(value, "syncId").is_some_and(is_protocol_identifier)
+        && text_field(value, "requestId").is_some_and(is_protocol_identifier)
+        && text_field(value, "sender").is_some_and(is_protocol_identifier)
+        && text_field(value, "targetSender").is_some_and(is_protocol_identifier)
+        && sorted_unique_sync_ids(field(value, "messageIds"), false).is_some()
+}
+
+pub fn is_sync_page_complete_packet(value: &Value) -> bool {
+    record(value)
+        && has_exact_fields(
+            value,
+            &[
+                "version",
+                "type",
+                "room",
+                "syncId",
+                "requestId",
+                "sender",
+                "targetSender",
+                "messageIds",
+            ],
+        )
+        && is_envelope_within_limit(value)
+        && has_v1(value)
+        && has_type(value, "sync_page_complete")
+        && text_field(value, "room").is_some_and(is_protocol_room)
+        && text_field(value, "syncId").is_some_and(is_protocol_identifier)
+        && text_field(value, "requestId").is_some_and(is_protocol_identifier)
+        && text_field(value, "sender").is_some_and(is_protocol_identifier)
+        && text_field(value, "targetSender").is_some_and(is_protocol_identifier)
+        && sorted_unique_sync_ids(field(value, "messageIds"), true).is_some()
+}
+
 fn nonnegative_integer(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_f64)
@@ -286,6 +422,9 @@ pub fn is_server_packet(value: &Value) -> bool {
 
     match text_field(value, "type") {
         Some("history_page_complete") => is_history_page_complete_packet(value),
+        Some("sync_inventory_page") => is_sync_inventory_page_packet(value),
+        Some("sync_missing_request") => is_sync_missing_request_packet(value),
+        Some("sync_page_complete") => is_sync_page_complete_packet(value),
         Some("joined") => {
             text_field(value, "room").is_some_and(is_protocol_room)
                 && nonnegative_integer(field(value, "peers"))
@@ -304,6 +443,8 @@ pub fn is_server_packet(value: &Value) -> bool {
                         | "message_too_large"
                         | "capacity_reached"
                         | "rate_limited"
+                        | "history_rate_limited"
+                        | "sync_rate_limited"
                         | "message_conflict"
                         | "storage_unavailable"
                         | "not_joined"
@@ -320,7 +461,12 @@ pub fn is_server_packet(value: &Value) -> bool {
 }
 
 pub fn is_client_packet(value: &Value) -> bool {
-    is_join_packet(value) || is_message_packet(value) || is_history_request_packet(value)
+    is_join_packet(value)
+        || is_message_packet(value)
+        || is_history_request_packet(value)
+        || is_sync_inventory_page_packet(value)
+        || is_sync_missing_request_packet(value)
+        || is_sync_page_complete_packet(value)
 }
 
 #[cfg(test)]
@@ -344,6 +490,9 @@ mod tests {
                 "history_request" => is_history_request_packet(value),
                 "server" => is_server_packet(value),
                 "history_page_complete" => is_history_page_complete_packet(value),
+                "sync_inventory_page" => is_sync_inventory_page_packet(value),
+                "sync_missing_request" => is_sync_missing_request_packet(value),
+                "sync_page_complete" => is_sync_page_complete_packet(value),
                 "timestamp" => value.as_str().is_some_and(is_protocol_timestamp),
                 "identifier" => value.as_str().is_some_and(is_protocol_identifier),
                 "room" => value.as_str().is_some_and(is_protocol_room),

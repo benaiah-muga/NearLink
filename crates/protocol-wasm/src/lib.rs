@@ -12,11 +12,15 @@
 //! and bounded in-memory reconciliation. It does not add persistence, peer
 //! identity, authentication, encryption, or transport behavior.
 
-use nearlink_protocol_core::sync::{InsertOutcome, MessageIndex, SyncError, MAX_ENVELOPE_BYTES};
+use nearlink_protocol_core::sync::{
+    InsertOutcome, InventoryPageOutcome, MessageIndex, SyncError, SyncInventoryReceiver,
+    SyncRequestBook, SyncRequestOutcome, MAX_ENVELOPE_BYTES,
+};
 use nearlink_protocol_core::{
     is_client_packet, is_history_page_complete_packet, is_history_request_packet, is_join_packet,
     is_message_packet, is_protocol_identifier, is_protocol_room, is_protocol_timestamp,
-    is_server_packet,
+    is_server_packet, is_sync_inventory_page_packet, is_sync_missing_request_packet,
+    is_sync_page_complete_packet,
 };
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
@@ -44,6 +48,14 @@ enum ErrorCode {
     KnownIdLimit,
     InvalidIdentifier,
     InvalidPageLimit,
+    InvalidInventoryPage,
+    InvalidInventorySequence,
+    InventoryConflict,
+    InventoryLimit,
+    InvalidSyncRequest,
+    SyncRequestLimit,
+    SyncRequestConflict,
+    InvalidSyncCompletion,
 }
 
 impl ErrorCode {
@@ -63,6 +75,14 @@ impl ErrorCode {
             Self::KnownIdLimit => "known_id_limit",
             Self::InvalidIdentifier => "invalid_identifier",
             Self::InvalidPageLimit => "invalid_page_limit",
+            Self::InvalidInventoryPage => "invalid_inventory_page",
+            Self::InvalidInventorySequence => "invalid_inventory_sequence",
+            Self::InventoryConflict => "inventory_conflict",
+            Self::InventoryLimit => "inventory_limit",
+            Self::InvalidSyncRequest => "invalid_sync_request",
+            Self::SyncRequestLimit => "sync_request_limit",
+            Self::SyncRequestConflict => "sync_request_conflict",
+            Self::InvalidSyncCompletion => "invalid_sync_completion",
         }
     }
 }
@@ -81,6 +101,14 @@ impl From<SyncError> for ErrorCode {
             SyncError::KnownIdLimit => Self::KnownIdLimit,
             SyncError::InvalidIdentifier => Self::InvalidIdentifier,
             SyncError::InvalidPageLimit => Self::InvalidPageLimit,
+            SyncError::InvalidInventoryPage => Self::InvalidInventoryPage,
+            SyncError::InvalidInventorySequence => Self::InvalidInventorySequence,
+            SyncError::InventoryConflict => Self::InventoryConflict,
+            SyncError::InventoryLimit => Self::InventoryLimit,
+            SyncError::InvalidSyncRequest => Self::InvalidSyncRequest,
+            SyncError::SyncRequestLimit => Self::SyncRequestLimit,
+            SyncError::SyncRequestConflict => Self::SyncRequestConflict,
+            SyncError::InvalidSyncCompletion => Self::InvalidSyncCompletion,
         }
     }
 }
@@ -97,6 +125,7 @@ fn sync_error_json(error: SyncError) -> String {
 ///
 /// Supported names match `packages/protocol/vectors/v1.json`: `client`,
 /// `join`, `message`, `history_request`, `server`, `history_page_complete`,
+/// `sync_inventory_page`, `sync_missing_request`, `sync_page_complete`,
 /// `timestamp`, `identifier`, and `room`.
 /// Input above 18 KiB is rejected before JSON parsing. Known validators return
 /// `{"ok":true,"valid":true}` or `{"ok":true,"valid":false}`.
@@ -119,6 +148,9 @@ pub fn validate_json(validator: &str, value_json: &str) -> String {
         "history_request" => is_history_request_packet(&value),
         "server" => is_server_packet(&value),
         "history_page_complete" => is_history_page_complete_packet(&value),
+        "sync_inventory_page" => is_sync_inventory_page_packet(&value),
+        "sync_missing_request" => is_sync_missing_request_packet(&value),
+        "sync_page_complete" => is_sync_page_complete_packet(&value),
         "timestamp" => value.as_str().is_some_and(is_protocol_timestamp),
         "identifier" => value.as_str().is_some_and(is_protocol_identifier),
         "room" => value.as_str().is_some_and(is_protocol_room),
@@ -213,6 +245,118 @@ impl WasmMessageIndex {
             "hasMore": page.has_more,
         })
         .to_string()
+    }
+}
+
+/// Stateful, bounded receiver for one synchronization inventory sequence.
+#[wasm_bindgen]
+pub struct WasmSyncInventoryReceiver {
+    inner: SyncInventoryReceiver,
+}
+
+#[wasm_bindgen]
+impl WasmSyncInventoryReceiver {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmSyncInventoryReceiver {
+        WasmSyncInventoryReceiver {
+            inner: SyncInventoryReceiver::new(),
+        }
+    }
+
+    /// Validate and accept one inventory page or exact retransmission.
+    pub fn accept_page_json(&mut self, page_json: &str) -> String {
+        if page_json.len() > MAX_ENVELOPE_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let page: Value = match serde_json::from_str(page_json) {
+            Ok(page) => page,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        match self.inner.accept_page(page) {
+            Ok(InventoryPageOutcome::Accepted) => json!({
+                "ok": true,
+                "outcome": "accepted",
+                "ids": self.inner.ids(),
+                "complete": self.inner.is_complete(),
+                "limitReached": self.inner.limit_reached(),
+            })
+            .to_string(),
+            Ok(InventoryPageOutcome::Duplicate) => json!({
+                "ok": true,
+                "outcome": "duplicate",
+                "ids": self.inner.ids(),
+                "complete": self.inner.is_complete(),
+                "limitReached": self.inner.limit_reached(),
+            })
+            .to_string(),
+            Err(error) => sync_error_json(error),
+        }
+    }
+}
+
+impl Default for WasmSyncInventoryReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Bounded receiver for synchronization requests and their completion packets.
+#[wasm_bindgen]
+pub struct WasmSyncRequestBook {
+    inner: SyncRequestBook,
+}
+
+#[wasm_bindgen]
+impl WasmSyncRequestBook {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmSyncRequestBook {
+        WasmSyncRequestBook {
+            inner: SyncRequestBook::new(),
+        }
+    }
+
+    pub fn register_request_json(&mut self, request_json: &str) -> String {
+        if request_json.len() > MAX_ENVELOPE_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let request: Value = match serde_json::from_str(request_json) {
+            Ok(request) => request,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        match self.inner.register_request(request) {
+            Ok(SyncRequestOutcome::Accepted) => {
+                json!({"ok": true, "outcome": "accepted"}).to_string()
+            }
+            Ok(SyncRequestOutcome::Duplicate) => {
+                json!({"ok": true, "outcome": "duplicate"}).to_string()
+            }
+            Err(error) => sync_error_json(error),
+        }
+    }
+
+    pub fn accept_completion_json(&mut self, completion_json: &str) -> String {
+        if completion_json.len() > MAX_ENVELOPE_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let completion: Value = match serde_json::from_str(completion_json) {
+            Ok(completion) => completion,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        match self.inner.accept_completion(completion) {
+            Ok(SyncRequestOutcome::Accepted) => {
+                json!({"ok": true, "outcome": "accepted"}).to_string()
+            }
+            Ok(SyncRequestOutcome::Duplicate) => {
+                json!({"ok": true, "outcome": "duplicate"}).to_string()
+            }
+            Err(error) => sync_error_json(error),
+        }
+    }
+}
+
+impl Default for WasmSyncRequestBook {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -366,6 +510,81 @@ mod tests {
         assert_eq!(
             parse_result(&index.page_json("[]", Some("a".repeat(129)), 1)),
             json!({"ok": false, "code": "invalid_identifier"})
+        );
+    }
+
+    #[test]
+    fn synchronization_facade_enforces_inventory_sequence_and_request_completion() {
+        let first = json!({
+            "version": 1,
+            "type": "sync_inventory_page",
+            "room": "room1",
+            "syncId": "sync-1",
+            "sender": "device-a",
+            "cursor": null,
+            "messageIds": ["a", "b"],
+            "nextCursor": "b",
+            "hasMore": true,
+            "limitReached": false,
+        });
+        let mut inventory = WasmSyncInventoryReceiver::new();
+        assert_eq!(
+            parse_result(&inventory.accept_page_json(&first.to_string()))["ids"],
+            json!(["a", "b"])
+        );
+        assert_eq!(
+            parse_result(&inventory.accept_page_json(&first.to_string()))["outcome"],
+            "duplicate"
+        );
+        let wrong_cursor = json!({
+            "version": 1,
+            "type": "sync_inventory_page",
+            "room": "room1",
+            "syncId": "sync-1",
+            "sender": "device-a",
+            "cursor": "a",
+            "messageIds": ["c"],
+            "nextCursor": "c",
+            "hasMore": false,
+            "limitReached": false,
+        });
+        assert_eq!(
+            parse_result(&inventory.accept_page_json(&wrong_cursor.to_string())),
+            json!({"ok": false, "code": "invalid_inventory_sequence"})
+        );
+
+        let request = json!({
+            "version": 1,
+            "type": "sync_missing_request",
+            "room": "room1",
+            "syncId": "sync-1",
+            "requestId": "request-1",
+            "sender": "device-a",
+            "targetSender": "device-b",
+            "messageIds": ["a", "c"],
+        });
+        let mut requests = WasmSyncRequestBook::new();
+        assert_eq!(
+            parse_result(&requests.register_request_json(&request.to_string())),
+            json!({"ok": true, "outcome": "accepted"})
+        );
+        let completion = json!({
+            "version": 1,
+            "type": "sync_page_complete",
+            "room": "room1",
+            "syncId": "sync-1",
+            "requestId": "request-1",
+            "sender": "device-b",
+            "targetSender": "device-a",
+            "messageIds": ["c"],
+        });
+        assert_eq!(
+            parse_result(&requests.accept_completion_json(&completion.to_string())),
+            json!({"ok": true, "outcome": "accepted"})
+        );
+        assert_eq!(
+            parse_result(&requests.accept_completion_json(&completion.to_string())),
+            json!({"ok": true, "outcome": "duplicate"})
         );
     }
 }

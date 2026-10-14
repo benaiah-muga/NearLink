@@ -118,6 +118,10 @@ test("loads older hub history in accepted order and retries the same cursor", as
     version: 1, type: "message", id: "e2e-history-oldest", room: "chromium-history-check",
     sender: "station-b", senderName: "Bea", createdAt: "2026-10-14T22:00:00.000Z", body: "Accepted first, newer timestamp",
   };
+  const syncMessage = {
+    version: 1, type: "message", id: "e2e-sync-message", room: "chromium-history-check",
+    sender: "station-b", senderName: "Bea", createdAt: "2026-10-14T09:00:00.000Z", body: "Received through bounded sync",
+  };
   const cursors: (string | null)[] = [];
   await page.routeWebSocket("ws://127.0.0.1:8000/ws", (socket) => {
     socket.onMessage((raw) => {
@@ -143,6 +147,21 @@ test("loads older hub history in accepted order and retries the same cursor", as
           nextCursor: null, hasMore: false, historyTruncated: false,
         }));
       }
+      if (packet.type === "sync_inventory_page" && packet.cursor === null) {
+        socket.send(JSON.stringify({
+          version: 1, type: "sync_inventory_page", room: packet.room, syncId: "e2e-peer-sync",
+          sender: "station-b", cursor: null, messageIds: [syncMessage.id], nextCursor: syncMessage.id,
+          hasMore: false, limitReached: false,
+        }));
+      }
+      if (packet.type === "sync_missing_request" && packet.targetSender === "station-b") {
+        socket.send(JSON.stringify(syncMessage));
+        socket.send(JSON.stringify({
+          version: 1, type: "sync_page_complete", room: packet.room, syncId: packet.syncId,
+          requestId: packet.requestId, sender: "station-b", targetSender: packet.sender,
+          messageIds: [syncMessage.id],
+        }));
+      }
     });
   });
 
@@ -156,6 +175,8 @@ test("loads older hub history in accepted order and retries the same cursor", as
   await saveAndJoin.click();
   const messageLog = page.getByRole("log", { name: "Messages in chromium-history-check" });
   await expect(messageLog.getByText(boundary.body)).toBeVisible();
+  await expect(messageLog.getByText(syncMessage.body)).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Requested message pages were received and verified in local storage." })).toBeVisible();
   await page.getByRole("button", { name: "Load older messages" }).click();
   await expect(page.getByRole("button", { name: "Retry loading older messages" })).toBeVisible();
   await page.getByRole("button", { name: "Retry loading older messages" }).click();
@@ -163,6 +184,81 @@ test("loads older hub history in accepted order and retries the same cursor", as
   await expect.poll(() => cursors).toEqual([boundary.id, boundary.id]);
   await expect(messageLog.getByText("No more retained hub history is available.")).toBeVisible();
   const displayedBodies = await messageLog.locator(".message-bubble").allTextContents();
-  expect(displayedBodies).toEqual([pageOldest.body, pageNewest.body, boundary.body]);
+  expect(displayedBodies).toEqual([pageOldest.body, pageNewest.body, boundary.body, syncMessage.body]);
   await expectAccessible(page, "the loaded and retried history page");
+});
+
+test("reconciles a persisted message over a confirmed direct Chromium session", async ({ browser }) => {
+  const left = await browser.newPage();
+  const right = await browser.newPage();
+  const room = "chromium-direct-sync";
+  const body = "Received over direct synchronization";
+  try {
+    await Promise.all([left.goto("/"), right.goto("/")]);
+    await Promise.all([waitForSetupReady(left), waitForSetupReady(right)]);
+    await left.getByLabel("Your call sign").fill("Direct Left");
+    await right.getByLabel("Your call sign").fill("Direct Right");
+    await left.getByLabel("Room frequency").fill(room);
+    await right.getByLabel("Room frequency").fill(room);
+    await Promise.all([left.getByLabel("Message transport").selectOption("direct"), right.getByLabel("Message transport").selectOption("direct")]);
+    await Promise.all([
+      left.getByRole("button", { name: "Save profile for direct link" }).click(),
+      right.getByRole("button", { name: "Save profile for direct link" }).click(),
+    ]);
+    await Promise.all([left.getByRole("button", { name: "Create offer" }).click(), right.getByRole("button", { name: "Create offer" }).click()]);
+    const seeded = await left.evaluate(async ({ roomName, messageBody }) => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("nearlink-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const transaction = database.transaction(["identity", "messages"], "readwrite");
+      const result = await new Promise<string>((resolve, reject) => {
+        const request = transaction.objectStore("identity").get("profile");
+        request.onsuccess = () => {
+          const identity = request.result as { sender: string; senderName: string };
+          const packet = {
+            version: 1, type: "message", id: "chromium-direct-sync-message", room: roomName,
+            sender: identity.sender, senderName: identity.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: messageBody,
+          };
+          transaction.objectStore("messages").put({ packet, direction: "outgoing", delivery: "sent", transport: "direct" });
+          resolve(identity.sender);
+        };
+        request.onerror = () => reject(request.error);
+      });
+      await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+      database.close();
+      return result;
+    }, { roomName: room, messageBody: body });
+    expect(seeded).toBeTruthy();
+
+    const offer = await left.getByLabel("Your signaling JSON to share").inputValue();
+    await right.getByLabel("Paste peer offer or answer JSON").fill(offer);
+    await right.getByRole("button", { name: "Accept offer" }).click();
+    const answerLabel = right.getByLabel("Your signaling JSON to share");
+    await expect.poll(async () => JSON.parse(await answerLabel.inputValue()).type).toBe("answer");
+    const answer = await answerLabel.inputValue();
+    await left.getByLabel("Paste peer offer or answer JSON").fill(answer);
+    await left.getByRole("button", { name: "Accept answer" }).click();
+    await Promise.all([
+      left.getByLabel("Remote SDP DTLS fingerprint").waitFor(),
+      right.getByLabel("Remote SDP DTLS fingerprint").waitFor(),
+    ]);
+    const leftFingerprint = await left.getByLabel("Remote SDP DTLS fingerprint").innerText();
+    const rightFingerprint = await right.getByLabel("Remote SDP DTLS fingerprint").innerText();
+    await left.getByLabel(/Fingerprint compared in person/).fill(leftFingerprint);
+    await right.getByLabel(/Fingerprint compared in person/).fill(rightFingerprint);
+    await Promise.all([
+      left.getByRole("button", { name: "Compare fingerprints" }).click(),
+      right.getByRole("button", { name: "Compare fingerprints" }).click(),
+    ]);
+    await expect(right.getByRole("log", { name: `Messages in ${room}` }).getByText(body)).toBeVisible({ timeout: 30000 });
+    await expect(right.getByRole("status").filter({ hasText: "Requested message pages were received and verified in local storage." })).toBeVisible();
+  } finally {
+    await Promise.all([left.close(), right.close()]);
+  }
 });

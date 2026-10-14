@@ -1,75 +1,136 @@
-# Message reconciliation primitive, draft
+# NearLink synchronization v1 draft
 
-Status: local Rust implementation slice. This document does not define a
-network synchronization protocol or a security protocol.
+Status: proposed bounded reconciliation over existing room transports
 
-## Current API
+This draft adds message-ID exchange to the existing v1 message envelope. It
+does not change message serialization or claim identity, confidentiality,
+completeness, exactly-once delivery, or emergency reliability. Hub rooms and
+direct WebRTC sessions use the same control packets. A transport loss restarts
+the exchange from a fresh inventory; persisted message IDs make repeated
+delivery idempotent.
 
-`crates/protocol-core/src/sync.rs` exposes an in-memory `MessageIndex` created
-for one validated room and operating on protocol v1 message packets. It
-validates each packet with the shared Rust validator before retaining it. The
-index keys messages by their opaque v1 message ID within that room. Callers
-must preserve the protocol requirement that IDs remain stable across retries.
+## Limits
 
-`insert` returns `Inserted` for a new packet and `Duplicate` when the complete
-JSON value matches the packet already stored under that ID. A different packet
-with the same ID and room returns `MessageConflict`; the existing packet
-remains unchanged. Errors contain no message bodies or identifiers.
+- One exchange is scoped to one validated room and one sender ID.
+- A local inventory contains at most 4,096 message IDs. When a larger local
+inventory is observed, the sender exchanges the bounded prefix and sets
+`limitReached` on its final inventory page. The receiver must display an
+incomplete result and must not say that the conversation is fully synchronized.
+- An inventory or missing-message batch carries 1 to 100 IDs, except the empty
+inventory uses one empty page.
+- IDs in each page are unique and sorted by their opaque string value. IDs and
+cursors are never interpreted as time or sequence values.
+- Every control packet and ordinary message packet is bounded by the existing
+18 KiB compact UTF-8 protocol envelope limit.
+- A receiver keeps at most 64 request records per exchange. Start
+  a fresh exchange if more request batches are needed.
+- Exchanges are restarted after disconnect, room change, storage failure, or
+invalid session data. Receivers deduplicate persisted messages by `(room, id)`.
 
-To reconcile with a peer, retain one consistent snapshot of the peer's known
-IDs. Pass that same snapshot to each `page_missing_from` call and continue from
-the exclusive `next_cursor`. If the known-ID snapshot changes, restart from
-the first page. Results are sorted by opaque ID only for deterministic
-pagination. Message timestamps are not used to infer authoritative order.
-`has_more` tells the caller whether another missing packet exists after the
-page under the same snapshot.
+## Packets
 
-The current implementation enforces these limits per `MessageIndex` or call:
+All packets use protocol version 1 and contain a valid `room`.
 
-| Resource | Limit |
-| --- | ---: |
-| Retained messages | 4,096 |
-| Retained compact JSON packet bytes | 16 MiB |
-| Compact JSON bytes per message | 18 KiB |
-| Known IDs per page request | 4,096 |
-| Messages per returned page | 128 |
-| Compact JSON bytes per returned page | 512 KiB |
-| JSON values inspected in one input packet | 512 |
-| Nesting depth inspected in one input packet | 32 |
-| Combined UTF-8 bytes in strings and object keys | 18 KiB |
+### `sync_inventory_page`
 
-The 18 KiB envelope ceiling includes protocol metadata in addition to the
-existing 16 KiB UTF-8 body limit. These are implementation bounds, not
-negotiated network capabilities. They bound data retained by the index,
-returned in pages, and inspected during input traversal. The API accepts an
-already allocated JSON value, so callers must also bound input bytes while
-parsing or constructing that value.
+```json
+{
+  "version": 1,
+  "type": "sync_inventory_page",
+  "room": "room1",
+  "syncId": "opaque-session-id",
+  "sender": "device-a",
+  "cursor": null,
+  "messageIds": ["id-a", "id-b"],
+  "nextCursor": "id-b",
+  "hasMore": false,
+  "limitReached": false
+}
+```
 
-## Boundaries and remaining work
+The sender creates a frozen, sorted inventory at the beginning of an exchange
+and sends pages in order. The first page has a null `cursor`; each following
+page uses the preceding page's `nextCursor`. `nextCursor` is the last ID in
+the current page, or null for the empty inventory. `hasMore` indicates that
+another page follows in the same inventory. `limitReached` is only true on a
+final page and says that the local inventory contained more than 4,096 IDs.
+Receivers reject gaps, duplicate IDs, page cursor mismatches, changed pages for
+the same `(sender, syncId, cursor)`, and pages that exceed the session bounds.
 
-`crates/protocol-wasm` exposes the structural validators and reconciliation
-operations through JSON-string functions and a `WasmMessageIndex` class. The
-facade checks JSON byte lengths before parsing, returns stable content-free
-error codes, and uses the same shared protocol vectors as the native core
-tests. `npm run test:wasm` builds the wasm-bindgen artifact and exercises it in
-Chromium. The browser app builds and loads this binding before enabling
-messaging. Hub packets and direct-peer packets pass through the Rust structural
-validators at their inbound boundaries, and outbound messages and join packets
-are checked before sending. If the module cannot initialize, connection, send,
-and peer actions remain disabled. The binding does not supply authentication,
-encryption, persistence, or synchronization behavior.
+### `sync_missing_request`
 
-The core has no persistent index, resumable peer cursor, synchronization
-packet type, or wire compatibility contract. The caller is responsible for
-storing synchronization progress and exchanging IDs and pages. The current
-message format does not authenticate the peer or bind an inventory to a
-trusted identity. A malicious peer can omit messages from its inventory,
-provide misleading IDs, or send conflicting packets. This primitive does not
-encrypt, authenticate, or prove completeness.
+```json
+{
+  "version": 1,
+  "type": "sync_missing_request",
+  "room": "room1",
+  "syncId": "target-inventory-session",
+  "requestId": "opaque-request-id",
+  "sender": "device-a",
+  "targetSender": "device-b",
+  "messageIds": ["id-c", "id-d"]
+}
+```
 
-Before the application relies on this behavior across devices, define a
-versioned transport-independent synchronization exchange, persist progress
-safely, bind accepted data to the selected identity and security design, and
-connect the tested binding to the application. Retain the existing rule that
-timestamps are presentation hints and that exactly-once delivery is not
-promised.
+The requester sends sorted unique IDs from the target's completed inventory
+that are absent from its own local inventory. Each packet has at most 100 IDs.
+The target responds only when `targetSender` is its local sender ID and
+`syncId` identifies the target's active inventory. A request can be repeated
+after a restart; exact duplicate requests are idempotent.
+
+### `sync_page_complete`
+
+```json
+{
+  "version": 1,
+  "type": "sync_page_complete",
+  "room": "room1",
+  "syncId": "target-inventory-session",
+  "requestId": "opaque-request-id",
+  "sender": "device-b",
+  "targetSender": "device-a",
+  "messageIds": ["id-c"]
+}
+```
+
+The target emits each available requested item as its ordinary v1 `message`
+packet, in request ID order, followed by one completion packet. Completion
+lists exactly the ordinary message packets emitted for this request; it may
+be a subset if a message was removed after inventory creation. The receiver
+persists and verifies those messages before considering the request handled.
+If the message set does not match the pending request or a save fails, the
+receiver stops that exchange and reports incomplete synchronization. A fresh
+exchange can retry without advancing a durable cursor.
+
+## Transport and storage behavior
+
+Control packets are relayed only to other clients in the joined room. They
+are not stored as chat messages or included in hub history. The hub validates
+that `sender` matches the sender ID from that WebSocket's join and applies a
+separate bounded rate limit. It does not authenticate the identity or contents
+claimed by a room participant.
+
+The browser uses the same synchronization state machine for WebSocket relay
+and the currently connected direct WebRTC peer. It sends only persisted
+messages whose current delivery state is accepted. Incoming messages pass
+through existing Rust/WASM packet validation and are committed through the
+existing IndexedDB deletion and deduplication rules before page completion is
+accepted. Live packets and synchronization packets can overlap; exact
+duplicates are harmless, conflicting content for one ID stops the exchange.
+
+Inventory and active batch state are ephemeral. On reconnect or reload, the
+client begins a fresh exchange. This is safe because accepted message rows
+remain the local source of truth and message insertion is idempotent. A failed
+page does not delete or reorder already saved messages. A history exchange
+can be partial when a peer is offline, a participant has more than 4,096
+messages, a message has been removed locally, or storage rejects a write.
+
+## Security and product limits
+
+Message IDs, room values, and sender IDs are not cryptographic identity. A
+hub participant can lie about an inventory, fabricate or suppress messages,
+observe routing metadata, and cause an incomplete or misleading exchange. A
+direct DTLS fingerprint comparison identifies only that current connection
+session. No inventory page proves provenance or completeness. Hub messages
+remain plaintext. This protocol does not provide E2EE, conflict-free
+concurrent editing, secure membership, or emergency-grade reliability.

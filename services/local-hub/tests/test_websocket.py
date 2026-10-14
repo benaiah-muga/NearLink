@@ -19,10 +19,12 @@ import main as hub  # noqa: E402
 def empty_hub_state(monkeypatch, tmp_path):
     assert hub.rooms == {}
     assert hub.active_connections == 0
+    hub.sync_rate_buckets.clear()
     monkeypatch.setattr(hub, "message_store", hub.MessageStore(tmp_path / "history.sqlite3"))
     yield
     assert hub.rooms == {}
     assert hub.active_connections == 0
+    hub.sync_rate_buckets.clear()
 
 
 def join_packet(room: str = "test-room", sender: str = "sender-1", name: str = "Sender") -> dict:
@@ -47,6 +49,21 @@ def message_packet(
         "senderName": name,
         "createdAt": "2026-10-14T12:00:00Z",
         "body": "hello",
+    }
+
+
+def sync_inventory_packet(*, room: str = "test-room", sender: str = "sender-1") -> dict:
+    return {
+        "version": 1,
+        "type": "sync_inventory_page",
+        "room": room,
+        "syncId": "sync-1",
+        "sender": sender,
+        "cursor": None,
+        "messageIds": ["id-a", "id-b"],
+        "nextCursor": "id-b",
+        "hasMore": False,
+        "limitReached": False,
     }
 
 
@@ -544,7 +561,9 @@ def test_history_request_rate_limit_is_separate_and_bounded(monkeypatch):
             assert first["type"] == "history_page_complete"
             websocket.send_json({**request, "requestId": "second-history-request"})
             limited = websocket.receive_json()
-            assert limited["code"] == "rate_limited"
+            assert limited["type"] == "error"
+            assert limited["code"] == "history_rate_limited"
+            assert "id" not in limited
 
 
 def test_history_page_is_bounded_and_truncation_only_reports_storage_loss():
@@ -755,3 +774,157 @@ def test_rate_limit_rejects_message_without_relay(monkeypatch):
 
     assert hub.rooms == {}
     assert hub.active_connections == 0
+
+
+def test_sync_control_packets_are_validated_relayed_room_scoped_and_not_stored():
+    packets = [
+        sync_inventory_packet(),
+        {
+            "version": 1,
+            "type": "sync_missing_request",
+            "room": "test-room",
+            "syncId": "sync-1",
+            "requestId": "request-1",
+            "sender": "sender-1",
+            "targetSender": "sender-2",
+            "messageIds": ["id-a", "id-b"],
+        },
+        {
+            "version": 1,
+            "type": "sync_page_complete",
+            "room": "test-room",
+            "syncId": "sync-1",
+            "requestId": "request-1",
+            "sender": "sender-2",
+            "targetSender": "sender-1",
+            "messageIds": ["id-a"],
+        },
+    ]
+    with TestClient(hub.app) as client:
+        sender = client.websocket_connect("/ws")
+        peer = client.websocket_connect("/ws")
+        isolated = client.websocket_connect("/ws")
+        with sender, peer, isolated:
+            sender.send_json(join_packet())
+            assert sender.receive_json()["type"] == "joined"
+            sender.receive_json()
+            peer.send_json(join_packet(sender="sender-2", name="Peer"))
+            assert peer.receive_json()["type"] == "joined"
+            peer.receive_json()
+            sender.receive_json()
+            isolated.send_json(join_packet(room="other-room", sender="other", name="Other"))
+            assert isolated.receive_json()["type"] == "joined"
+            isolated.receive_json()
+
+            for packet in packets:
+                if packet["sender"] == "sender-1":
+                    sender.send_json(packet)
+                    assert peer.receive_json() == packet
+                else:
+                    peer.send_json(packet)
+                    assert sender.receive_json() == packet
+
+            assert hub.message_store.recent("test-room")[0] == []
+            assert hub.message_store.recent("other-room")[0] == []
+
+    assert hub.rooms == {}
+    assert len(hub.sync_rate_buckets) == 2
+
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as observer:
+            observer.send_json(join_packet(sender="observer", name="Observer"))
+            assert observer.receive_json()["type"] == "joined"
+            assert observer.receive_json()["type"] == "presence"
+            assert hub.message_store.recent("test-room")[0] == []
+
+
+@pytest.mark.parametrize(
+    "mutate, expected_code",
+    [
+        (lambda packet: packet.update(extra="not-allowed"), "invalid_packet"),
+        (lambda packet: packet.update(sender="forged-sender"), "invalid_packet"),
+        (lambda packet: packet.update(room="other-room"), "not_joined"),
+        (lambda packet: packet.update(messageIds=["id-b", "id-a"]), "invalid_packet"),
+        (lambda packet: packet.update(nextCursor="id-a"), "invalid_packet"),
+        (lambda packet: packet.update(messageIds=["id-a"] * 101), "invalid_packet"),
+    ],
+)
+def test_sync_control_rejects_malformed_unjoined_and_wrong_sender(mutate, expected_code):
+    packet = sync_inventory_packet()
+    mutate(packet)
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as websocket:
+            websocket.send_json(join_packet())
+            assert websocket.receive_json()["type"] == "joined"
+            assert websocket.receive_json()["type"] == "presence"
+            websocket.send_json(packet)
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert response["code"] == expected_code
+            assert hub.message_store.recent("test-room")[0] == []
+
+
+def test_sync_control_rate_limit_is_bounded_and_separate(monkeypatch):
+    monkeypatch.setattr(hub, "MAX_SYNC_CONTROLS_PER_MINUTE", 1)
+    with TestClient(hub.app) as client:
+        sender = client.websocket_connect("/ws")
+        peer = client.websocket_connect("/ws")
+        with sender, peer:
+            sender.send_json(join_packet())
+            assert sender.receive_json()["type"] == "joined"
+            sender.receive_json()
+            peer.send_json(join_packet(sender="sender-2", name="Peer"))
+            assert peer.receive_json()["type"] == "joined"
+            peer.receive_json()
+            sender.receive_json()
+            packet = sync_inventory_packet()
+            sender.send_json(packet)
+            assert peer.receive_json() == packet
+            sender.send_json({**packet, "syncId": "sync-2"})
+            limited = sender.receive_json()
+            assert limited["type"] == "error"
+            assert limited["code"] == "sync_rate_limited"
+            assert "id" not in limited
+            assert hub.message_store.recent("test-room")[0] == []
+
+
+def test_sync_control_configured_rate_limit_allows_2700_packets_per_minute():
+    client = hub.Client(websocket=None, room="test-room", sender="sender-1", sender_name="Sender")
+    assert hub.MAX_SYNC_CONTROLS_PER_MINUTE == 2_700
+    assert all(hub.consume_sync_control(client) for _ in range(2_700))
+    assert not hub.consume_sync_control(client)
+    assert len(hub.sync_rate_buckets) == 1
+
+
+def test_sync_control_rate_limit_survives_reconnect_and_bucket_count_is_bounded(monkeypatch):
+    monkeypatch.setattr(hub, "MAX_SYNC_CONTROLS_PER_MINUTE", 1)
+    monkeypatch.setattr(hub, "MAX_SYNC_RATE_BUCKETS", 1)
+    with TestClient(hub.app) as client:
+        with client.websocket_connect("/ws") as first:
+            first.send_json(join_packet())
+            assert first.receive_json()["type"] == "joined"
+            assert first.receive_json()["type"] == "presence"
+            first.send_json(sync_inventory_packet())
+
+        assert hub.rooms == {}
+        assert len(hub.sync_rate_buckets) == 1
+        assert ("test-room", "sender-1") in hub.sync_rate_buckets
+
+        with client.websocket_connect("/ws") as reconnect:
+            reconnect.send_json(join_packet())
+            assert reconnect.receive_json()["type"] == "joined"
+            assert reconnect.receive_json()["type"] == "presence"
+            reconnect.send_json({**sync_inventory_packet(), "syncId": "sync-2"})
+            rejected = reconnect.receive_json()
+            assert rejected["type"] == "error"
+            assert rejected["code"] == "sync_rate_limited"
+
+        with client.websocket_connect("/ws") as new_sender:
+            new_sender.send_json(join_packet(sender="sender-2", name="Sender Two"))
+            assert new_sender.receive_json()["type"] == "joined"
+            assert new_sender.receive_json()["type"] == "presence"
+            new_sender.send_json(sync_inventory_packet(sender="sender-2"))
+            rejected_for_capacity = new_sender.receive_json()
+            assert rejected_for_capacity["type"] == "error"
+            assert rejected_for_capacity["code"] == "sync_rate_limited"
+            assert len(hub.sync_rate_buckets) == 1
