@@ -56,6 +56,12 @@ The final values must consider IndexedDB quota behavior, browser eviction,
 mobile memory and storage, reconnect traffic, and hub message size limits.
 Avoid holding the full file and all chunks in memory at once. Backpressure must
 pause production when the transport or receiver cannot accept more data.
+In particular, the current hub caps WebSocket frames at 32 KiB and protocol v1
+caps a message body at 16 KiB. A 64 KiB chunk cannot be sent through the current
+message envelope; JSON and base64 framing would increase its wire size further.
+A future design must choose and review a versioned binary or chunk framing
+format with transport-specific limits before using this provisional chunk
+size.
 
 ## Restart and integrity behavior
 
