@@ -1,0 +1,102 @@
+[
+  {
+    "name": "inventory acceptance and exact replay",
+    "operations": [
+      {
+        "kind": "inventory_page",
+        "value": {"version": 1, "type": "sync_inventory_page", "room": "room1", "syncId": "sync-1", "sender": "device-a", "cursor": null, "messageIds": ["a", "b"], "nextCursor": "b", "hasMore": true, "limitReached": false},
+        "expected": {"ok": true, "outcome": "accepted", "ids": ["a", "b"], "complete": false, "limitReached": false}
+      },
+      {
+        "kind": "inventory_page",
+        "value": {"version": 1, "type": "sync_inventory_page", "room": "room1", "syncId": "sync-1", "sender": "device-a", "cursor": null, "messageIds": ["a", "b"], "nextCursor": "b", "hasMore": true, "limitReached": false},
+        "expected": {"ok": true, "outcome": "duplicate", "ids": ["a", "b"], "complete": false, "limitReached": false}
+      }
+    ]
+  },
+  {
+    "name": "changed inventory page conflicts at the same cursor",
+    "operations": [
+      {
+        "kind": "inventory_page",
+        "value": {"version": 1, "type": "sync_inventory_page", "room": "room1", "syncId": "sync-1", "sender": "device-a", "cursor": null, "messageIds": ["a"], "nextCursor": "a", "hasMore": true, "limitReached": false},
+        "expected": {"ok": true, "outcome": "accepted", "ids": ["a"], "complete": false, "limitReached": false}
+      },
+      {
+        "kind": "inventory_page",
+        "value": {"version": 1, "type": "sync_inventory_page", "room": "room1", "syncId": "sync-1", "sender": "device-a", "cursor": null, "messageIds": ["a"], "nextCursor": "a", "hasMore": false, "limitReached": false},
+        "expected": {"ok": false, "code": "inventory_conflict"}
+      }
+    ]
+  },
+  {
+    "name": "inventory rejects an invalid cursor order",
+    "operations": [
+      {
+        "kind": "inventory_page",
+        "value": {"version": 1, "type": "sync_inventory_page", "room": "room1", "syncId": "sync-1", "sender": "device-a", "cursor": null, "messageIds": ["a", "b"], "nextCursor": "b", "hasMore": true, "limitReached": false},
+        "expected": {"ok": true, "outcome": "accepted", "ids": ["a", "b"], "complete": false, "limitReached": false}
+      },
+      {
+        "kind": "inventory_page",
+        "value": {"version": 1, "type": "sync_inventory_page", "room": "room1", "syncId": "sync-1", "sender": "device-a", "cursor": "a", "messageIds": ["c"], "nextCursor": "c", "hasMore": false, "limitReached": false},
+        "expected": {"ok": false, "code": "invalid_inventory_sequence"}
+      }
+    ]
+  },
+  {
+    "name": "request acceptance exact replay and request ID conflict",
+    "operations": [
+      {
+        "kind": "request",
+        "value": {"version": 1, "type": "sync_missing_request", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-a", "targetSender": "device-b", "messageIds": ["a", "c"]},
+        "expected": {"ok": true, "outcome": "accepted"}
+      },
+      {
+        "kind": "request",
+        "value": {"version": 1, "type": "sync_missing_request", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-a", "targetSender": "device-b", "messageIds": ["a", "c"]},
+        "expected": {"ok": true, "outcome": "duplicate"}
+      },
+      {
+        "kind": "request",
+        "value": {"version": 1, "type": "sync_missing_request", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-a", "targetSender": "device-b", "messageIds": ["b", "c"]},
+        "expected": {"ok": false, "code": "sync_request_conflict"}
+      }
+    ]
+  },
+  {
+    "name": "completion accepts requested IDs and rejects unrequested IDs",
+    "operations": [
+      {
+        "kind": "request",
+        "value": {"version": 1, "type": "sync_missing_request", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-a", "targetSender": "device-b", "messageIds": ["a", "c"]},
+        "expected": {"ok": true, "outcome": "accepted"}
+      },
+      {
+        "kind": "completion",
+        "value": {"version": 1, "type": "sync_page_complete", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-b", "targetSender": "device-a", "messageIds": ["c"]},
+        "expected": {"ok": true, "outcome": "accepted"}
+      },
+      {
+        "kind": "completion",
+        "value": {"version": 1, "type": "sync_page_complete", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-b", "targetSender": "device-a", "messageIds": ["a", "c"]},
+        "expected": {"ok": false, "code": "sync_request_conflict"}
+      }
+    ]
+  },
+  {
+    "name": "completion rejects an unrequested ID",
+    "operations": [
+      {
+        "kind": "request",
+        "value": {"version": 1, "type": "sync_missing_request", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-a", "targetSender": "device-b", "messageIds": ["a", "c"]},
+        "expected": {"ok": true, "outcome": "accepted"}
+      },
+      {
+        "kind": "completion",
+        "value": {"version": 1, "type": "sync_page_complete", "room": "room1", "syncId": "sync-1", "requestId": "request-1", "sender": "device-b", "targetSender": "device-a", "messageIds": ["b"]},
+        "expected": {"ok": false, "code": "invalid_sync_completion"}
+      }
+    ]
+  }
+]

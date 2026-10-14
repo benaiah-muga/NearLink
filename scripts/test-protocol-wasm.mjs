@@ -60,10 +60,16 @@ try {
     if (!condition) throw new Error(label);
   };
   const result = (value) => JSON.parse(value);
+  const stable = (value) => Array.isArray(value)
+    ? value.map(stable)
+    : value && typeof value === "object"
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]))
+      : value;
 
   try {
     await init();
     const vectors = await fetch("/vectors.json").then((response) => response.json());
+    const syncVectors = await fetch("/sync-state-vectors.json").then((response) => response.json());
     for (const vector of vectors) {
       const actual = result(validate_json(vector.validator, JSON.stringify(vector.value)));
       check(actual.ok && actual.valid === vector.valid, "protocol vector mismatch");
@@ -91,45 +97,28 @@ try {
     check(second.messages[0].id === "b" && !second.hasMore, "second page mismatch");
     check(result(index.insert_json(" ".repeat(18 * 1024 + 1))).code === "input_too_large", "input limit missing");
 
-    const inventory = new WasmSyncInventoryReceiver();
-    const inventoryPage = {
-      version: 1,
-      type: "sync_inventory_page",
-      room: "room1",
-      syncId: "sync-1",
-      sender: "device-a",
-      cursor: null,
-      messageIds: ["a", "b"],
-      nextCursor: "b",
-      hasMore: true,
-      limitReached: false,
-    };
-    check(result(inventory.accept_page_json(JSON.stringify(inventoryPage))).ids.join(",") === "a,b", "inventory state mismatch");
-    check(result(inventory.accept_page_json(JSON.stringify(inventoryPage))).outcome === "duplicate", "inventory replay mismatch");
-    const request = {
-      version: 1,
-      type: "sync_missing_request",
-      room: "room1",
-      syncId: "sync-1",
-      requestId: "request-1",
-      sender: "device-a",
-      targetSender: "device-b",
-      messageIds: ["a", "c"],
-    };
-    const requestBook = new WasmSyncRequestBook();
-    check(result(requestBook.register_request_json(JSON.stringify(request))).outcome === "accepted", "request state mismatch");
-    const completion = {
-      version: 1,
-      type: "sync_page_complete",
-      room: "room1",
-      syncId: "sync-1",
-      requestId: "request-1",
-      sender: "device-b",
-      targetSender: "device-a",
-      messageIds: ["c"],
-    };
-    check(result(requestBook.accept_completion_json(JSON.stringify(completion))).outcome === "accepted", "completion mismatch");
-    window.__protocolWasmResult = { ok: true, vectorCount: vectors.length };
+    for (const vector of syncVectors) {
+      const inventory = new WasmSyncInventoryReceiver();
+      const requests = new WasmSyncRequestBook();
+      for (const operation of vector.operations) {
+        const encoded = JSON.stringify(operation.value);
+        const actual = operation.kind === "inventory_page"
+          ? result(inventory.accept_page_json(encoded))
+          : operation.kind === "request"
+            ? result(requests.register_request_json(encoded))
+            : operation.kind === "completion"
+              ? result(requests.accept_completion_json(encoded))
+              : (() => { throw new Error("unknown sync vector operation"); })();
+        check(
+          JSON.stringify(stable(actual)) === JSON.stringify(stable(operation.expected)),
+          "sync state vector mismatch: " + vector.name + " (" + operation.kind + ")",
+        );
+        if (!actual.ok) {
+          check(Object.keys(actual).sort().join(",") === "code,ok", "sync error leaked packet data");
+        }
+      }
+    }
+    window.__protocolWasmResult = { ok: true, vectorCount: vectors.length, syncVectorCount: syncVectors.length };
   } catch (error) {
     window.__protocolWasmResult = { ok: false, error: String(error) };
   }
@@ -137,15 +126,19 @@ try {
   );
   const vectors = await readFile(path.join(root, "packages/protocol/vectors/v1.json"));
   await writeFile(path.join(temp, "vectors.json"), vectors);
+  const syncVectors = await readFile(path.join(root, "packages/protocol/vectors/sync-state-v1.json"));
+  await writeFile(path.join(temp, "sync-state-vectors.json"), syncVectors);
 
   server = createServer(async (request, response) => {
     const requested = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
     const filename = requested === "/vectors.json"
       ? "vectors.json"
-      : requested === "/"
-        ? "index.html"
-        : path.basename(requested);
-    if (filename !== "index.html" && filename !== "vectors.json" && !/^[\w.-]+$/.test(filename)) {
+      : requested === "/sync-state-vectors.json"
+        ? "sync-state-vectors.json"
+        : requested === "/"
+          ? "index.html"
+          : path.basename(requested);
+    if (filename !== "index.html" && filename !== "vectors.json" && filename !== "sync-state-vectors.json" && !/^[\w.-]+$/.test(filename)) {
       response.writeHead(404);
       response.end();
       return;
@@ -179,7 +172,7 @@ try {
   await page.waitForFunction(() => window.__protocolWasmResult !== undefined);
   const result = await page.evaluate(() => window.__protocolWasmResult);
   assert.equal(result.ok, true, result.error ?? "WebAssembly browser check failed");
-  console.log(`NEARLINK_PROTOCOL_WASM_BROWSER_OK vectors=${result.vectorCount}`);
+  console.log(`NEARLINK_PROTOCOL_WASM_BROWSER_OK vectors=${result.vectorCount} syncStateVectors=${result.syncVectorCount}`);
 } finally {
   await browser?.close();
   if (server) await new Promise((resolve) => server.close(resolve));

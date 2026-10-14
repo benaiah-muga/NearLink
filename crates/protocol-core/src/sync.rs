@@ -689,6 +689,82 @@ mod tests {
     }
 
     #[test]
+    fn shared_sync_state_vectors_match_core_outcomes() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/protocol/vectors/sync-state-v1.json"
+        ))
+        .expect("shared sync state vectors are valid JSON");
+
+        for vector in vectors.as_array().expect("vector list") {
+            let mut inventory = SyncInventoryReceiver::new();
+            let mut requests = SyncRequestBook::new();
+            for operation in vector["operations"].as_array().expect("operations") {
+                let value = operation["value"].clone();
+                let actual = match operation["kind"].as_str().expect("operation kind") {
+                    "inventory_page" => match inventory.accept_page(value) {
+                        Ok(outcome) => serde_json::json!({
+                            "ok": true,
+                            "outcome": match outcome {
+                                InventoryPageOutcome::Accepted => "accepted",
+                                InventoryPageOutcome::Duplicate => "duplicate",
+                            },
+                            "ids": inventory.ids(),
+                            "complete": inventory.is_complete(),
+                            "limitReached": inventory.limit_reached(),
+                        }),
+                        Err(error) => serde_json::json!({
+                            "ok": false,
+                            "code": match error {
+                                SyncError::InventoryConflict => "inventory_conflict",
+                                SyncError::InvalidInventorySequence => "invalid_inventory_sequence",
+                                _ => panic!("unexpected inventory vector error: {error}"),
+                            },
+                        }),
+                    },
+                    "request" => match requests.register_request(value) {
+                        Ok(outcome) => serde_json::json!({
+                            "ok": true,
+                            "outcome": match outcome {
+                                SyncRequestOutcome::Accepted => "accepted",
+                                SyncRequestOutcome::Duplicate => "duplicate",
+                            },
+                        }),
+                        Err(error) => serde_json::json!({
+                            "ok": false,
+                            "code": match error {
+                                SyncError::SyncRequestConflict => "sync_request_conflict",
+                                _ => panic!("unexpected request vector error: {error}"),
+                            },
+                        }),
+                    },
+                    "completion" => match requests.accept_completion(value) {
+                        Ok(outcome) => serde_json::json!({
+                            "ok": true,
+                            "outcome": match outcome {
+                                SyncRequestOutcome::Accepted => "accepted",
+                                SyncRequestOutcome::Duplicate => "duplicate",
+                            },
+                        }),
+                        Err(error) => serde_json::json!({
+                            "ok": false,
+                            "code": match error {
+                                SyncError::InvalidSyncCompletion => "invalid_sync_completion",
+                                SyncError::SyncRequestConflict => "sync_request_conflict",
+                                _ => panic!("unexpected completion vector error: {error}"),
+                            },
+                        }),
+                    },
+                    kind => panic!("unknown sync vector operation: {kind}"),
+                };
+                assert_eq!(actual, operation["expected"], "vector: {}", vector["name"]);
+                if actual["ok"] == false {
+                    assert_eq!(actual.as_object().expect("error result").len(), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn inventory_receiver_enforces_cursor_identity_order_and_idempotency() {
         let first = inventory_page("sync-1", None, &["a", "b"], true, false);
         let second = inventory_page("sync-1", Some("b"), &["c"], false, true);
