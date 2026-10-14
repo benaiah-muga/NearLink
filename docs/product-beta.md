@@ -140,6 +140,14 @@ JSON, full fingerprints, screenshots containing conversation content, or hub
 database files. These values can reveal private content, local network
 addresses, or persistent identifiers.
 
+The app's **Connection diagnostics** disclosure provides an optional summary of
+allowlisted hub, direct peer, protocol, and browser storage states. When the
+selected conversation is loaded and stable, it also includes message counts
+from that room's local rows. Counts are hidden while the conversation loads or
+changes. The summary excludes message content and station or room details. Use
+the copy button to copy it, or select the visible text area and copy manually
+if clipboard access is unavailable.
+
 ### Feedback checklist
 
 - App version or source commit, plus whether this was a packaged build or a

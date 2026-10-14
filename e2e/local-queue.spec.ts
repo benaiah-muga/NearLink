@@ -15,6 +15,12 @@ async function expectAccessible(page: import("@playwright/test").Page, state: st
 }
 
 test("saves a station profile and keeps a message queued through reload without a hub", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async () => { throw new Error("Clipboard access is blocked."); } },
+    });
+  });
   const hubAttempts: string[] = [];
   const hubSocketErrors: string[] = [];
   page.on("websocket", (socket) => {
@@ -25,6 +31,13 @@ test("saves a station profile and keeps a message queued through reload without 
   await page.goto("/");
   await expect(page.getByText("Messages save locally until a hub is connected")).toBeVisible();
   await expectAccessible(page, "the loaded station screen");
+  const diagnostics = page.locator(".diagnostics-panel");
+  const diagnosticsSummary = diagnostics.locator("summary");
+  await diagnosticsSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(diagnostics).toHaveAttribute("open", "");
+  await expect(diagnostics.getByText("Unavailable while the selected conversation loads or changes")).toBeVisible();
+  await expectAccessible(page, "diagnostics opened with the keyboard");
   await page.getByLabel("Your call sign").fill("Test Station");
   await page.getByLabel("Room frequency").fill("chromium-queue-check");
   await page.getByLabel("Hub address").fill("ws://127.0.0.1:1/ws");
@@ -41,6 +54,15 @@ test("saves a station profile and keeps a message queued through reload without 
   const messageLog = page.getByRole("log", { name: "Messages in chromium-queue-check" });
   await expect(messageLog.getByText(message)).toBeVisible();
   await expect(messageLog.getByText("Queued on this device")).toBeVisible();
+  await diagnostics.getByRole("button", { name: "Copy diagnostics summary" }).click();
+  const manualCopy = diagnostics.getByLabel("Copy this summary manually");
+  await expect(manualCopy).toBeVisible();
+  const copiedDiagnostics = await manualCopy.inputValue();
+  expect(copiedDiagnostics).not.toContain("chromium-queue-check");
+  expect(copiedDiagnostics).not.toContain("Test Station");
+  expect(copiedDiagnostics).not.toContain("127.0.0.1:1");
+  expect(copiedDiagnostics).not.toContain(message);
+  await expectAccessible(page, "the diagnostics manual-copy fallback");
   await expectAccessible(page, "the queued message screen");
 
   await page.reload();

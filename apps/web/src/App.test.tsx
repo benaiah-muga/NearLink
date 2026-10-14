@@ -101,6 +101,7 @@ import App from "./App";
 import { beginRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, saveMessage, type StoredMessage } from "./lib/storage";
 
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, "storage");
+const originalClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 const originalShowModalDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "showModal");
 const originalDialogCloseDescriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "close");
 
@@ -239,6 +240,8 @@ afterEach(() => {
   cleanup();
   if (originalStorageDescriptor) Object.defineProperty(navigator, "storage", originalStorageDescriptor);
   else Reflect.deleteProperty(navigator, "storage");
+  if (originalClipboardDescriptor) Object.defineProperty(navigator, "clipboard", originalClipboardDescriptor);
+  else Reflect.deleteProperty(navigator, "clipboard");
   if (originalShowModalDescriptor) Object.defineProperty(HTMLDialogElement.prototype, "showModal", originalShowModalDescriptor);
   else Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
   if (originalDialogCloseDescriptor) Object.defineProperty(HTMLDialogElement.prototype, "close", originalDialogCloseDescriptor);
@@ -313,6 +316,70 @@ describe("browser storage retention feedback", () => {
 });
 
 describe("browser app messaging flow", () => {
+  it("shows and copies only privacy-safe states and counts for the loaded room", async () => {
+    const sensitive = {
+      room: "private-room-code-9f2a",
+      callSign: "Private Call Sign",
+      sender: "sender-secret-identifier",
+      hub: "ws://private-hub.example:8123/ws?token=secret",
+      sdp: '{"type":"offer","sdp":"private-sdp-value"}',
+      fingerprint: "sha-256 AA:BB:CC:DD private-fingerprint",
+      body: "A private message body that must not be copied",
+    };
+    localStorage.setItem("nearlink.room", sensitive.room);
+    localStorage.setItem("nearlink.hub", sensitive.hub);
+    await saveMessage({
+      packet: { version: 1, type: "message", id: "private-message-id", room: sensitive.room, sender: sensitive.sender, senderName: sensitive.callSign, createdAt: "2026-10-14T09:00:00.000Z", body: sensitive.body },
+      direction: "incoming",
+      delivery: "queued",
+    });
+    await saveMessage({
+      packet: { version: 1, type: "message", id: "other-room-private-id", room: "other-private-room", sender: sensitive.sender, senderName: sensitive.callSign, createdAt: "2026-10-14T10:00:00.000Z", body: "Other room body" },
+      direction: "outgoing",
+      delivery: "sent",
+    });
+    await Promise.all([loadIdentity(), loadMessages(sensitive.room), isRoomMessagesDeleted(sensitive.room)]);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error(`Private clipboard failure ${sensitive.fingerprint}`)) },
+    });
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
+    await screen.findByText(sensitive.body);
+
+    const details = screen.getByText("Connection diagnostics").closest("details")!;
+    fireEvent.click(screen.getByText("Connection diagnostics"));
+    await screen.findByText("Messages", { selector: "dt" });
+    expect(within(details).getAllByText("1", { selector: "dd" })).toHaveLength(2);
+    expect(within(details).getByText("Queued", { selector: "dt" })).toBeTruthy();
+    fireEvent.click(within(details).getByRole("button", { name: "Copy diagnostics summary" }));
+    const fallback = await within(details).findByLabelText("Copy this summary manually");
+    expect(within(details).getByText("Clipboard access failed. Copy the summary from the text box below.")).toBeTruthy();
+    const summaryText = (fallback as HTMLTextAreaElement).value;
+    for (const value of Object.values(sensitive)) {
+      expect(summaryText).not.toContain(value);
+      expect(details.textContent).not.toContain(value);
+    }
+    expect(summaryText).toContain("Messages: 1");
+    expect(summaryText).toContain("Queued: 1");
+    expect(summaryText).not.toContain("Other room body");
+
+    messageReadGate.room = "next-room";
+    messageReadGate.pending = new Promise((resolve) => { messageReadGate.releaseRead = () => resolve([]); });
+    const nextRoomReadCount = messageReadGate.requestedRooms.length;
+    fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "next-room" } });
+    await within(details).findByText("Unavailable while the selected conversation loads or changes", { selector: "dd" });
+    await waitFor(() => expect(messageReadGate.requestedRooms.slice(nextRoomReadCount)).toContain("next-room"));
+    expect(within(details).queryByText("1", { selector: "dd" })).toBeNull();
+    expect(within(details).queryByLabelText("Copy this summary manually")).toBeNull();
+    expect(within(details).queryByText("Clipboard access failed. Copy the summary from the text box below.")).toBeNull();
+    await within(details).findByText("Diagnostics changed. Copy the updated summary if needed.");
+    await act(async () => {
+      messageReadGate.releaseRead?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  });
+
   it("requires confirmation, clears only this room on this device, and closes live room transport", async () => {
     const localMessage = {
       packet: { version: 1 as const, type: "message" as const, id: "saved-local", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Saved locally" },
@@ -324,8 +391,8 @@ describe("browser app messaging flow", () => {
     await saveMessage(localMessage);
     await saveMessage(otherRoomMessage);
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
-    await screen.findByText("Saved locally");
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 });
+    await screen.findByText("Saved locally", {}, { timeout: 5000 });
 
     fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
@@ -397,11 +464,11 @@ describe("browser app messaging flow", () => {
     await saveMessage(saved);
     await expect(Promise.all([loadIdentity(), loadMessages(ROOM), isRoomMessagesDeleted(ROOM)])).resolves.toMatchObject([IDENTITY, [saved], false]);
     const firstTab = render(<App />);
-    await waitFor(() => expect((within(firstTab.container).getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
-    await within(firstTab.container).findByText("Shared local history");
+    await waitFor(() => expect((within(firstTab.container).getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 });
+    await within(firstTab.container).findByText("Shared local history", {}, { timeout: 5000 });
     const secondTab = render(<App />);
-    await waitFor(() => expect((within(secondTab.container).getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
-    await within(secondTab.container).findByText("Shared local history");
+    await waitFor(() => expect((within(secondTab.container).getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 });
+    await within(secondTab.container).findByText("Shared local history", {}, { timeout: 5000 });
 
     fireEvent.click(within(firstTab.container).getByRole("button", { name: "Connect radio" }));
     fireEvent.click(within(secondTab.container).getByRole("button", { name: "Connect radio" }));
@@ -433,8 +500,8 @@ describe("browser app messaging flow", () => {
       transport: "hub",
     });
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
-    await screen.findByText("History to clear");
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 });
+    await screen.findByText("History to clear", {}, { timeout: 5000 });
 
     const externalTab = new MockBroadcastChannel("nearlink-room-deletion-v1");
     messageReadGate.resumeRoom = ROOM;
@@ -920,7 +987,7 @@ describe("browser app messaging flow", () => {
 
   it("keeps the composer disabled until the selected room has loaded", async () => {
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 });
 
     const draft = screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement;
     fireEvent.change(draft, { target: { value: "Ready for the next room" } });

@@ -123,6 +123,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .notice-banner:focus { outline: 2px solid #8b6a29; outline-offset: 2px; }
 .notice-banner > span { display: grid; flex: 0 0 17px; width: 17px; height: 17px; place-items: center; border-radius: 50%; color: white; background: #a58643; font-family: Georgia, serif; }
 .notice-banner button { margin-left: auto; padding: 0 3px; border: 0; color: inherit; background: transparent; font-size: 17px; }
+.diagnostics-panel { margin: 0 44px 14px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 3px; color: #53574d; background: #f6f5ef; font-size: 10px; }
+.diagnostics-panel summary { width: fit-content; min-height: 26px; color: var(--green); font-size: 11px; font-weight: 700; cursor: pointer; }
+.diagnostics-panel summary:focus-visible, .diagnostics-copy:focus-visible { outline: 2px solid #8b6a29; outline-offset: 3px; }
+.diagnostics-panel > p { margin: 5px 0 10px; line-height: 1.5; }
+.diagnostics-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 0 0 10px; }
+.diagnostics-grid > div { min-width: 0; }
+.diagnostics-grid dt { color: #66685f; font-size: 8px; letter-spacing: .04em; text-transform: uppercase; }
+.diagnostics-grid dd { margin: 3px 0 0; overflow-wrap: anywhere; color: #29382e; font-size: 10px; font-variant-numeric: tabular-nums; }
+.diagnostics-grid .diagnostics-unavailable { grid-column: 1 / -1; }
+.diagnostics-copy { min-height: 34px; padding: 7px 10px; border: 1px solid #536c57; border-radius: 3px; color: #f8f7f0; background: var(--green); font-size: 10px; }
+.diagnostics-copy-status { margin: 8px 0 0 !important; color: #4d604e; }
+.diagnostics-manual-copy { display: grid; gap: 5px; margin-top: 9px; }
+.diagnostics-manual-copy label { color: #39463a; font-weight: 700; }
+.diagnostics-manual-copy textarea { width: 100%; min-height: 130px; padding: 9px; border: 1px solid #c9c8bd; border-radius: 3px; color: #343a33; background: #fffef9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; line-height: 1.5; resize: vertical; }
+.diagnostics-manual-copy textarea:focus-visible { outline: 2px solid #8b6a29; outline-offset: 2px; }
 .delete-room-confirmation[open] { display: block; width: min(760px, calc(100vw - 32px)); max-width: 760px; margin: auto; padding: 16px; border: 1px solid #dbcfaa; border-radius: 3px; color: #5d533a; background: #f6f0da; }
 .delete-room-confirmation::backdrop { background: #17201d80; }
 .delete-room-confirmation h2 { margin: 0; color: #4e4430; font-size: 13px; }
@@ -184,6 +199,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
   .station-shell { grid-template-columns: 268px minmax(0, 1fr); }
   .station-sidebar { padding-right: 19px; padding-left: 19px; }
   .conversation-header { padding: 0 26px; }
+  .diagnostics-panel { margin-right: 26px; margin-left: 26px; }
   .message-scroll, .composer-wrap { padding-right: 26px; padding-left: 26px; }
 }
 @media (min-width: 681px) and (max-height: 640px) {
@@ -219,6 +235,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
   .conversation-panel { flex: 1 0 420px; min-height: 420px; }
   .conversation-header { min-height: 64px; padding: 10px 18px; flex-wrap: wrap; gap: 8px; }
   .clear-room-button { margin-left: auto; }
+  .diagnostics-panel { margin-right: 18px; margin-left: 18px; }
+  .diagnostics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .room-ident { gap: 9px; }.room-symbol { width: 30px; height: 30px; flex-basis: 30px; font-size: 21px; }
   .room-ident .eyebrow { font-size: 7px; }.room-ident h1 { max-width: 45vw; font-size: 13px; }
   .header-right { gap: 12px; }.connection-status { gap: 7px; }.connection-status strong { font-size: 9px; }.connection-status small { font-size: 8px; }

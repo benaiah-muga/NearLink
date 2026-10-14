@@ -3,6 +3,7 @@ import type { FormEvent, KeyboardEvent } from "react";
 import { PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
 import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, requestStoragePersistence, resumeRoomMessages, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
+import { buildDiagnosticsSummary, formatDiagnosticsSummary } from "./lib/diagnostics";
 import { initializeWasmProtocol, MAX_PROTOCOL_ENVELOPE_BYTES, validateJsonWithWasm, validateWithWasm } from "./lib/wasmProtocol";
 
 type LinkState = "offline" | "connecting" | "linking" | "online" | "retrying" | "error";
@@ -118,6 +119,8 @@ function App() {
   const [deletingRoom, setDeletingRoom] = useState(false);
   const [roomDeletedLocally, setRoomDeletedLocally] = useState(false);
   const [sendTransport, setSendTransport] = useState<"hub" | "direct">("hub");
+  const [diagnosticsCopyStatus, setDiagnosticsCopyStatus] = useState("");
+  const [manualDiagnosticsText, setManualDiagnosticsText] = useState<string | null>(null);
   const roomDeletionDialogRef = useRef<HTMLDialogElement>(null);
   const roomDeletionOpenerRef = useRef<HTMLElement | null>(null);
   const deletionStatusRef = useRef<HTMLDivElement>(null);
@@ -547,6 +550,31 @@ function App() {
   const normalizedName = displayName.trim();
   const conversationLoaded = storageReady && conversationReady && loadedRoom === room.trim();
   const composerReady = conversationLoaded && !roomDeletedLocally;
+  const diagnosticsCountsReady = Boolean(room.trim() && conversationLoaded && !deletingRoom);
+  const diagnosticsRows = diagnosticsCountsReady ? messages.filter((item) => item.packet.room === room.trim()) : [];
+  const diagnosticsSummary = buildDiagnosticsSummary({
+    hubState: linkState,
+    directState,
+    protocolState: wasmFailed ? "unavailable" : wasmReady ? "ready" : "loading",
+    storageState: storagePersistence,
+    conversationReady: diagnosticsCountsReady,
+    messageCounts: diagnosticsCountsReady ? {
+      total: diagnosticsRows.length,
+      queued: diagnosticsRows.filter((item) => item.delivery === "queued").length,
+      sent: diagnosticsRows.filter((item) => item.delivery === "sent").length,
+      failed: diagnosticsRows.filter((item) => item.delivery === "failed").length,
+    } : null,
+  });
+  const diagnosticsText = formatDiagnosticsSummary(diagnosticsSummary);
+  const showManualDiagnostics = manualDiagnosticsText === diagnosticsText;
+  const diagnosticsSummaryChangedAfterCopyFailure = manualDiagnosticsText !== null && !showManualDiagnostics;
+  const visibleDiagnosticsCopyStatus = diagnosticsSummaryChangedAfterCopyFailure ? "" : diagnosticsCopyStatus;
+
+  useEffect(() => {
+    if (!diagnosticsSummaryChangedAfterCopyFailure) return;
+    setManualDiagnosticsText(null);
+    setDiagnosticsCopyStatus("Diagnostics changed. Copy the updated summary if needed.");
+  }, [diagnosticsSummaryChangedAfterCopyFailure, diagnosticsText]);
   const profileReady = Boolean(wasmReady && profileSaved && identity?.senderName.trim() && identity.senderName.trim() === normalizedName && validateWithWasm("identifier", identity.sender) && isValidCallSign(identity.senderName) && validateWithWasm("room", room.trim()));
   const canJoin = Boolean(profileReady && room.trim() && hubUrl.trim());
   const canSaveProfile = Boolean(wasmReady && identity && validateWithWasm("identifier", identity.sender) && isValidCallSign(normalizedName) && validateWithWasm("room", room.trim()) && (sendTransport === "direct" || hubUrl.trim()));
@@ -992,6 +1020,24 @@ function App() {
     setIsInstallable(false);
   }
 
+  async function copyDiagnostics() {
+    const text = diagnosticsText;
+    setDiagnosticsCopyStatus("");
+    setManualDiagnosticsText(null);
+    if (!navigator.clipboard?.writeText) {
+      setManualDiagnosticsText(text);
+      setDiagnosticsCopyStatus("Clipboard access is unavailable. Copy the summary from the text box below.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setDiagnosticsCopyStatus("Diagnostics summary copied.");
+    } catch {
+      setManualDiagnosticsText(text);
+      setDiagnosticsCopyStatus("Clipboard access failed. Copy the summary from the text box below.");
+    }
+  }
+
   const groups: { label: string; items: StoredMessage[] }[] = [];
   for (const item of sortedMessages) {
     const label = formatDate(item.packet.createdAt);
@@ -1084,6 +1130,29 @@ function App() {
           </div>
           <button type="button" className="clear-room-button" disabled={!room.trim() || !conversationReady || deletingRoom} onClick={(event) => { roomDeletionOpenerRef.current = event.currentTarget; setConfirmRoomDeletion(true); }}>Clear this device's saved conversation</button>
         </header>
+
+        <details className="diagnostics-panel">
+          <summary>Connection diagnostics</summary>
+          <p>Share these connection states and counts when asking for support. Message content and station details are not included.</p>
+          <dl className="diagnostics-grid">
+            <div><dt>Hub</dt><dd>{diagnosticsSummary.hub}</dd></div>
+            <div><dt>Direct peer</dt><dd>{diagnosticsSummary.direct}</dd></div>
+            <div><dt>Protocol checks</dt><dd>{diagnosticsSummary.protocol}</dd></div>
+            <div><dt>Browser storage</dt><dd>{diagnosticsSummary.storage}</dd></div>
+            {diagnosticsSummary.conversation.counts ? <>
+              <div><dt>Messages</dt><dd>{diagnosticsSummary.conversation.counts.total}</dd></div>
+              <div><dt>Queued</dt><dd>{diagnosticsSummary.conversation.counts.queued}</dd></div>
+              <div><dt>Sent</dt><dd>{diagnosticsSummary.conversation.counts.sent}</dd></div>
+              <div><dt>Failed</dt><dd>{diagnosticsSummary.conversation.counts.failed}</dd></div>
+            </> : <div className="diagnostics-unavailable"><dt>Message counts</dt><dd>Unavailable while the selected conversation loads or changes</dd></div>}
+          </dl>
+          <button type="button" className="diagnostics-copy" onClick={() => void copyDiagnostics()}>Copy diagnostics summary</button>
+          {visibleDiagnosticsCopyStatus && <p className="diagnostics-copy-status" role="status" aria-live="polite">{visibleDiagnosticsCopyStatus}</p>}
+          {showManualDiagnostics && <div className="diagnostics-manual-copy">
+            <label htmlFor="diagnostics-manual-text">Copy this summary manually</label>
+            <textarea id="diagnostics-manual-text" rows={7} readOnly value={manualDiagnosticsText ?? ""} />
+          </div>}
+        </details>
 
         <dialog ref={roomDeletionDialogRef} aria-labelledby="delete-room-title" aria-describedby="delete-room-description" className="delete-room-confirmation" onCancel={() => setConfirmRoomDeletion(false)}>
           <h2 id="delete-room-title">Clear saved messages for {room.trim()}?</h2>
