@@ -165,6 +165,8 @@ describe("direct peer app flow", () => {
     fireEvent.change(screen.getByLabelText(/Fingerprint compared in person/), { target: { value: FINGERPRINT } });
     fireEvent.click(screen.getByRole("button", { name: "Compare fingerprints" }));
     await screen.findByText(/Fingerprint matches this DTLS session/);
+    fireEvent.change(screen.getByLabelText("Message transport"), { target: { value: "direct" } });
+    expect(screen.getByText("Session fingerprint compared")).toBeTruthy();
     await waitFor(() => expect(transport.sent).toHaveLength(1));
     expect(JSON.parse(transport.sent[0])).toEqual(unverifiedQueued?.packet);
     fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Hello peer" } });
