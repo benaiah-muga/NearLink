@@ -13,8 +13,9 @@
 //! identity, authentication, encryption, or transport behavior.
 
 use nearlink_protocol_core::sync::{
-    InsertOutcome, InventoryPageOutcome, MessageIndex, SyncError, SyncInventoryReceiver,
-    SyncRequestBook, SyncRequestOutcome, MAX_ENVELOPE_BYTES,
+    plan_missing_batch, InsertOutcome, InventoryPageOutcome, MessageIndex, MissingIdSelector,
+    SyncError, SyncInventoryReceiver, SyncRequestBook, SyncRequestOutcome, MAX_ENVELOPE_BYTES,
+    MAX_SYNC_SELECTION_CHUNK_IDS,
 };
 use nearlink_protocol_core::{
     is_client_packet, is_history_page_complete_packet, is_history_request_packet, is_join_packet,
@@ -157,6 +158,103 @@ pub fn validate_json(validator: &str, value_json: &str) -> String {
         _ => return error_json(ErrorCode::UnknownValidator),
     };
     json!({"ok": true, "valid": valid}).to_string()
+}
+
+/// Return one bounded message-ID batch from a sorted missing-ID plan.
+#[wasm_bindgen]
+pub fn plan_missing_batch_json(missing_ids_json: &str, offset: usize) -> String {
+    if missing_ids_json.len() > MAX_KNOWN_IDS_JSON_BYTES {
+        return error_json(ErrorCode::InputTooLarge);
+    }
+    let missing_ids: Vec<String> = match serde_json::from_str(missing_ids_json) {
+        Ok(ids) => ids,
+        Err(_) => return error_json(ErrorCode::InvalidJson),
+    };
+    match plan_missing_batch(&missing_ids, offset) {
+        Ok(ids) => {
+            let next_offset = offset + ids.len();
+            json!({
+                "ok": true,
+                "ids": ids,
+                "nextOffset": next_offset,
+                "hasMore": next_offset < missing_ids.len(),
+            })
+            .to_string()
+        }
+        Err(error) => sync_error_json(error),
+    }
+}
+
+/// Stateful bounded selector comparing a peer's inventory with local IDs.
+/// The local snapshot is streamed in chunks so local history may exceed the
+/// peer inventory limit without allocating a second unbounded set in WASM.
+#[wasm_bindgen]
+pub struct WasmMissingIdSelector {
+    inner: Result<MissingIdSelector, ErrorCode>,
+}
+
+#[wasm_bindgen]
+impl WasmMissingIdSelector {
+    /// Construct from a unique, ascending peer inventory of at most 4,096 IDs.
+    #[wasm_bindgen(constructor)]
+    pub fn new(peer_ids_json: &str) -> WasmMissingIdSelector {
+        if peer_ids_json.len() > MAX_KNOWN_IDS_JSON_BYTES {
+            return WasmMissingIdSelector {
+                inner: Err(ErrorCode::InputTooLarge),
+            };
+        }
+        let peer_ids: Vec<String> = match serde_json::from_str(peer_ids_json) {
+            Ok(ids) => ids,
+            Err(_) => {
+                return WasmMissingIdSelector {
+                    inner: Err(ErrorCode::InvalidJson),
+                }
+            }
+        };
+        WasmMissingIdSelector {
+            inner: MissingIdSelector::new(&peer_ids).map_err(ErrorCode::from),
+        }
+    }
+
+    /// Check whether construction succeeded without throwing across the JS boundary.
+    pub fn status_json(&self) -> String {
+        match &self.inner {
+            Ok(_) => "{\"ok\":true}".to_owned(),
+            Err(error) => error_json(*error),
+        }
+    }
+
+    /// Observe one local-ID chunk. Each chunk is limited to 4,096 IDs.
+    pub fn observe_local_ids_json(&mut self, local_ids_json: &str) -> String {
+        if local_ids_json.len() > MAX_KNOWN_IDS_JSON_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let local_ids: Vec<String> = match serde_json::from_str(local_ids_json) {
+            Ok(ids) => ids,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        if local_ids.len() > MAX_SYNC_SELECTION_CHUNK_IDS {
+            return sync_error_json(SyncError::InvalidPageLimit);
+        }
+        match &mut self.inner {
+            Ok(selector) => match selector.observe_local_ids(&local_ids) {
+                Ok(()) => "{\"ok\":true}".to_owned(),
+                Err(error) => sync_error_json(error),
+            },
+            Err(error) => error_json(*error),
+        }
+    }
+
+    /// Finish the local scan and return the peer IDs not present locally.
+    pub fn finish_json(&mut self) -> String {
+        match &mut self.inner {
+            Ok(selector) => match selector.finish() {
+                Ok(missing_ids) => json!({ "ok": true, "missingIds": missing_ids }).to_string(),
+                Err(error) => sync_error_json(error),
+            },
+            Err(error) => error_json(*error),
+        }
+    }
 }
 
 /// Stateful facade around one room-scoped bounded message index.
@@ -482,6 +580,38 @@ mod tests {
         assert_eq!(
             parse_result(&index.page_json(&oversized_ids, None, 1)),
             json!({"ok": false, "code": "input_too_large"})
+        );
+    }
+
+    #[test]
+    fn missing_id_selector_and_batch_inputs_are_bounded() {
+        let oversized = " ".repeat(MAX_KNOWN_IDS_JSON_BYTES + 1);
+        assert_eq!(
+            parse_result(&WasmMissingIdSelector::new(&oversized).status_json()),
+            json!({"ok": false, "code": "input_too_large"})
+        );
+        assert_eq!(
+            parse_result(&plan_missing_batch_json(&oversized, 0)),
+            json!({"ok": false, "code": "input_too_large"})
+        );
+
+        let mut selector = WasmMissingIdSelector::new("[\"peer\"]");
+        assert_eq!(
+            parse_result(&selector.observe_local_ids_json(&oversized)),
+            json!({"ok": false, "code": "input_too_large"})
+        );
+        let too_many_local_ids =
+            serde_json::to_string(&vec!["peer"; MAX_SYNC_SELECTION_CHUNK_IDS + 1])
+                .expect("local IDs encode");
+        assert_eq!(
+            parse_result(&selector.observe_local_ids_json(&too_many_local_ids)),
+            json!({"ok": false, "code": "invalid_page_limit"})
+        );
+        let too_many_peer_ids =
+            serde_json::to_string(&vec!["peer"; 4_097]).expect("peer IDs encode");
+        assert_eq!(
+            parse_result(&WasmMissingIdSelector::new(&too_many_peer_ids).status_json()),
+            json!({"ok": false, "code": "known_id_limit"})
         );
     }
 

@@ -99,4 +99,49 @@
       }
     ]
   }
+,
+  {
+    "name": "missing selection keeps peer order and excludes locally accepted IDs",
+    "operations": [
+      {"kind":"selector_start","value":{"peerIds":["a","b","c","d"]},"expected":{"ok":true}},
+      {"kind":"selector_local","value":{"localIds":["b","d"]},"expected":{"ok":true}},
+      {"kind":"selector_finish","value":{},"expected":{"ok":true,"missingIds":["a","c"]}}
+    ]
+  },
+  {
+    "name": "missing selection rejects an unsorted peer inventory",
+    "operations": [
+      {"kind":"selector_start","value":{"peerIds":["b","a"]},"expected":{"ok":false,"code":"invalid_identifier"}}
+    ]
+  },
+  {
+    "name": "empty selection returns no missing IDs",
+    "operations": [
+      {"kind":"selector_start","value":{"peerIds":[]},"expected":{"ok":true}},
+      {"kind":"selector_local","value":{"localIds":[]},"expected":{"ok":true}},
+      {"kind":"selector_finish","value":{},"expected":{"ok":true,"missingIds":[]}}
+    ]
+  },
+  {
+    "name": "duplicate local IDs are idempotent during missing selection",
+    "operations": [
+      {"kind":"selector_start","value":{"peerIds":["a","b","c"]},"expected":{"ok":true}},
+      {"kind":"selector_local","value":{"localIds":["b","b"]},"expected":{"ok":true}},
+      {"kind":"selector_local","value":{"localIds":["b"]},"expected":{"ok":true}},
+      {"kind":"selector_finish","value":{},"expected":{"ok":true,"missingIds":["a","c"]}}
+    ]
+  },
+  {
+    "name": "missing IDs are planned in bounded deterministic batches",
+    "operations": [
+    {"kind":"plan_batch","value":{"missingIds":["id000","id001","id002","id003","id004","id005","id006","id007","id008","id009","id010","id011","id012","id013","id014","id015","id016","id017","id018","id019","id020","id021","id022","id023","id024","id025","id026","id027","id028","id029","id030","id031","id032","id033","id034","id035","id036","id037","id038","id039","id040","id041","id042","id043","id044","id045","id046","id047","id048","id049","id050","id051","id052","id053","id054","id055","id056","id057","id058","id059","id060","id061","id062","id063","id064","id065","id066","id067","id068","id069","id070","id071","id072","id073","id074","id075","id076","id077","id078","id079","id080","id081","id082","id083","id084","id085","id086","id087","id088","id089","id090","id091","id092","id093","id094","id095","id096","id097","id098","id099","id100"],"offset":0},"expected":{"ok":true,"ids":["id000","id001","id002","id003","id004","id005","id006","id007","id008","id009","id010","id011","id012","id013","id014","id015","id016","id017","id018","id019","id020","id021","id022","id023","id024","id025","id026","id027","id028","id029","id030","id031","id032","id033","id034","id035","id036","id037","id038","id039","id040","id041","id042","id043","id044","id045","id046","id047","id048","id049","id050","id051","id052","id053","id054","id055","id056","id057","id058","id059","id060","id061","id062","id063","id064","id065","id066","id067","id068","id069","id070","id071","id072","id073","id074","id075","id076","id077","id078","id079","id080","id081","id082","id083","id084","id085","id086","id087","id088","id089","id090","id091","id092","id093","id094","id095","id096","id097","id098","id099"],"nextOffset":100,"hasMore":true}},
+    {"kind":"plan_batch","value":{"missingIds":["id000","id001","id002","id003","id004","id005","id006","id007","id008","id009","id010","id011","id012","id013","id014","id015","id016","id017","id018","id019","id020","id021","id022","id023","id024","id025","id026","id027","id028","id029","id030","id031","id032","id033","id034","id035","id036","id037","id038","id039","id040","id041","id042","id043","id044","id045","id046","id047","id048","id049","id050","id051","id052","id053","id054","id055","id056","id057","id058","id059","id060","id061","id062","id063","id064","id065","id066","id067","id068","id069","id070","id071","id072","id073","id074","id075","id076","id077","id078","id079","id080","id081","id082","id083","id084","id085","id086","id087","id088","id089","id090","id091","id092","id093","id094","id095","id096","id097","id098","id099","id100"],"offset":100},"expected":{"ok":true,"ids":["id100"],"nextOffset":101,"hasMore":false}}
+    ]
+  },
+  {
+    "name": "missing batch rejects offsets beyond the plan",
+    "operations": [
+    {"kind":"plan_batch","value":{"missingIds":["a"],"offset":2},"expected":{"ok":false,"code":"invalid_page_limit"}}
+    ]
+  }
 ]

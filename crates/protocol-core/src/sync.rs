@@ -57,6 +57,82 @@ pub const MAX_KNOWN_IDS: usize = 4_096;
 pub const MAX_PAGE_MESSAGES: usize = 128;
 /// Maximum aggregate compact JSON packet size returned in one page.
 pub const MAX_PAGE_BYTES: usize = 512 * 1024;
+/// Maximum number of local IDs accepted in one missing-ID scan chunk.
+pub const MAX_SYNC_SELECTION_CHUNK_IDS: usize = 4_096;
+
+/// Bounded selector for a peer inventory and a streaming local-ID scan.
+/// Only the peer's bounded inventory and one membership bit per peer ID are
+/// retained. Local IDs may be supplied in any number of bounded chunks.
+#[derive(Debug, Clone)]
+pub struct MissingIdSelector {
+    peer_ids: Vec<String>,
+    locally_present: Vec<bool>,
+    finished: bool,
+}
+
+impl MissingIdSelector {
+    /// Construct a selector from one unique, ordered peer inventory.
+    pub fn new(peer_ids: &[String]) -> Result<Self, SyncError> {
+        validate_ordered_ids(peer_ids)?;
+        Ok(Self {
+            peer_ids: peer_ids.to_vec(),
+            locally_present: vec![false; peer_ids.len()],
+            finished: false,
+        })
+    }
+
+    /// Record membership matches from one bounded local-ID chunk.
+    /// Repeated local IDs are idempotent, matching set membership semantics.
+    pub fn observe_local_ids(&mut self, local_ids: &[String]) -> Result<(), SyncError> {
+        if self.finished || local_ids.len() > MAX_SYNC_SELECTION_CHUNK_IDS {
+            return Err(SyncError::InvalidPageLimit);
+        }
+        for local_id in local_ids {
+            if !is_protocol_identifier(local_id) {
+                return Err(SyncError::InvalidIdentifier);
+            }
+            if let Ok(index) = self.peer_ids.binary_search(local_id) {
+                self.locally_present[index] = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize the local scan and return peer IDs not found locally.
+    pub fn finish(&mut self) -> Result<Vec<String>, SyncError> {
+        if self.finished {
+            return Err(SyncError::InvalidPageLimit);
+        }
+        self.finished = true;
+        Ok(self
+            .peer_ids
+            .iter()
+            .zip(&self.locally_present)
+            .filter_map(|(peer_id, present)| (!present).then_some(peer_id.clone()))
+            .collect())
+    }
+}
+
+/// Return one deterministic, protocol-sized batch from a missing-ID plan.
+pub fn plan_missing_batch(missing_ids: &[String], offset: usize) -> Result<Vec<String>, SyncError> {
+    validate_ordered_ids(missing_ids)?;
+    if offset > missing_ids.len() {
+        return Err(SyncError::InvalidPageLimit);
+    }
+    Ok(missing_ids[offset..(offset + crate::MAX_SYNC_PACKET_IDS).min(missing_ids.len())].to_vec())
+}
+
+fn validate_ordered_ids(ids: &[String]) -> Result<(), SyncError> {
+    if ids.len() > MAX_SYNC_INVENTORY_IDS {
+        return Err(SyncError::KnownIdLimit);
+    }
+    if ids.iter().any(|id| !is_protocol_identifier(id))
+        || ids.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SyncError::InvalidIdentifier);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndexedMessage {
@@ -698,9 +774,88 @@ mod tests {
         for vector in vectors.as_array().expect("vector list") {
             let mut inventory = SyncInventoryReceiver::new();
             let mut requests = SyncRequestBook::new();
+            let mut selector: Option<MissingIdSelector> = None;
             for operation in vector["operations"].as_array().expect("operations") {
                 let value = operation["value"].clone();
                 let actual = match operation["kind"].as_str().expect("operation kind") {
+                    "selector_start" => {
+                        let peer_ids: Vec<String> =
+                            serde_json::from_value(value["peerIds"].clone()).expect("peer IDs");
+                        match MissingIdSelector::new(&peer_ids) {
+                            Ok(created) => {
+                                selector = Some(created);
+                                serde_json::json!({ "ok": true })
+                            }
+                            Err(error) => serde_json::json!({
+                                "ok": false,
+                                "code": match error {
+                                    SyncError::KnownIdLimit => "known_id_limit",
+                                    SyncError::InvalidIdentifier => "invalid_identifier",
+                                    _ => panic!("unexpected selector creation error: {error}"),
+                                },
+                            }),
+                        }
+                    }
+                    "selector_local" => {
+                        let local_ids: Vec<String> =
+                            serde_json::from_value(value["localIds"].clone()).expect("local IDs");
+                        match selector
+                            .as_mut()
+                            .expect("selector initialized")
+                            .observe_local_ids(&local_ids)
+                        {
+                            Ok(()) => serde_json::json!({ "ok": true }),
+                            Err(error) => serde_json::json!({
+                                "ok": false,
+                                "code": match error {
+                                    SyncError::InvalidPageLimit => "invalid_page_limit",
+                                    SyncError::InvalidIdentifier => "invalid_identifier",
+                                    _ => panic!("unexpected local scan error: {error}"),
+                                },
+                            }),
+                        }
+                    }
+                    "selector_finish" => {
+                        match selector.as_mut().expect("selector initialized").finish() {
+                            Ok(missing_ids) => {
+                                serde_json::json!({ "ok": true, "missingIds": missing_ids })
+                            }
+                            Err(error) => serde_json::json!({
+                                "ok": false,
+                                "code": match error {
+                                    SyncError::InvalidPageLimit => "invalid_page_limit",
+                                    _ => panic!("unexpected selector finish error: {error}"),
+                                },
+                            }),
+                        }
+                    }
+                    "plan_batch" => {
+                        let missing_ids: Vec<String> =
+                            serde_json::from_value(value["missingIds"].clone())
+                                .expect("missing IDs");
+                        let offset: usize =
+                            serde_json::from_value(value["offset"].clone()).expect("batch offset");
+                        match plan_missing_batch(&missing_ids, offset) {
+                            Ok(ids) => {
+                                let next_offset = offset + ids.len();
+                                serde_json::json!({
+                                    "ok": true,
+                                    "ids": ids,
+                                    "nextOffset": next_offset,
+                                    "hasMore": next_offset < missing_ids.len(),
+                                })
+                            }
+                            Err(error) => serde_json::json!({
+                                "ok": false,
+                                "code": match error {
+                                    SyncError::KnownIdLimit => "known_id_limit",
+                                    SyncError::InvalidIdentifier => "invalid_identifier",
+                                    SyncError::InvalidPageLimit => "invalid_page_limit",
+                                    _ => panic!("unexpected batch vector error: {error}"),
+                                },
+                            }),
+                        }
+                    }
                     "inventory_page" => match inventory.accept_page(value) {
                         Ok(outcome) => serde_json::json!({
                             "ok": true,
@@ -762,6 +917,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn missing_id_planning_is_ordered_bounded_and_offset_checked() {
+        let peer = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let local = vec!["b".to_owned()];
+        let mut selector = MissingIdSelector::new(&peer).unwrap();
+        selector.observe_local_ids(&local).unwrap();
+        assert_eq!(selector.finish().unwrap(), ["a", "c"]);
+        assert_eq!(selector.finish(), Err(SyncError::InvalidPageLimit));
+        let mut duplicate_selector = MissingIdSelector::new(&peer).unwrap();
+        duplicate_selector
+            .observe_local_ids(&["b".into(), "b".into()])
+            .unwrap();
+        assert_eq!(duplicate_selector.finish().unwrap(), ["a", "c"]);
+        assert_eq!(
+            MissingIdSelector::new(&["b".into(), "a".into()]).unwrap_err(),
+            SyncError::InvalidIdentifier
+        );
+        assert_eq!(
+            plan_missing_batch(&peer, 4),
+            Err(SyncError::InvalidPageLimit)
+        );
+        let over_limit = (0..=MAX_SYNC_INVENTORY_IDS)
+            .map(|i| format!("id{i:04}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MissingIdSelector::new(&over_limit).unwrap_err(),
+            SyncError::KnownIdLimit
+        );
+        assert_eq!(
+            plan_missing_batch(&over_limit, 0),
+            Err(SyncError::KnownIdLimit)
+        );
+        let ids = (0..crate::MAX_SYNC_PACKET_IDS + 1)
+            .map(|i| format!("id{i:03}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plan_missing_batch(&ids, 0).unwrap().len(),
+            crate::MAX_SYNC_PACKET_IDS
+        );
+        assert_eq!(
+            plan_missing_batch(&ids, crate::MAX_SYNC_PACKET_IDS).unwrap(),
+            [ids.last().unwrap().clone()]
+        );
+        let mut many_local_selector = MissingIdSelector::new(&peer).unwrap();
+        for _ in 0..2 {
+            many_local_selector
+                .observe_local_ids(&vec!["b".to_owned(); MAX_SYNC_SELECTION_CHUNK_IDS])
+                .unwrap();
+        }
+        assert_eq!(many_local_selector.finish().unwrap(), ["a", "c"]);
+        assert_eq!(
+            many_local_selector.observe_local_ids(&[]),
+            Err(SyncError::InvalidPageLimit)
+        );
     }
 
     #[test]

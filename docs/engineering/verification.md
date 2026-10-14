@@ -69,11 +69,13 @@ target, and `wasm-bindgen-cli` 0.2.103. It generates ignored files under
 first. The app fails closed if the generated module cannot initialize. The
 `test:wasm` command separately exercises the binding and shared protocol
 vectors in Chromium. In the browser synchronization flow, Rust/WASM accepts
-bounded inventory sequences and validates and tracks bounded
-request/completion relationships. TypeScript retains pending-request
-bookkeeping and owns IndexedDB access, accepted-message snapshots, transport
-sends, verification that requested messages were saved before completion is
-accepted, rate budgets, and UI state. The Rust `MessageIndex` remains in-memory
+bounded inventory sequences, validates and tracks bounded request/completion
+relationships, selects missing IDs against the full local snapshot through
+bounded chunks, and plans bounded request batches. TypeScript retains
+pending-request bookkeeping and owns IndexedDB access, accepted-message
+snapshots, transport sends, verification that requested messages were saved
+before completion is accepted, rate budgets, and UI state. The Rust
+`MessageIndex` remains in-memory
 and is not the browser's persistent source of truth. These APIs do not provide peer
 authentication, encryption, guaranteed-complete synchronization, or a native
 mobile target, and there is no native app in the repository.

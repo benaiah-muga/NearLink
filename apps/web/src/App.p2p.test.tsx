@@ -42,6 +42,7 @@ vi.mock("./lib/wasmProtocol", async () => {
       return protocol.isProtocolIdentifier(value);
     },
     isWasmSyncStateReady: () => true,
+    MAX_SYNC_SELECTION_CHUNK_IDS: 4096,
     createWasmSyncInventoryReceiver: () => {
       const ids: string[] = [];
       return {
@@ -51,6 +52,19 @@ vi.mock("./lib/wasmProtocol", async () => {
         },
         free: () => undefined,
       };
+    },
+    createWasmMissingIdSelector: (peerIds: string[]) => {
+      const local = new Set<string>();
+      return {
+        observeLocalIds: (ids: string[]) => ids.forEach((id) => local.add(id)),
+        finish: () => peerIds.filter((id) => !local.has(id)),
+        free: () => undefined,
+      };
+    },
+    planWasmMissingBatch: (missingIds: string[], offset: number) => {
+      const ids = missingIds.slice(offset, offset + 100);
+      const nextOffset = offset + ids.length;
+      return { ids, nextOffset, hasMore: nextOffset < missingIds.length };
     },
     createWasmSyncRequestBook: () => ({
       registerRequest: () => "accepted" as const,

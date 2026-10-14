@@ -17,7 +17,7 @@ NearLink targets browser and future native clients and requires consistent proto
 
 Use a small Rust core for platform-neutral protocol processing and bounded synchronization state, with future message and cryptographic behavior added only after concrete requirements and review. Keep storage, UI, permissions, rate budgets, and transport I/O behind explicit adapters. Expose the core to the web client through a narrow WebAssembly interface after dependency target support and bundle size are verified.
 
-The Rust validator, bounded in-memory reconciliation primitive, and browser synchronization state wrappers are incremental portability slices, not a complete portable messaging core. The browser uses Rust/WASM for bounded inventory sequencing and request/completion validation. TypeScript retains app-side pending-request bookkeeping and remains responsible for persistent message snapshots, message storage, transport interaction, persistence verification, rate budgets, and presentation. No native application currently integrates the core.
+The Rust validator, bounded in-memory reconciliation primitive, and browser synchronization state wrappers are incremental portability slices, not a complete portable messaging core. The browser uses Rust/WASM for bounded inventory sequencing, request/completion validation, missing-ID selection against the full local snapshot in bounded chunks, and bounded request planning. TypeScript retains app-side pending-request bookkeeping and remains responsible for persistent message snapshots, message storage, transport interaction, persistence verification, rate budgets, and presentation. No native application currently integrates the core.
 
 ## Rationale
 

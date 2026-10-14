@@ -22,7 +22,26 @@ export interface SyncRequestState {
   free(): void;
 }
 
+export interface SyncMissingBatch {
+  ids: string[];
+  nextOffset: number;
+  hasMore: boolean;
+}
+
+export interface SyncMissingIdSelector {
+  observeLocalIds(ids: string[]): void;
+  finish(): string[];
+  free(): void;
+}
+
 interface WasmSyncModule {
+  plan_missing_batch_json(missingIdsJson: string, offset: number): string;
+  WasmMissingIdSelector: new (peerIdsJson: string) => {
+    status_json(): string;
+    observe_local_ids_json(localIdsJson: string): string;
+    finish_json(): string;
+    free(): void;
+  };
   WasmSyncInventoryReceiver: new () => {
     accept_page_json(pageJson: string): string;
     free(): void;
@@ -40,6 +59,7 @@ type WasmModule = WasmSyncModule & {
 };
 
 export const MAX_PROTOCOL_ENVELOPE_BYTES = 18 * 1024;
+export const MAX_SYNC_SELECTION_CHUNK_IDS = 4_096;
 
 let wasmValidator: WasmValidator | null = null;
 let wasmSyncModule: WasmSyncModule | null = null;
@@ -53,8 +73,11 @@ export function initializeWasmProtocol(): Promise<boolean> {
       await wasm.default();
       wasmValidator = wasm.validate_json;
       wasmSyncModule = "WasmSyncInventoryReceiver" in wasm && "WasmSyncRequestBook" in wasm
+        && "WasmMissingIdSelector" in wasm && "plan_missing_batch_json" in wasm
         && typeof wasm.WasmSyncInventoryReceiver === "function"
-        && typeof wasm.WasmSyncRequestBook === "function" ? wasm : null;
+        && typeof wasm.WasmSyncRequestBook === "function"
+        && typeof wasm.WasmMissingIdSelector === "function"
+        && typeof wasm.plan_missing_batch_json === "function" ? wasm : null;
       return true;
     } catch {
       wasmValidator = null;
@@ -105,6 +128,39 @@ export function createWasmSyncRequestBook(): SyncRequestState {
     acceptCompletion: (packet) => outcome(book.accept_completion_json(JSON.stringify(packet))),
     free: () => book.free(),
   };
+}
+
+export function createWasmMissingIdSelector(peerIds: string[]): SyncMissingIdSelector {
+  if (!wasmSyncModule) throw new Error("WASM synchronization planner is unavailable.");
+  const selector = new wasmSyncModule.WasmMissingIdSelector(JSON.stringify(peerIds));
+  if (parseSyncResult(selector.status_json()).ok !== true) {
+    selector.free();
+    throw new Error("WASM rejected the peer synchronization inventory.");
+  }
+  return {
+    observeLocalIds(ids) {
+      const result = parseSyncResult(selector.observe_local_ids_json(JSON.stringify(ids)));
+      if (result.ok !== true) throw new Error("WASM rejected local synchronization IDs.");
+    },
+    finish() {
+      const result = parseSyncResult(selector.finish_json());
+      if (result.ok !== true || !Array.isArray(result.missingIds) || !result.missingIds.every((id) => typeof id === "string")) {
+        throw new Error("WASM rejected synchronization missing-ID selection.");
+      }
+      return result.missingIds;
+    },
+    free: () => selector.free(),
+  };
+}
+
+export function planWasmMissingBatch(missingIds: string[], offset: number): SyncMissingBatch {
+  if (!wasmSyncModule) throw new Error("WASM synchronization planner is unavailable.");
+  const result = parseSyncResult(wasmSyncModule.plan_missing_batch_json(JSON.stringify(missingIds), offset));
+  if (result.ok !== true || !Array.isArray(result.ids) || !result.ids.every((id) => typeof id === "string")
+    || !Number.isSafeInteger(result.nextOffset) || typeof result.hasMore !== "boolean") {
+    throw new Error("WASM rejected synchronization request planning.");
+  }
+  return { ids: result.ids, nextOffset: result.nextOffset as number, hasMore: result.hasMore };
 }
 
 function parseSyncResult(json: string): Record<string, unknown> {

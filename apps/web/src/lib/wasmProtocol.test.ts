@@ -53,6 +53,7 @@ describe("WASM protocol validator bridge", () => {
     const initialize = vi.fn(async () => undefined);
     const inventoryFree = vi.fn();
     const requestFree = vi.fn();
+    const selectorFree = vi.fn();
     const acceptPage = vi.fn()
       .mockReturnValueOnce(JSON.stringify({ ok: true, outcome: "accepted", ids: ["a"], complete: true, limitReached: false }))
       .mockReturnValueOnce(JSON.stringify({ ok: false, code: "inventory_conflict" }));
@@ -65,11 +66,22 @@ describe("WASM protocol validator bridge", () => {
       accept_completion_json = vi.fn(() => JSON.stringify({ ok: true, outcome: "duplicate" }));
       free = requestFree;
     }
+    const planMissingBatch = vi.fn(() => JSON.stringify({ ok: true, ids: ["b"], nextOffset: 1, hasMore: false }));
+    const observeLocalIds = vi.fn(() => JSON.stringify({ ok: true }));
+    const finishMissingIds = vi.fn(() => JSON.stringify({ ok: true, missingIds: ["b"] }));
+    class WasmMissingIdSelector {
+      status_json = vi.fn(() => JSON.stringify({ ok: true }));
+      observe_local_ids_json = observeLocalIds;
+      finish_json = finishMissingIds;
+      free = selectorFree;
+    }
     vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({
       default: initialize,
       validate_json: () => JSON.stringify({ ok: true, valid: true }),
       WasmSyncInventoryReceiver,
       WasmSyncRequestBook,
+      WasmMissingIdSelector,
+      plan_missing_batch_json: planMissingBatch,
     }));
     const bridge = await import("./wasmProtocol");
 
@@ -83,7 +95,21 @@ describe("WASM protocol validator bridge", () => {
     expect(requests.registerRequest({ type: "sync_missing_request" } as never)).toBe("accepted");
     expect(requests.acceptCompletion({ type: "sync_page_complete" } as never)).toBe("duplicate");
     requests.free();
+    const selector = bridge.createWasmMissingIdSelector(["a", "b"]);
+    selector.observeLocalIds(["a"]);
+    expect(selector.finish()).toEqual(["b"]);
+    selector.free();
+    const rejectedSelector = bridge.createWasmMissingIdSelector(["a"]);
+    observeLocalIds.mockReturnValueOnce(JSON.stringify({ ok: false, code: "invalid_page_limit" }));
+    expect(() => rejectedSelector.observeLocalIds(["a"])).toThrow("WASM rejected local synchronization IDs.");
+    finishMissingIds.mockReturnValueOnce(JSON.stringify({ ok: false, code: "invalid_page_limit" }));
+    expect(() => rejectedSelector.finish()).toThrow("WASM rejected synchronization missing-ID selection.");
+    rejectedSelector.free();
+    expect(bridge.planWasmMissingBatch(["b"], 0)).toEqual({ ids: ["b"], nextOffset: 1, hasMore: false });
+    expect(observeLocalIds).toHaveBeenCalledWith('["a"]');
+    expect(planMissingBatch).toHaveBeenCalledWith('["b"]', 0);
     expect(inventoryFree).toHaveBeenCalledOnce();
     expect(requestFree).toHaveBeenCalledOnce();
+    expect(selectorFree).toHaveBeenCalledTimes(2);
   });
 });

@@ -15,6 +15,9 @@ import {
   createWasmSyncInventoryReceiver,
   createWasmSyncRequestBook,
   isWasmSyncStateReady,
+  planWasmMissingBatch,
+  createWasmMissingIdSelector,
+  MAX_SYNC_SELECTION_CHUNK_IDS,
   type SyncInventoryState,
   type SyncRequestState,
 } from "./wasmProtocol";
@@ -384,14 +387,31 @@ export class SyncCoordinator {
 
   private async requestMissing(session: InventorySession): Promise<void> {
     const requestEpoch = this.epoch;
+    let current: StoredMessage[];
     try {
       await this.localSnapshotReady;
       if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
-      const current = await this.options.loadAccepted();
-      if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
-      const currentIds = new Set(current.filter((item) => item.packet.room === this.options.room
-        && item.delivery === "sent" && item.failure === undefined && this.options.validateMessage(item.packet)).map((item) => item.packet.id));
-      session.missingIds = session.ids.filter((id) => !currentIds.has(id));
+      current = await this.options.loadAccepted();
+    } catch {
+      if (this.isRunActive(requestEpoch) && this.isSessionActive(session)) this.fail("The local storage check failed. Reconnect to restart synchronization from fresh inventories.");
+      return;
+    }
+    if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
+    let selector: ReturnType<typeof createWasmMissingIdSelector> | null = null;
+    try {
+      selector = createWasmMissingIdSelector(session.ids);
+      let localChunk: string[] = [];
+      for (const item of current) {
+        if (item.packet.room !== this.options.room || item.delivery !== "sent" || item.failure !== undefined
+          || !this.options.validateMessage(item.packet)) continue;
+        localChunk.push(item.packet.id);
+        if (localChunk.length === MAX_SYNC_SELECTION_CHUNK_IDS) {
+          selector.observeLocalIds(localChunk);
+          localChunk = [];
+        }
+      }
+      if (localChunk.length > 0) selector.observeLocalIds(localChunk);
+      session.missingIds = selector.finish();
       if (session.missingIds.length === 0) {
         this.options.onState?.(this.partial ? "partial" : "complete", this.partial
           ? "An inventory exceeded the 4,096 ID limit. This exchange cannot claim complete synchronization."
@@ -400,7 +420,9 @@ export class SyncCoordinator {
       }
       this.sendNextRequest(session);
     } catch {
-      if (this.isRunActive(requestEpoch) && this.isSessionActive(session)) this.fail("The local storage check failed. Reconnect to restart synchronization from fresh inventories.");
+      if (this.isRunActive(requestEpoch) && this.isSessionActive(session)) this.fail("WASM could not compare the local snapshot with the peer inventory. Reconnect to restart synchronization.");
+    } finally {
+      selector?.free();
     }
   }
 
@@ -419,8 +441,19 @@ export class SyncCoordinator {
     if (session.nextRequestOffset >= session.missingIds.length) {
       return this.sendNextRequest();
     }
-    const ids = session.missingIds.slice(session.nextRequestOffset, session.nextRequestOffset + MAX_SYNC_PACKET_IDS);
-    session.nextRequestOffset += ids.length;
+    let ids: string[];
+    try {
+      const batch = planWasmMissingBatch(session.missingIds, session.nextRequestOffset);
+      ids = batch.ids;
+      if (ids.length === 0 || batch.nextOffset <= session.nextRequestOffset || batch.nextOffset > session.missingIds.length
+        || batch.hasMore !== (batch.nextOffset < session.missingIds.length)) {
+        throw new Error("WASM returned an invalid synchronization request batch.");
+      }
+      session.nextRequestOffset = batch.nextOffset;
+    } catch {
+      this.fail("WASM could not plan synchronization request batches. Reconnect to start over.");
+      return;
+    }
     const requestId = this.options.makeId();
     const request: SyncMissingRequestPacket = {
       version: PROTOCOL_VERSION,

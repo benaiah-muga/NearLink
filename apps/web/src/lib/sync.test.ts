@@ -11,6 +11,20 @@ vi.mock("./wasmProtocol", async () => {
   return {
     initializeWasmProtocol: async () => true,
     isWasmSyncStateReady: () => wasmState.ready,
+    MAX_SYNC_SELECTION_CHUNK_IDS: 4096,
+    createWasmMissingIdSelector: (peerIds: string[]) => {
+      const local = new Set<string>();
+      return {
+        observeLocalIds: (ids: string[]) => ids.forEach((id) => local.add(id)),
+        finish: () => peerIds.filter((id) => !local.has(id)),
+        free: () => undefined,
+      };
+    },
+    planWasmMissingBatch: (missingIds: string[], offset: number) => {
+      const ids = missingIds.slice(offset, offset + 100);
+      const nextOffset = offset + ids.length;
+      return { ids, nextOffset, hasMore: nextOffset < missingIds.length };
+    },
     createWasmSyncInventoryReceiver: () => {
       const pages = new Map<string, string>();
       const ids: string[] = [];
@@ -305,6 +319,22 @@ describe("SyncCoordinator", () => {
     expect(pages.reduce((total, value) => total + (value.type === "sync_inventory_page" ? value.messageIds.length : 0), 0)).toBe(4096);
     expect(pages.at(-1)).toMatchObject({ hasMore: false, limitReached: true });
     expect(state).toBe("partial");
+    coordinator.stop();
+  });
+
+  it("compares peer inventories against local history larger than the inventory bound", async () => {
+    const rows = Array.from({ length: 4097 }, (_, index) => stored(`local-${String(index).padStart(4, "0")}`, "local-a"));
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    let detail = "";
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "request", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next, message) => { state = next; detail = message; } });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: ["local-4096", "remote-missing"], nextCursor: "remote-missing", hasMore: false, limitReached: false });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(state, detail).not.toBe("error");
+    await vi.waitFor(() => expect(sent.some((value) => value.type === "sync_missing_request")).toBe(true));
+    expect(sent.find((value) => value.type === "sync_missing_request")).toMatchObject({ messageIds: ["remote-missing"] });
+    expect(state).not.toBe("error");
     coordinator.stop();
   });
 

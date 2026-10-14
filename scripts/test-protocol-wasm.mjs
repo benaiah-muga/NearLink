@@ -54,7 +54,7 @@ try {
     `<!doctype html>
 <meta charset="utf-8">
 <script type="module">
-  import init, { validate_json, WasmMessageIndex, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
+  import init, { validate_json, plan_missing_batch_json, WasmMessageIndex, WasmMissingIdSelector, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
 
   const check = (condition, label) => {
     if (!condition) throw new Error(label);
@@ -100,10 +100,19 @@ try {
     for (const vector of syncVectors) {
       const inventory = new WasmSyncInventoryReceiver();
       const requests = new WasmSyncRequestBook();
+      let selector = null;
       for (const operation of vector.operations) {
         const encoded = JSON.stringify(operation.value);
         const actual = operation.kind === "inventory_page"
           ? result(inventory.accept_page_json(encoded))
+          : operation.kind === "selector_start"
+            ? (selector = new WasmMissingIdSelector(JSON.stringify(operation.value.peerIds)), result(selector.status_json()))
+            : operation.kind === "selector_local"
+              ? result(selector.observe_local_ids_json(JSON.stringify(operation.value.localIds)))
+              : operation.kind === "selector_finish"
+                ? result(selector.finish_json())
+                : operation.kind === "plan_batch"
+              ? result(plan_missing_batch_json(JSON.stringify(operation.value.missingIds), operation.value.offset))
           : operation.kind === "request"
             ? result(requests.register_request_json(encoded))
             : operation.kind === "completion"
@@ -117,7 +126,16 @@ try {
           check(Object.keys(actual).sort().join(",") === "code,ok", "sync error leaked packet data");
         }
       }
+      selector?.free();
     }
+    const oversized = " ".repeat(600 * 1024 + 1);
+    check(result(new WasmMissingIdSelector(oversized).status_json()).code === "input_too_large", "selector constructor byte limit missing");
+    const boundedSelector = new WasmMissingIdSelector(JSON.stringify(["peer"]));
+    check(result(boundedSelector.observe_local_ids_json(oversized)).code === "input_too_large", "selector scan byte limit missing");
+    check(result(boundedSelector.observe_local_ids_json(JSON.stringify(Array(4097).fill("peer")))).code === "invalid_page_limit", "selector chunk count limit missing");
+    check(result(plan_missing_batch_json(oversized, 0)).code === "input_too_large", "batch planner byte limit missing");
+    check(result(new WasmMissingIdSelector(JSON.stringify(Array(4097).fill("peer"))).status_json()).code === "known_id_limit", "peer inventory count limit missing");
+    boundedSelector.free();
     window.__protocolWasmResult = { ok: true, vectorCount: vectors.length, syncVectorCount: syncVectors.length };
   } catch (error) {
     window.__protocolWasmResult = { ok: false, error: String(error) };

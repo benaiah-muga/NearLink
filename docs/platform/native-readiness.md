@@ -10,12 +10,13 @@ The repository contains a React and TypeScript browser application in
 `apps/web`, a protocol package in `packages/protocol`, and Rust crates in
 `crates/protocol-core` and `crates/protocol-wasm`. The core validates protocol
 v1 JSON structures, bounded in-memory message reconciliation, and synchronization
-inventory/request state. The WASM facade exposes these APIs to JavaScript.
-Generated browser bindings are built by the checked-in script. The browser uses
-Rust/WASM for packet validation, bounded inventory sequence acceptance, and
-bounded request/completion validation and tracking. TypeScript retains
-pending-request bookkeeping and owns IndexedDB access, accepted message
-snapshots, missing-ID selection and batching, transport sends,
+inventory/request state and deterministic missing-ID selection and request
+batch planning. The WASM facade exposes these APIs to JavaScript. Generated
+browser bindings are built by the checked-in script. The browser uses
+Rust/WASM for packet validation, bounded inventory sequence acceptance,
+bounded request/completion validation and tracking, missing-ID selection, and
+bounded request planning. TypeScript retains pending-exchange bookkeeping and
+owns IndexedDB access, accepted message snapshots, transport sends,
 persist-before-completion verification, rate budgets, and UI state. The Rust
 `MessageIndex` is in-memory and is not persistent browser storage. Neither crate
 implements identity or encryption. There is no Tauri configuration, Tauri
