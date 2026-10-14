@@ -8,11 +8,13 @@ The current prototype provides browser messaging through an optional local hub a
 
 - `apps/web`: React and TypeScript browser application.
 - `services/local-hub`: FastAPI WebSocket hub.
+- `packages/protocol`: shared TypeScript packet validation.
+- `crates/protocol-core`: native Rust protocol v1 JSON validator with shared test vectors. It is not integrated into the browser and does not provide a WASM binding.
 - `docs`: architecture, protocol, security, and contributor documentation.
 
 ## Development
 
-Requirements: Node.js 20 or newer, npm, Python 3.11 or newer, and a browser with IndexedDB and WebSocket support.
+Web development requires Node.js 20 or newer, npm, Python 3.11 or newer, and a browser with IndexedDB and WebSocket support. Working on the Rust protocol core also requires the toolchain pinned in `rust-toolchain.toml`.
 
 ```sh
 npm ci

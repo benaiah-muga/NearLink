@@ -23,3 +23,9 @@ jobs:
       - run: npm ci
       - run: python -m pip install -r services/local-hub/requirements-dev.lock
       - run: npm run verify:all
+      - run: rustup toolchain install 1.84.1 --profile minimal
+      - run: rustup component add rustfmt --toolchain 1.84.1
+      - run: rustup target add wasm32-unknown-unknown --toolchain 1.84.1
+      - run: cargo +1.84.1 fmt --manifest-path crates/protocol-core/Cargo.toml -- --check
+      - run: cargo +1.84.1 test --manifest-path crates/protocol-core/Cargo.toml --locked
+      - run: cargo +1.84.1 check --target wasm32-unknown-unknown --manifest-path crates/protocol-core/Cargo.toml --locked

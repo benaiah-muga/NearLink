@@ -167,7 +167,8 @@ export function isServerPacket(value: unknown): value is ServerPacket {
     case "presence":
       return Number.isInteger(value.peers) && Number(value.peers) >= 0;
     case "error":
-      return ["invalid_packet", "room_required", "message_too_large", "capacity_reached", "rate_limited", "message_conflict", "storage_unavailable"].includes(String(value.code))
+      return typeof value.code === "string"
+        && ["invalid_packet", "room_required", "message_too_large", "capacity_reached", "rate_limited", "message_conflict", "storage_unavailable"].includes(value.code)
         && typeof value.message === "string"
         && (value.id === undefined || isProtocolIdentifier(value.id));
     default:

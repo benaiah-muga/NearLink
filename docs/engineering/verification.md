@@ -22,4 +22,23 @@ are excluded from the scan.
 
 GitHub Actions installs Node.js and Python, installs JavaScript dependencies
 from the npm lockfile and Python dependencies from the pinned development
-lockfile, and runs the same command on pushes to `main` and pull requests.
+lockfile, and runs the same command on pushes to `main` and pull requests. It
+also runs separate Rust core formatting and test checks.
+
+## Rust protocol core
+
+When changing the Rust crate, use the toolchain pinned in `rust-toolchain.toml`
+and run:
+
+```sh
+rustup toolchain install 1.84.1 --profile minimal
+rustup component add rustfmt --toolchain 1.84.1
+rustup target add wasm32-unknown-unknown --toolchain 1.84.1
+cargo +1.84.1 fmt --manifest-path crates/protocol-core/Cargo.toml -- --check
+cargo +1.84.1 test --manifest-path crates/protocol-core/Cargo.toml --locked
+cargo +1.84.1 check --target wasm32-unknown-unknown --manifest-path crates/protocol-core/Cargo.toml --locked
+```
+
+The formatter and test run cover the native host target. The target check only
+cross-compiles the crate for WebAssembly. It does not provide a WASM binding,
+browser runtime test, native mobile target, or browser integration.

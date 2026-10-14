@@ -1,6 +1,8 @@
 # Protocol v1 test vectors
 
-The executable vectors in `protocol.test.ts` define the current version 1 packet boundary. They cover valid join, message, joined, acknowledgment, presence, and error packets, plus invalid identifiers, rooms, timestamps, and message bodies.
+The shared vectors in `../vectors/v1.json` define the current version 1 packet boundary and run in both the TypeScript validator tests and the native Rust protocol-core tests. They cover valid join, message, joined, acknowledgment, presence, and error packets, plus invalid identifiers, rooms, timestamps, and message bodies.
+
+The Rust crate is pinned to Rust 1.84.1 and uses `serde_json` for parsed JSON values. CI cross-compiles it for `wasm32-unknown-unknown`, but the crate has no JavaScript binding and no browser runtime or interoperability test. The local environment used for the current development run only has the native Linux target installed. The crate is not `no_std` and does not implement cryptography, authentication, or transport behavior.
 
 Protocol identifiers accept 1 to 128 ASCII characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. Rooms accept 1 to 64 ASCII characters from `A-Z`, `a-z`, `0-9`, `_`, and `-`. Display names contain 1 to 64 non-whitespace Unicode code points. Message bodies must contain non-whitespace text and fit within 16 KiB when encoded as UTF-8.
 

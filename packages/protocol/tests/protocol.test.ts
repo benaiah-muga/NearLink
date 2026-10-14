@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   isClientPacket,
   isJoinPacket,
@@ -9,6 +10,12 @@ import {
   isServerPacket,
   PROTOCOL_VERSION,
 } from "../src/index";
+
+const sharedVectors = JSON.parse(readFileSync(new URL("../vectors/v1.json", import.meta.url), "utf8")) as {
+  validator: string;
+  valid: boolean;
+  value: unknown;
+}[];
 
 const join = {
   version: PROTOCOL_VERSION,
@@ -30,6 +37,23 @@ const message = {
 };
 
 describe("NearLink protocol v1 validation", () => {
+  it("matches the shared JSON protocol vectors", () => {
+    const validators: Record<string, (value: unknown) => boolean> = {
+      client: isClientPacket,
+      join: isJoinPacket,
+      message: isMessagePacket,
+      server: isServerPacket,
+      timestamp: isProtocolTimestamp,
+      identifier: isProtocolIdentifier,
+      room: isProtocolRoom,
+    };
+    for (const vector of sharedVectors) {
+      const validator = validators[vector.validator];
+      expect(validator, `unknown shared vector validator ${vector.validator}`).toBeDefined();
+      expect(validator!(vector.value), JSON.stringify(vector)).toBe(vector.valid);
+    }
+  });
+
   it("accepts valid client join and message packets", () => {
     expect(isJoinPacket(join)).toBe(true);
     expect(isClientPacket(join)).toBe(true);
