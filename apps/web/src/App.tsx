@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
-import { isServerPacket, PROTOCOL_VERSION, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
+import { isMessagePacket, isProtocolRoom, isServerPacket, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type MessagePacket } from "@nearlink/protocol";
 import { loadIdentity, loadMessages, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoredMessage } from "./lib/storage";
+import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
 
 type LinkState = "offline" | "connecting" | "linking" | "online" | "retrying" | "error";
 const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8000/ws`;
@@ -21,6 +22,40 @@ function writeLocalSetting(key: string, value: string): boolean {
 function makeId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
   return `nl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function normalizeFingerprint(value: string): string | null {
+  const match = /^\s*(sha-256|sha-384|sha-512)\s+([0-9a-f:]+)\s*$/i.exec(value);
+  if (!match) return null;
+  const algorithm = match[1].toLowerCase();
+  const bytes = match[2].replaceAll(":", "").toUpperCase();
+  const expectedLength = algorithm === "sha-256" ? 64 : algorithm === "sha-384" ? 96 : 128;
+  if (bytes.length !== expectedLength || !/^[0-9A-F]+$/.test(bytes)) return null;
+  return `${algorithm} ${bytes.match(/.{2}/g)?.join(":") ?? ""}`;
+}
+
+function isValidCallSign(value: string): boolean {
+  return isMessagePacket({
+    version: PROTOCOL_VERSION,
+    type: "message",
+    id: "profile-check",
+    room: "profile-check",
+    sender: "profile-check",
+    senderName: value,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    body: "profile check",
+  });
+}
+
+function sameMessagePacket(left: MessagePacket, right: MessagePacket): boolean {
+  return left.version === right.version
+    && left.type === right.type
+    && left.id === right.id
+    && left.room === right.room
+    && left.sender === right.sender
+    && left.senderName === right.senderName
+    && left.createdAt === right.createdAt
+    && left.body === right.body;
 }
 
 function formatTime(timestamp: string): string {
@@ -43,6 +78,7 @@ function SignalMark({ active }: { active: boolean }) {
 
 function App() {
   const [identity, setIdentity] = useState<LocalIdentity | null>(null);
+  const [profileSaved, setProfileSaved] = useState(false);
   const [displayName, setDisplayName] = useState("");
   const [room, setRoom] = useState(() => readLocalSetting(ROOM_KEY) ?? "");
   const [hubUrl, setHubUrl] = useState(() => readLocalSetting(HUB_KEY) ?? DEFAULT_HUB);
@@ -58,7 +94,16 @@ function App() {
   const [isInstallable, setIsInstallable] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [retryingMessageKeys, setRetryingMessageKeys] = useState<Set<string>>(() => new Set());
+  const [directState, setDirectState] = useState<TransportState>("closed");
+  const [signalInput, setSignalInput] = useState("");
+  const [localSignal, setLocalSignal] = useState("");
+  const [peerFingerprint, setPeerFingerprint] = useState<string | null>(null);
+  const [trustedFingerprint, setTrustedFingerprint] = useState("");
+  const [fingerprintConfirmed, setFingerprintConfirmed] = useState(false);
+  const [directBusy, setDirectBusy] = useState(false);
+  const [sendTransport, setSendTransport] = useState<"hub" | "direct">("hub");
   const socketRef = useRef<WebSocket | null>(null);
+  const directRef = useRef<DirectWebRtcTransport | null>(null);
   const messagesRef = useRef(messages);
   const messageKeysRef = useRef(new Set<string>());
   const retryingMessageKeysRef = useRef(new Set<string>());
@@ -66,10 +111,28 @@ function App() {
   const pendingSendRef = useRef(false);
   const shouldReconnectRef = useRef(false);
   const attemptRef = useRef(0);
+  const currentRoomRef = useRef(room.trim());
+  const fingerprintConfirmedRef = useRef(fingerprintConfirmed);
+  const directInFlightRef = useRef(new Set<string>());
+  const directInboundOperationsRef = useRef(new Map<string, Promise<void>>());
   const messageEndRef = useRef<HTMLDivElement>(null);
 
   messagesRef.current = messages;
   activeRoomRef.current = room.trim();
+  currentRoomRef.current = room.trim();
+  fingerprintConfirmedRef.current = fingerprintConfirmed;
+
+  function closeDirectTransport() {
+    directRef.current?.close();
+    directRef.current = null;
+    directInFlightRef.current.clear();
+    fingerprintConfirmedRef.current = false;
+    setDirectState("closed");
+    setPeerFingerprint(null);
+    setTrustedFingerprint("");
+    setFingerprintConfirmed(false);
+    setLocalSignal("");
+  }
 
   useEffect(() => {
     let active = true;
@@ -78,12 +141,14 @@ function App() {
       const next = saved ?? { sender: makeId(), senderName: "" };
       setIdentity(next);
       setDisplayName(next.senderName);
+      setProfileSaved(Boolean(saved?.senderName.trim()));
       if (!saved) void saveIdentity(next).catch(() => setNotice("Local identity could not be saved on this device."));
       setStorageReady(true);
     }).catch(() => {
       if (active) {
         setNotice("Local storage is unavailable. Messages may not survive a reload.");
         setIdentity({ sender: makeId(), senderName: "" });
+        setProfileSaved(false);
         setStorageReady(true);
       }
     });
@@ -91,6 +156,9 @@ function App() {
   }, []);
 
   useEffect(() => {
+    closeDirectTransport();
+    setSignalInput("");
+    setSendTransport("hub");
     if (room && !writeLocalSetting(ROOM_KEY, room)) {
       setNotice("Your room setting could not be saved. Re-enter it if you reload this page.");
     }
@@ -109,6 +177,8 @@ function App() {
     }
     return () => { active = false; };
   }, [room]);
+
+  useEffect(() => () => directRef.current?.close(), []);
 
   useEffect(() => {
     const capture = (event: Event) => {
@@ -167,7 +237,7 @@ function App() {
           setLinkState("online");
           setNotice("");
           for (const item of messagesRef.current) {
-            if (item.direction === "outgoing" && item.delivery === "queued") {
+            if (item.direction === "outgoing" && item.delivery === "queued" && (item.transport ?? "hub") === "hub") {
               try { socket.send(JSON.stringify(item.packet)); }
               catch { setNotice("Your queued messages are saved. The radio will retry."); socket.close(); break; }
             }
@@ -176,7 +246,7 @@ function App() {
         }
         if (packet.type === "presence") { setPeers(packet.peers); return; }
         if (packet.type === "ack") {
-          const pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === room.trim() && item.direction === "outgoing");
+          const pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === room.trim() && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
           if (!pending) return;
           let saved = true;
           try { await updateDelivery(pending.packet.room, packet.id, "sent"); }
@@ -235,20 +305,221 @@ function App() {
   const sortedMessages = useMemo(() => loadedRoom === room.trim() ? [...messages].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)) : [], [loadedRoom, messages, room]);
   const normalizedName = displayName.trim();
   const composerReady = storageReady && conversationReady && loadedRoom === room.trim();
-  const canJoin = Boolean(identity && normalizedName && room.trim() && hubUrl.trim());
+  const profileReady = Boolean(profileSaved && identity?.senderName.trim() && identity.senderName.trim() === normalizedName && isValidCallSign(identity.senderName) && isProtocolRoom(room.trim()));
+  const canJoin = Boolean(profileReady && room.trim() && hubUrl.trim());
+  const canSaveProfile = Boolean(identity && isValidCallSign(normalizedName) && isProtocolRoom(room.trim()) && (sendTransport === "direct" || hubUrl.trim()));
   const linkLabel = linkState === "online" ? "On frequency" : linkState === "linking" ? "Calling station" : linkState === "connecting" || linkState === "retrying" ? "Finding signal" : linkState === "error" ? "Check settings" : "Standby";
 
   async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!identity || !normalizedName || !room.trim()) return;
+    if (!identity || !isValidCallSign(normalizedName) || !isProtocolRoom(room.trim())) return;
     const nextIdentity = { ...identity, senderName: normalizedName };
     setIdentity(nextIdentity);
     let identitySaved = true;
     try { await saveIdentity(nextIdentity); }
     catch { identitySaved = false; }
+    setProfileSaved(identitySaved && Boolean(nextIdentity.senderName.trim()));
     const settingsSaved = writeLocalSetting(HUB_KEY, hubUrl.trim());
-    setLinkRequested(true);
-    setNotice(!identitySaved ? "Your identity could not be saved. It may change if you reload this page." : !settingsSaved ? "Your station settings could not be saved. Re-enter them if you reload this page." : "");
+    if (sendTransport === "direct") {
+      setLinkRequested(false);
+      setLinkState("offline");
+    } else {
+      setLinkRequested(true);
+    }
+    setNotice(!identitySaved ? "Your identity could not be saved. It may change if you reload this page." : !settingsSaved ? "Your station settings could not be saved. Re-enter them if you reload this page." : sendTransport === "direct" ? "Profile saved for direct peer setup. The hub remains disconnected." : "");
+  }
+
+  function makeDirectTransport(): DirectWebRtcTransport {
+    const connectionRoom = room.trim();
+    directRef.current?.close();
+    directRef.current = null;
+    const transport = new DirectWebRtcTransport();
+    directRef.current = transport;
+    directInFlightRef.current.clear();
+    fingerprintConfirmedRef.current = false;
+    setFingerprintConfirmed(false);
+    setPeerFingerprint(null);
+    transport.onStateChange = (state) => {
+      if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
+      setDirectState(state);
+      if (state !== "connected") {
+        fingerprintConfirmedRef.current = false;
+        directInFlightRef.current.clear();
+        setFingerprintConfirmed(false);
+      }
+    };
+    transport.onError = (error) => {
+      if (directRef.current === transport && currentRoomRef.current === connectionRoom) setNotice(error.message);
+    };
+    transport.onMessage = (data) => { void processDirectData(transport, connectionRoom, data); };
+    setDirectState("new");
+    return transport;
+  }
+
+  async function processDirectData(transport: DirectWebRtcTransport, connectionRoom: string, data: unknown) {
+    if (directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || typeof data !== "string") return;
+    let packet: unknown;
+    try { packet = JSON.parse(data); } catch { setNotice("The direct peer sent unreadable data. It was ignored."); return; }
+    if (isServerPacket(packet) && packet.type === "ack") {
+      const key = `${connectionRoom}\u0000${packet.id}`;
+      if (!directInFlightRef.current.has(key)) return;
+      const persisted = await loadMessages(connectionRoom).catch(() => null);
+      if (!persisted || directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || !directInFlightRef.current.has(key)) return;
+      const pending = persisted.find((item) => item.packet.id === packet.id && item.direction === "outgoing" && item.transport === "direct");
+      if (!pending) return;
+      directInFlightRef.current.delete(key);
+      try {
+        await updateDelivery(connectionRoom, packet.id, "sent");
+        if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
+        setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === connectionRoom ? { ...item, delivery: "sent", transport: "direct" } : item));
+      } catch {
+        if (currentRoomRef.current === connectionRoom) setNotice("The peer accepted your message, but its status could not be saved on this device.");
+      }
+      return;
+    }
+    if (!isMessagePacket(packet) || packet.room !== connectionRoom) return;
+    const messageKey = `${packet.room}\u0000${packet.id}`;
+    const previous = directInboundOperationsRef.current.get(messageKey) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      if (directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
+      const existing = await loadMessages(connectionRoom).catch(() => null);
+      if (!existing || directRef.current !== transport || currentRoomRef.current !== connectionRoom) {
+        if (!existing && currentRoomRef.current === connectionRoom) setNotice("The direct message could not be checked against local storage, so it was not accepted.");
+        return;
+      }
+      const duplicate = existing.find((item) => item.packet.id === packet.id);
+      if (duplicate) {
+        if (!sameMessagePacket(duplicate.packet, packet)) {
+          if (currentRoomRef.current === connectionRoom) setNotice("A conflicting direct message used an already saved message ID. It was ignored.");
+          return;
+        }
+        messageKeysRef.current.add(messageKey);
+        if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
+          const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
+          try { transport.send(JSON.stringify(ack)); } catch { setNotice("The saved duplicate could not be acknowledged. It remains saved on this device."); }
+        }
+        return;
+      }
+      const item: StoredMessage = { packet, direction: "incoming", delivery: "sent", transport: "direct" };
+      try {
+        await saveMessage(item);
+      } catch {
+        if (currentRoomRef.current === connectionRoom) setNotice("The direct message arrived, but could not be saved. No acknowledgment was sent.");
+        return;
+      }
+      if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
+      messageKeysRef.current.add(messageKey);
+      setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id) ? current : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+      if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
+        const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
+        try { transport.send(JSON.stringify(ack)); }
+        catch { setNotice("The message was saved, but the peer acknowledgment could not be sent."); }
+      }
+    });
+    directInboundOperationsRef.current.set(messageKey, operation);
+    try { await operation; }
+    finally { if (directInboundOperationsRef.current.get(messageKey) === operation) directInboundOperationsRef.current.delete(messageKey); }
+  }
+
+  async function createDirectOffer() {
+    setDirectBusy(true);
+    setLocalSignal("");
+    const connectionRoom = room.trim();
+    let transport: DirectWebRtcTransport | null = null;
+    try {
+      transport = makeDirectTransport();
+      const signal = await transport.createOffer();
+      if (directRef.current === transport && currentRoomRef.current === connectionRoom) setLocalSignal(signal);
+    }
+    catch (error) {
+      if (!transport || directRef.current === transport) {
+        setNotice(error instanceof Error ? error.message : "Could not create a direct offer.");
+        closeDirectTransport();
+      }
+    }
+    finally { setDirectBusy(false); }
+  }
+
+  async function acceptDirectOffer() {
+    setDirectBusy(true);
+    setLocalSignal("");
+    const connectionRoom = room.trim();
+    let transport: DirectWebRtcTransport | null = null;
+    try {
+      transport = makeDirectTransport();
+      const answer = await transport.acceptOffer(signalInput);
+      if (directRef.current === transport && currentRoomRef.current === connectionRoom) {
+        setLocalSignal(answer);
+        setPeerFingerprint(transport.peerFingerprint);
+      }
+    } catch (error) {
+      if (!transport || directRef.current === transport) {
+        setNotice(error instanceof Error ? error.message : "Could not accept the direct offer.");
+        closeDirectTransport();
+      }
+    }
+    finally { setDirectBusy(false); }
+  }
+
+  async function acceptDirectAnswer() {
+    const transport = directRef.current;
+    if (!transport) { setNotice("Create a direct offer before accepting an answer."); return; }
+    const connectionRoom = room.trim();
+    setDirectBusy(true);
+    try {
+      await transport.acceptAnswer(signalInput);
+      if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
+      setPeerFingerprint(transport.peerFingerprint);
+      fingerprintConfirmedRef.current = false;
+      setFingerprintConfirmed(false);
+    } catch (error) {
+      if (directRef.current === transport) {
+        setNotice(error instanceof Error ? error.message : "Could not accept the direct answer.");
+        closeDirectTransport();
+      }
+    }
+    finally { setDirectBusy(false); }
+  }
+
+  function confirmFingerprint() {
+    const received = peerFingerprint ? normalizeFingerprint(peerFingerprint) : null;
+    const supplied = normalizeFingerprint(trustedFingerprint);
+    if (!received || !supplied || received !== supplied) {
+      fingerprintConfirmedRef.current = false;
+      setFingerprintConfirmed(false);
+      setNotice("Fingerprint does not match. Compare the complete fingerprint over your separate trusted channel.");
+      return;
+    }
+    fingerprintConfirmedRef.current = true;
+    setFingerprintConfirmed(true);
+    setNotice("Fingerprint matches this DTLS session. It does not verify a lasting identity or a real-world person.");
+    flushQueuedDirectMessages();
+  }
+
+  function sendDirectMessage(item: StoredMessage): boolean {
+    const transport = directRef.current;
+    const key = `${item.packet.room}\u0000${item.packet.id}`;
+    if (!transport || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || currentRoomRef.current !== item.packet.room || directInFlightRef.current.has(key)) return false;
+    try {
+      directInFlightRef.current.add(key);
+      transport.send(JSON.stringify(item.packet));
+      return true;
+    } catch {
+      directInFlightRef.current.delete(key);
+      setNotice("The message remains queued on this device because the direct link is unavailable.");
+      return false;
+    }
+  }
+
+  async function flushQueuedDirectMessages() {
+    const transport = directRef.current;
+    const flushRoom = currentRoomRef.current;
+    if (!transport || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
+    const savedMessages = await loadMessages(flushRoom).catch(() => null);
+    if (!savedMessages || directRef.current !== transport || currentRoomRef.current !== flushRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
+    for (const item of savedMessages) {
+      if (item.direction === "outgoing" && item.delivery === "queued" && item.transport === "direct") sendDirectMessage(item);
+    }
   }
 
   async function retryMessage(message: StoredMessage) {
@@ -266,11 +537,15 @@ function App() {
       setRetryingMessageKeys(new Set(retryingMessageKeysRef.current));
     }
     setMessages((current) => current.map((item) => item.packet.id === message.packet.id && item.packet.room === message.packet.room ? { ...item, delivery: "queued" } : item));
-    if (activeRoomRef.current === message.packet.room && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
-      try { socketRef.current.send(JSON.stringify(message.packet)); }
-      catch {
-        setNotice("The message is queued on this device. The radio will reconnect and retry it.");
-        socketRef.current.close();
+    if (activeRoomRef.current === message.packet.room) {
+      if (message.transport === "direct") {
+        sendDirectMessage(message);
+      } else if ((message.transport ?? "hub") === "hub" && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
+        try { socketRef.current.send(JSON.stringify(message.packet)); }
+        catch {
+          setNotice("The message is queued on this device. The radio will reconnect and retry it.");
+          socketRef.current.close();
+        }
       }
     }
   }
@@ -278,7 +553,7 @@ function App() {
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const body = draft.trim();
-    if (!storageReady || !conversationReady || loadedRoom !== room.trim() || pendingSendRef.current || !identity || !body || !room.trim()) return;
+    if (!storageReady || !conversationReady || loadedRoom !== room.trim() || pendingSendRef.current || !profileReady || !identity || !body || !room.trim()) return;
     pendingSendRef.current = true;
     const submittedDraft = draft;
     const messageRoom = room.trim();
@@ -292,7 +567,12 @@ function App() {
       createdAt: new Date().toISOString(),
       body,
     };
-    const item: StoredMessage = { packet, direction: "outgoing", delivery: "queued" };
+    if (!isMessagePacket(packet)) {
+      setNotice("Check your saved call sign, room code, and message text. This message was not queued.");
+      pendingSendRef.current = false;
+      return;
+    }
+    const item: StoredMessage = { packet, direction: "outgoing", delivery: "queued", transport: sendTransport };
     messageKeysRef.current.add(`${packet.room}\u0000${packet.id}`);
     setMessages((current) => [...current, item]);
     try { await saveMessage(item); }
@@ -305,7 +585,9 @@ function App() {
     }
     if (activeRoomRef.current === messageRoom) {
       setDraft((current) => current === submittedDraft ? "" : current);
-      if (linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
+      if (sendTransport === "direct") {
+        sendDirectMessage(item);
+      } else if (sendTransport === "hub" && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
         try { socketRef.current.send(JSON.stringify(packet)); }
         catch {
           setNotice("The message is saved on this device. The radio will reconnect and retry it.");
@@ -364,10 +646,36 @@ function App() {
             <input id="hub-address" type="url" inputMode="url" spellCheck={false} placeholder="ws://192.168.1.20:8000/ws" value={hubUrl} onChange={(event) => { setHubUrl(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
             <p className="field-hint">Use your hub’s LAN address on another device.</p>
 
-            <button className="primary-button" type="submit" disabled={!canJoin || linkRequested}>
-              <span className="button-dot" />{linkRequested ? "Station settings saved" : "Save and join room"}
+            <button className="primary-button" type="submit" disabled={!canSaveProfile || (linkRequested && sendTransport === "hub")}>
+              <span className="button-dot" />{sendTransport === "direct" ? "Save profile for direct link" : linkRequested ? "Station settings saved" : "Save and join room"}
             </button>
           </form>
+        </section>
+
+        <section className="direct-panel" aria-labelledby="direct-title">
+          <div className="section-label"><span>02</span><h2 id="direct-title">Direct peer link</h2></div>
+          <p className="direct-description">Create an offer on one device, exchange the complete JSON, then accept it on the other device. Compare the fingerprint in person or through an authenticated channel different from the SDP exchange. Otherwise, an intermediary could replace both the signaling data and fingerprint. This host-only connection may require both devices to share a reachable local network. No public STUN or TURN server is configured.</p>
+          <div className="direct-actions">
+            <button type="button" onClick={() => void createDirectOffer()} disabled={!composerReady || !profileReady || directBusy}>Create offer</button>
+            <button type="button" onClick={() => void acceptDirectOffer()} disabled={!composerReady || !profileReady || directBusy || !signalInput.trim()}>Accept offer</button>
+            <button type="button" onClick={() => void acceptDirectAnswer()} disabled={!composerReady || !profileReady || directBusy || !signalInput.trim() || !directRef.current}>Accept answer</button>
+          </div>
+          <label htmlFor="direct-signal-input">Paste peer offer or answer JSON</label>
+          <textarea id="direct-signal-input" value={signalInput} onChange={(event) => setSignalInput(event.target.value)} rows={3} spellCheck={false} />
+          {localSignal && <>
+            <label htmlFor="direct-signal-output">Your signaling JSON to share</label>
+            <textarea id="direct-signal-output" value={localSignal} readOnly rows={3} spellCheck={false} />
+          </>}
+          <p className="direct-state" role="status" aria-live="polite">Direct channel: {directState}. {fingerprintConfirmed ? "Fingerprint confirmed for this session." : "Messages over this link require fingerprint confirmation."}</p>
+          {peerFingerprint && <>
+            <label htmlFor="peer-fingerprint">Remote SDP DTLS fingerprint</label>
+            <output id="peer-fingerprint" className="fingerprint-value">{peerFingerprint}</output>
+            <label htmlFor="trusted-fingerprint">Fingerprint compared in person or through the separate authenticated channel</label>
+            <input id="trusted-fingerprint" value={trustedFingerprint} onChange={(event) => { setTrustedFingerprint(event.target.value); fingerprintConfirmedRef.current = false; setFingerprintConfirmed(false); }} autoComplete="off" spellCheck={false} />
+            <button type="button" className="fingerprint-confirm" onClick={confirmFingerprint} disabled={directState !== "connected"}>Compare fingerprints</button>
+            <p className="fingerprint-limit">A match verifies only this DTLS session. It does not prove a lasting device identity or the real-world person you are speaking with.</p>
+          </>}
+          <button type="button" className="direct-close" onClick={closeDirectTransport} disabled={!directRef.current}>Close direct link</button>
         </section>
 
         <section className="frequency-card" aria-label="Local range indicator">
@@ -414,7 +722,7 @@ function App() {
           ) : groups.map((group) => (
             <section className="message-day" key={group.label}>
               <div className="day-divider"><span>{group.label}</span><i /></div>
-              {group.items.map(({ packet, direction, delivery }) => (
+              {group.items.map(({ packet, direction, delivery, transport }) => (
                 <article key={`${packet.room}:${packet.id}`} className={`message-row ${direction === "outgoing" ? "message-outgoing" : "message-incoming"}`}>
                   <div className="message-avatar" aria-hidden="true">{(packet.senderName || "?").slice(0, 1).toUpperCase()}</div>
                   <div className="message-content">
@@ -422,7 +730,7 @@ function App() {
                     <div className="message-bubble">{packet.body}</div>
                     {direction === "outgoing" && <div className={`delivery-state ${delivery}`}>
                       <span className="delivery-glyph">{delivery === "sent" ? "✓" : delivery === "failed" ? "!" : "◷"}</span>
-                      {delivery === "sent" ? "Accepted by hub" : delivery === "failed" ? <>Not accepted <button type="button" className="retry-button" disabled={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} aria-busy={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} onClick={() => void retryMessage({ packet, direction, delivery })}>{retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "Retrying…" : "Retry"}</button></> : "Queued on this device"}
+                      {delivery === "sent" ? (transport === "direct" ? "Accepted by peer device" : "Accepted by hub") : delivery === "failed" ? <>Not accepted <button type="button" className="retry-button" disabled={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} aria-busy={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} onClick={() => void retryMessage({ packet, direction, delivery, transport })}>{retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "Retrying…" : "Retry"}</button></> : "Queued on this device"}
                     </div>}
                   </div>
                 </article>
@@ -436,9 +744,9 @@ function App() {
           <form className="composer" aria-busy={!composerReady} onSubmit={sendMessage}>
             <label className="sr-only" htmlFor="message-draft">Write a message</label>
             <textarea id="message-draft" rows={1} maxLength={4000} placeholder={!composerReady ? "Loading saved messages…" : room.trim() ? "Write a message to this room…" : "Choose a room to start a message"} value={draft} disabled={!composerReady || !room.trim()} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => { if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return; if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
-            <div className="composer-tools"><span><kbd>↵</kbd> send <span className="tool-divider">·</span> <kbd>⇧ ↵</kbd> new line</span><span className="char-count">{draft.length}/4000</span><button type="submit" className="send-button" disabled={!composerReady || !draft.trim() || !room.trim()} aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.75 12h14.5m0 0-6-6m6 6-6 6" /></svg></button></div>
+            <div className="composer-tools"><label className="transport-choice">Send via <select aria-label="Message transport" value={sendTransport} onChange={(event) => setSendTransport(event.target.value as "hub" | "direct")}><option value="hub">Local hub</option><option value="direct">Direct peer</option></select></label><span><kbd>↵</kbd> send <span className="tool-divider">·</span> <kbd>⇧ ↵</kbd> new line</span><span className="char-count">{draft.length}/4000</span><button type="submit" className="send-button" disabled={!composerReady || !profileReady || !draft.trim() || !room.trim()} aria-label="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.75 12h14.5m0 0-6-6m6 6-6 6" /></svg></button></div>
           </form>
-          <div className="composer-foot"><span role="status" aria-live="polite"><i className={linkState === "online" ? "foot-live" : ""} />{!composerReady ? "Loading saved messages" : linkState === "online" ? "Connected to local hub" : "Messages save locally until a hub is connected"}</span><span>NEARLINK <b>·</b> LOCAL FIRST</span></div>
+          <div className="composer-foot"><span role="status" aria-live="polite"><i className={sendTransport === "direct" ? (directState === "connected" && fingerprintConfirmed ? "foot-live" : "") : linkState === "online" ? "foot-live" : ""} />{!composerReady ? "Loading saved messages" : sendTransport === "direct" ? directState === "connected" && fingerprintConfirmed ? "Direct peer session verified" : "Direct messages remain queued until session confirmation" : linkState === "online" ? "Connected to local hub" : "Messages save locally until a hub is connected"}</span><span>NEARLINK <b>·</b> LOCAL FIRST</span></div>
         </footer>
       </section>
     </main>

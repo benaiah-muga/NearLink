@@ -66,6 +66,16 @@ describe("local IndexedDB storage", () => {
     await expect(loadMessages("alpha")).resolves.toEqual([duplicate]);
   });
 
+  it("persists the optional transport hint and keeps legacy rows hub-compatible", async () => {
+    const direct = { ...message("direct-row", "2026-10-14T09:00:00.000Z", "sent"), transport: "direct" as const };
+    await saveMessage(direct);
+    await saveMessage(message("legacy-row", "2026-10-14T10:00:00.000Z", "sent"));
+
+    const saved = await loadMessages("alpha");
+    expect(saved.find((item) => item.packet.id === "direct-row")?.transport).toBe("direct");
+    expect(saved.find((item) => item.packet.id === "legacy-row")?.transport).toBeUndefined();
+  });
+
   it("persists delivery transitions and treats an unknown message as a no-op", async () => {
     await saveMessage(message("delivery", "2026-10-14T09:00:00.000Z"));
     await updateDelivery("alpha", "delivery", "sent");

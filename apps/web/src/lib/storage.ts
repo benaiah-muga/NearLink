@@ -6,6 +6,7 @@ export interface StoredMessage {
   packet: MessagePacket;
   direction: "outgoing" | "incoming";
   delivery: DeliveryState;
+  transport?: "hub" | "direct";
 }
 
 export interface LocalIdentity {

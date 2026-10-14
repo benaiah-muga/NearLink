@@ -27,7 +27,7 @@ button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid #a47e2f; outline-offset: 3px; }
 .station-shell { display: grid; grid-template-columns: 308px minmax(0, 1fr); width: min(1600px, 100%); height: 100vh; min-height: 640px; margin: 0 auto; overflow: hidden; background: var(--paper); box-shadow: 0 0 60px #101b1512; }
-.station-sidebar { display: flex; flex-direction: column; padding: 30px 25px 24px; color: #eeeade; background: var(--green-dark); }
+.station-sidebar { display: flex; flex-direction: column; padding: 30px 25px 24px; overflow-y: auto; color: #eeeade; background: var(--green-dark); }
 .brand-lockup { display: flex; align-items: center; gap: 12px; padding: 2px 0 27px; border-bottom: 1px solid #ffffff1b; }
 .brand-mark { display: grid; width: 39px; height: 39px; place-items: center; border: 1px solid #dac16d80; border-radius: 12px; background: #e2c56f12; }
 .brand-lockup .signal-mark { transform: scale(.72); }
@@ -46,6 +46,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .station-form input:focus { border-color: #d2b95f; background: #ffffff0d; }
 .station-form input[type="url"] { font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
 .field-hint { margin: -12px 0 16px; color: #899489; font-size: 9px; line-height: 1.5; }
+.direct-panel { margin-top: 19px; padding: 13px 11px; border: 1px solid #ffffff20; border-radius: 4px; background: #ffffff08; }
+.direct-panel .section-label { margin-bottom: 10px; }
+.direct-description, .fingerprint-limit { margin: 0 0 10px; color: #a2aa9d; font-size: 12px; line-height: 1.5; }
+.direct-panel > label { display: block; margin: 10px 0 6px; color: #b5b9ad; font-size: 12px; line-height: 1.4; }
+.direct-panel textarea, .direct-panel input { width: 100%; min-width: 0; min-height: 42px; padding: 8px; border: 1px solid #ffffff28; border-radius: 3px; color: #f3f0e4; background: #101b15; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.direct-panel textarea { resize: vertical; }
+.direct-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.direct-actions button, .fingerprint-confirm, .direct-close { min-height: 42px; padding: 8px; border: 1px solid #dac16d5c; border-radius: 3px; color: #e4d69f; background: #ffffff09; font-size: 12px; }
+.direct-actions button:first-child { grid-column: 1 / -1; }
+.direct-actions button:disabled, .fingerprint-confirm:disabled, .direct-close:disabled { opacity: .45; cursor: not-allowed; }
+.direct-state { margin: 10px 0 5px; color: #e3cd7e; font-size: 12px; line-height: 1.45; }
+.fingerprint-value { display: block; padding: 9px; border: 1px solid #ffffff22; border-radius: 3px; color: #f2e8c0; background: #101b15; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.fingerprint-confirm { width: 100%; margin-top: 8px; color: #1e2c23; background: var(--yellow); font-weight: 700; }
+.fingerprint-limit { margin-top: 8px; }
+.direct-close { width: 100%; margin-top: 8px; border-color: #ffffff24; color: #abb2a6; }
 .primary-button { display: flex; align-items: center; justify-content: center; gap: 9px; height: 43px; margin-top: 1px; border: 0; border-radius: 4px; color: #1e2c23; background: var(--yellow); font-size: 11px; font-weight: 700; transition: background .15s, transform .15s; }
 .primary-button:hover:not(:disabled) { background: #f0d886; transform: translateY(-1px); }
 .primary-button:disabled { color: #d4d4c9; background: #ffffff1c; }
@@ -139,6 +154,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .composer textarea { display: block; width: 100%; min-height: 38px; max-height: 130px; resize: vertical; border: 0; outline: 0; color: #344137; background: transparent; font-size: 12px; line-height: 1.6; }
 .composer textarea::placeholder { color: #a3a297; }
 .composer-tools { display: flex; align-items: center; gap: 9px; min-height: 30px; color: #9a9a8e; font-size: 8px; }
+.transport-choice { display: flex; align-items: center; gap: 4px; color: #85877c; font-size: 12px; }
+.transport-choice select { min-height: 42px; max-width: 120px; padding: 6px; border: 1px solid #e4e2d8; border-radius: 3px; color: #596253; background: #f7f6ef; font-size: 12px; }
 .composer-tools kbd { padding: 2px 4px; border: 1px solid #e4e2d8; border-radius: 2px; color: #7b7e73; background: #f7f6ef; font-family: inherit; font-size: 8px; }
 .tool-divider { padding: 0 4px; color: #c4c1b4; }
 .char-count { margin-left: auto; color: #b1afa3; font-variant-numeric: tabular-nums; }
@@ -166,8 +183,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
   .conversation-panel { min-height: 0; }
 }
 @media (max-width: 680px) {
-  .station-shell { display: flex; height: 100vh; height: 100dvh; min-height: 0; flex-direction: column; overflow: auto; }
-  .station-sidebar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(135px, .8fr); gap: 0 15px; padding: 15px 18px 12px; }
+  .station-shell { display: flex; height: 100vh; height: 100dvh; min-height: 0; flex-direction: column; overflow-x: hidden; overflow-y: auto; }
+  .station-sidebar { display: grid; flex: 0 0 auto; grid-template-columns: minmax(0, 1fr) minmax(135px, .8fr); gap: 0 15px; padding: 15px 18px 12px; }
+  .direct-panel { grid-column: 1 / -1; }
   .brand-lockup { grid-column: 1 / -1; padding: 0 0 12px; border: 0; }
   .brand-mark { width: 33px; height: 33px; }
   .brand-lockup .eyebrow { font-size: 14px; }
@@ -189,7 +207,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
   .link-toggle { width: auto; padding: 6px 0; border: 0; font-size: 9px; }
   .local-note { margin: 0; font-size: 8px; text-align: right; }
   .install-button { width: auto; margin: 0; padding: 7px; }
-  .conversation-panel { flex: 1; min-height: 0; }
+  .conversation-panel { flex: 1 0 420px; min-height: 420px; }
   .conversation-header { min-height: 64px; padding: 0 18px; }
   .room-ident { gap: 9px; }.room-symbol { width: 30px; height: 30px; flex-basis: 30px; font-size: 21px; }
   .room-ident .eyebrow { font-size: 7px; }.room-ident h1 { max-width: 45vw; font-size: 13px; }
