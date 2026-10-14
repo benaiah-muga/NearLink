@@ -11,6 +11,8 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -25,7 +27,34 @@ jobs:
       - run: npm run verify:all
       - run: rustup toolchain install 1.84.1 --profile minimal
       - run: rustup component add rustfmt --toolchain 1.84.1
+      - run: rustup component add clippy --toolchain 1.84.1
       - run: rustup target add wasm32-unknown-unknown --toolchain 1.84.1
       - run: cargo +1.84.1 fmt --manifest-path crates/protocol-core/Cargo.toml -- --check
       - run: cargo +1.84.1 test --manifest-path crates/protocol-core/Cargo.toml --locked
       - run: cargo +1.84.1 check --target wasm32-unknown-unknown --manifest-path crates/protocol-core/Cargo.toml --locked
+      - run: cargo +1.84.1 clippy --manifest-path crates/protocol-core/Cargo.toml --locked -- -D warnings
+
+  security-audit:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266
+        with:
+          inputs: services/local-hub/requirements-dev.lock
+          no-deps: true
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: crates/protocol-core
