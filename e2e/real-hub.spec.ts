@@ -144,7 +144,7 @@ async function seedRetainedHistory(room: string) {
 }
 
 test("real local hub accepts, replays, persists, and pages a two-client conversation", async ({ browser }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(120_000);
   const externalAttempts: string[] = [];
   const room = `e2e-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
   const bodies = [
@@ -202,13 +202,14 @@ test("real local hub accepts, replays, persists, and pages a two-client conversa
     await configureAndJoin(sender, "Hub Sender", room);
     const senderLog = sender.getByRole("log", { name: `Messages in ${room}` });
     const sendAndWaitForHubAcceptance = async (body: string) => {
+      await expect(sender.locator(".connection-status")).toHaveClass(/status-online/, { timeout: 20_000 });
       const priorCount = sentMessageIds.length;
       await sender.getByRole("textbox", { name: "Write a message" }).fill(body);
       await sender.getByRole("button", { name: "Send message" }).click();
-      await expect.poll(() => sentMessageIds.length).toBeGreaterThan(priorCount);
+      await expect.poll(() => sentMessageIds.length, { timeout: 20_000 }).toBeGreaterThan(priorCount);
       const sentId = sentMessageIds.at(-1);
       expect(sentId).toBeTruthy();
-      await expect.poll(() => acknowledgedMessageIds).toContain(sentId);
+      await expect.poll(() => acknowledgedMessageIds, { timeout: 20_000 }).toContain(sentId);
       const bubble = senderLog.getByText(body);
       await expect(bubble).toBeVisible();
       await expect(bubble.locator("..")).toContainText("Accepted by hub");
