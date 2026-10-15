@@ -230,7 +230,12 @@ describe("local IndexedDB storage", () => {
     await new Promise<void>((resolve, reject) => {
       const transaction = database.transaction(["identity", "messages"], "readwrite");
       transaction.objectStore("identity").put({ key: "profile", sender: "legacy-device", senderName: "Legacy" });
-      transaction.objectStore("messages").put(message("legacy", "2026-10-14T09:00:00.000Z"));
+      transaction.objectStore("messages").put(message("legacy-later", "2026-10-14T10:00:00.000Z"));
+      transaction.objectStore("messages").put(message("legacy-earlier", "2026-10-14T09:00:00.000Z"));
+      transaction.objectStore("messages").put({
+        ...message("legacy-other-room", "2026-10-14T08:00:00.000Z"),
+        packet: packet("legacy-other-room", "2026-10-14T08:00:00.000Z", "beta"),
+      });
       transaction.oncomplete = () => resolve();
       transaction.onabort = () => reject(transaction.error);
       transaction.onerror = () => reject(transaction.error);
@@ -238,17 +243,87 @@ describe("local IndexedDB storage", () => {
     database.close();
 
     await expect(loadIdentity()).resolves.toEqual({ sender: "legacy-device", senderName: "Legacy" });
-    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("legacy", "2026-10-14T09:00:00.000Z"), displayOrder: 0 }]);
+    await expect(loadMessages("alpha")).resolves.toEqual([
+      { ...message("legacy-earlier", "2026-10-14T09:00:00.000Z"), displayOrder: 0 },
+      { ...message("legacy-later", "2026-10-14T10:00:00.000Z"), displayOrder: 1 },
+    ]);
+    await expect(loadMessages("beta")).resolves.toEqual([{
+      ...message("legacy-other-room", "2026-10-14T08:00:00.000Z"),
+      packet: packet("legacy-other-room", "2026-10-14T08:00:00.000Z", "beta"),
+      displayOrder: 0,
+    }]);
 
     const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = openRequest();
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
-    expect(upgraded.version).toBe(4);
+    expect(upgraded.version).toBe(5);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDeliveryCreatedAt")).toBe(true);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDisplayOrder")).toBe(true);
     expect(upgraded.objectStoreNames.contains("roomDeletions")).toBe(true);
+    upgraded.close();
+  });
+
+  it("preserves version 4 message order, rows, identity, tombstones, indexes, and room isolation", async () => {
+    const rows: StoredMessage[] = [
+      { ...message("alpha-second", "2026-10-14T09:00:00.000Z", "sent"), transport: "direct", displayOrder: -3 },
+      { ...message("alpha-first", "2026-10-14T10:00:00.000Z", "failed"), transport: "hub", failure: "message_conflict", displayOrder: 8 },
+      {
+        ...message("beta-only", "2026-10-14T08:00:00.000Z", "sent"),
+        packet: packet("beta-only", "2026-10-14T08:00:00.000Z", "beta"),
+        direction: "incoming",
+        displayOrder: 17,
+      },
+    ];
+    const identity = { key: "profile", sender: "v4-device", senderName: "Version Four" };
+    const tombstone = { room: "alpha", state: "deleted" };
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = openRequest(4);
+      request.onupgradeneeded = () => {
+        const messages = request.result.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
+        messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
+        messages.createIndex("roomDeliveryCreatedAt", ["packet.room", "delivery", "packet.createdAt"]);
+        messages.createIndex("roomDisplayOrder", ["packet.room", "displayOrder"]);
+        request.result.createObjectStore("identity", { keyPath: "key" });
+        request.result.createObjectStore("roomDeletions", { keyPath: "room" });
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(["messages", "identity", "roomDeletions"], "readwrite");
+      for (const row of rows) transaction.objectStore("messages").put(row);
+      transaction.objectStore("identity").put(identity);
+      transaction.objectStore("roomDeletions").put(tombstone);
+      transaction.oncomplete = () => resolve();
+      transaction.onabort = () => reject(transaction.error);
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    await expect(loadMessages("alpha")).resolves.toEqual([rows[0], rows[1]]);
+    await expect(loadMessages("beta")).resolves.toEqual([rows[2]]);
+    await expect(loadIdentity()).resolves.toEqual({ sender: identity.sender, senderName: identity.senderName });
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
+
+    const upgraded = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = openRequest();
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    expect(upgraded.version).toBe(5);
+    const transaction = upgraded.transaction(["messages", "identity", "roomDeletions"], "readonly");
+    const messages = transaction.objectStore("messages");
+    expect([...messages.indexNames].sort()).toEqual(["roomCreatedAt", "roomDeliveryCreatedAt", "roomDisplayOrder"]);
+    expect(messages.index("roomDisplayOrder").keyPath).toEqual(["packet.room", "displayOrder"]);
+    const persistedRows = await new Promise<StoredMessage[]>((resolve, reject) => {
+      const request = messages.getAll() as IDBRequest<StoredMessage[]>;
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    expect(persistedRows).toEqual(expect.arrayContaining(rows));
+    expect(persistedRows).toHaveLength(rows.length);
     upgraded.close();
   });
 

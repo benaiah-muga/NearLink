@@ -42,7 +42,7 @@ export async function requestStoragePersistence(): Promise<StoragePersistenceRes
 }
 
 const DATABASE_NAME = "nearlink-local";
-const DATABASE_VERSION = 4;
+const DATABASE_VERSION = 5;
 const MESSAGE_STORE = "messages";
 const IDENTITY_STORE = "identity";
 const ROOM_DELETION_STORE = "roomDeletions";
@@ -114,13 +114,17 @@ function ensureIndex(store: IDBObjectStore, name: string, keyPath: string | stri
   }
 }
 
-function migrate(database: IDBDatabase, transaction: IDBTransaction): void {
+function migrate(database: IDBDatabase, transaction: IDBTransaction, oldVersion: number): void {
   const messages = ensureStore(database, transaction, MESSAGE_STORE, MESSAGE_KEY_PATH);
   ensureIndex(messages, ROOM_CREATED_INDEX, ROOM_CREATED_KEY_PATH);
   ensureIndex(messages, ROOM_DELIVERY_CREATED_INDEX, ROOM_DELIVERY_CREATED_KEY_PATH);
   ensureIndex(messages, ROOM_DISPLAY_ORDER_INDEX, ["packet.room", "displayOrder"]);
   ensureStore(database, transaction, IDENTITY_STORE, IDENTITY_KEY_PATH);
   ensureStore(database, transaction, ROOM_DELETION_STORE, "room");
+
+  // Version 4 introduced displayOrder. Backfill only databases that predate it.
+  // Version 4 and later contain user-visible ordering that must survive upgrades.
+  if (oldVersion >= 4) return;
 
   const migration = messages.index(ROOM_CREATED_INDEX).openCursor();
   let activeRoom: string | undefined;
@@ -157,9 +161,9 @@ function openDatabase(): Promise<IDBDatabase> {
       reject(fail("Could not open local message storage", cause));
     };
 
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       try {
-        migrate(request.result, request.transaction!);
+        migrate(request.result, request.transaction!, event.oldVersion);
       } catch (error) {
         migrationFailure = error;
         try {
