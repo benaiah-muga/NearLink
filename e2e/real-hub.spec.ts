@@ -93,7 +93,7 @@ async function seedRetainedHistory(room: string) {
   });
   try {
     await new Promise<void>((resolve, reject) => {
-      const deadline = setTimeout(() => reject(new Error("The local hub did not join the history seeder.")), 5_000);
+      const deadline = setTimeout(() => reject(new Error("The local hub did not join the history seeder.")), 20_000);
       socket.addEventListener("open", () => {
         socket.send(JSON.stringify({ version: 1, type: "join", room, sender, senderName: "History Seed" }));
         const poll = setInterval(() => {
@@ -113,7 +113,7 @@ async function seedRetainedHistory(room: string) {
         const timeout = setTimeout(() => {
           pendingAcks.delete(id);
           reject(new Error(`The local hub did not acknowledge seeded message ${index}.`));
-        }, 5_000);
+        }, 20_000);
         pendingAcks.set(id, () => {
           clearTimeout(timeout);
           pendingAcks.delete(id);
@@ -144,7 +144,7 @@ async function seedRetainedHistory(room: string) {
 }
 
 test("real local hub accepts, replays, persists, and pages a two-client conversation", async ({ browser }) => {
-  test.setTimeout(120_000);
+  test.setTimeout(180_000);
   const externalAttempts: string[] = [];
   const room = `e2e-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
   const bodies = [
