@@ -71,13 +71,49 @@ test("production service worker keeps the local conversation usable offline and 
       await navigator.serviceWorker.ready;
       return Boolean(navigator.serviceWorker.controller);
     });
-    const initialCache = await page.evaluate(async () => {
-      const cache = await caches.open("nearlink-shell-v1");
-      const root = await cache.match("/");
-      const assets = await cache.keys();
-      return { root: Boolean(root), assets: assets.map((request) => new URL(request.url).pathname) };
+    const inspectInitialCache = async () => page.evaluate(async () => {
+      const control = await caches.open("nearlink-shell-control-v1");
+      const active = await control.match(new URL("/__nearlink_shell__/active", location.origin).href);
+      const pending = await control.match(new URL("/__nearlink_shell__/pending", location.origin).href);
+      const cacheName = active ? await active.text() : null;
+      const cache = cacheName ? await caches.open(cacheName) : null;
+      const assets = cache ? await cache.keys() : [];
+      const paths = assets.map((request) => new URL(request.url).pathname);
+      const complete = Boolean(cache && await cache.match(new URL("/__nearlink_shell__/complete", location.origin).href));
+      const registration = await navigator.serviceWorker.getRegistration();
+      const cacheInventory = await caches.keys();
+      return {
+        pointer: Boolean(active),
+        cacheName,
+        complete,
+        root: Boolean(cache && await cache.match(new URL("/", location.origin).href)),
+        representativeAssets: {
+          js: paths.some((path) => path.startsWith("/assets/") && path.endsWith(".js")),
+          wasm: paths.some((path) => /\/nearlink_protocol_wasm-[^/]+\.js$/.test(path)),
+          css: paths.some((path) => path.startsWith("/assets/") && path.endsWith(".css")),
+        },
+        assets: paths,
+        pending: pending ? await pending.text() : null,
+        cacheInventory,
+        workerStates: {
+          installing: registration?.installing?.state ?? null,
+          waiting: registration?.waiting?.state ?? null,
+          active: registration?.active?.state ?? null,
+        },
+      };
     });
-    expect(initialCache.root).toBe(true);
+    await expect.poll(inspectInitialCache, {
+      timeout: 15_000,
+      message: "The service worker should promote a complete offline shell before the test continues.",
+    }).toMatchObject({
+      pointer: true,
+      complete: true,
+      root: true,
+      representativeAssets: { js: true, wasm: true, css: true },
+      workerStates: { active: "activated" },
+    });
+    const initialCache = await inspectInitialCache();
+    expect(initialCache.root, JSON.stringify(initialCache)).toBe(true);
     expect(initialCache.assets.some((path) => path.startsWith("/assets/") && path.endsWith(".js"))).toBe(true);
     expect(initialCache.assets.some((path) => /\/nearlink_protocol_wasm-[^/]+\.js$/.test(path))).toBe(true);
     expect(initialCache.assets.some((path) => path.startsWith("/assets/") && path.endsWith(".css"))).toBe(true);
