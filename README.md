@@ -54,4 +54,4 @@ For direct communication, both browser clients can exchange WebRTC offer and ans
 
 This is an early development project. Local network communication depends on users being able to reach the same hub. The hub stores and relays plaintext in its bounded local history. Direct WebRTC data is also not end-to-end encrypted by an application messaging protocol. Browser storage can be cleared or evicted. Do not use NearLink for sensitive communication or emergency coordination.
 
-See [the architecture overview](docs/architecture/overview.md), [protocol draft](docs/protocol/v1-draft.md), [threat model](docs/security/threat-model.md), and [contributing guide](CONTRIBUTING.md).
+See [the architecture overview](docs/architecture/overview.md), [protocol draft](docs/protocol/v1-draft.md), [threat model](docs/security/threat-model.md), [project roadmap](docs/roadmap.md), [governance policy](GOVERNANCE.md), and [contributing guide](CONTRIBUTING.md).

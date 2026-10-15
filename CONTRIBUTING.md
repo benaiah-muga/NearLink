@@ -2,6 +2,10 @@
 
 NearLink is developed in the open. Keep changes focused, document protocol or architecture changes, and describe known limitations clearly.
 
+See the [governance policy](GOVERNANCE.md) for the proposal, review, decision,
+security escalation, and release process. The [roadmap](docs/roadmap.md)
+tracks current evidence, next outcomes, and gates that remain pending.
+
 ## Local setup
 
 See the root README for the web client and local hub setup.
