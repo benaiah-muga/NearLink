@@ -41,4 +41,33 @@ The reload check only covers the provider's in-memory storage within one process
 
 ## Dependency review
 
-The OpenMLS packages are pinned to the exact `openmls-v0.9.0` Git tag in `Cargo.toml`, and the resolved transitive graph is recorded in `Cargo.lock`. Cargo metadata resolved 198 packages, each with a declared license expression after this private spike crate inherited the repository MIT license. No dedicated license policy checker or RustSec audit command is installed in the environment, so this is license metadata inventory only and no advisory status is claimed. Before any product adoption, review the complete resolved dependency graph, license policy, advisories, browser target behavior, storage semantics, protocol threat model, operational design, and independent security assessment. This research spike is not an approval for adding these dependencies to product flows.
+The OpenMLS packages are pinned to the exact `openmls-v0.9.0` Git tag in `Cargo.toml`, and the resolved transitive graph is recorded in `Cargo.lock`. Cargo metadata resolved 198 packages, each with a declared license expression after this private spike crate inherited the repository MIT license. This is a license metadata inventory, not a license compatibility review.
+
+A RustSec audit of the complete lockfile on 2026-10-15 reported
+`RUSTSEC-2026-0330` and `RUSTSEC-2026-0331` for `libcrux-kem` 0.0.9, plus an
+informational unmaintained warning for `proc-macro-error2`. The two
+`libcrux-kem` advisories cover panic behavior on short inputs and identify
+0.0.10 as patched. The affected package comes from the locked optional
+`hpke-rs-libcrux` 0.7.0 backend, which pins `libcrux-kem` 0.0.9. The selected
+`OpenMlsRustCrypto` provider and tested targets do not activate that backend,
+but RustSec reports it because it remains in the full lockfile. This finding
+blocks selecting OpenMLS until the lockfile and exact feature graph receive
+independent review. The `proc-macro-error2` unmaintained warning is also in the
+active selected dependency graph through `hax-lib-macros`, `libcrux-sha3`, and
+`hpke-rs`, which is used by `openmls_rust_crypto`.
+
+The current research workflow checks formatting, runs the native compatibility
+test, and compiles the tests for `wasm32-unknown-unknown`. It does not rerun
+RustSec. These audit findings are a snapshot from 2026-10-15, not continuous
+audit coverage. Any `Cargo.lock` change or dependency feature-graph change must
+trigger a fresh RustSec review of both the complete lockfile and the active
+selected graph. An independent review of that evidence is required before
+selecting OpenMLS. See [RUSTSEC-2026-0330](https://rustsec.org/advisories/RUSTSEC-2026-0330),
+[RUSTSEC-2026-0331](https://rustsec.org/advisories/RUSTSEC-2026-0331), and
+[RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173).
+
+Before any product adoption, review the complete resolved dependency graph,
+license policy, advisories, browser target behavior, storage semantics,
+protocol threat model, operational design, and independent security
+assessment. This research spike is not an approval for adding these
+dependencies to product flows.

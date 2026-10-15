@@ -51,6 +51,26 @@ security audit also remain blockers. Defer integration until one candidate
 passes the exact target, provider, interoperability, storage, and independent
 review gates below.
 
+A RustSec audit of this spike's complete lockfile on 2026-10-15 reported
+`RUSTSEC-2026-0330` and `RUSTSEC-2026-0331` for `libcrux-kem` 0.0.9, plus an
+informational unmaintained warning for `proc-macro-error2`. The two
+`libcrux-kem` advisories describe panic-on-short-input behavior. Their patched
+release is 0.0.10, but the locked optional `hpke-rs-libcrux` 0.7.0 package pins
+`libcrux-kem` 0.0.9. `cargo tree --target all -i libcrux-kem@0.0.9` found no
+active path for the spike's selected `OpenMlsRustCrypto` provider and tested
+targets; RustSec still reports packages present in the full lockfile. The
+`proc-macro-error2` warning is in the active selected graph through
+`hax-lib-macros`, `libcrux-sha3`, and `hpke-rs`, which is used by
+`openmls_rust_crypto`. The current research workflow checks formatting, native
+tests, and WASM compilation only; it does not rerun RustSec. Treat these audit
+results as a snapshot, not ongoing audit coverage. Any lockfile or dependency
+feature-graph change requires a fresh RustSec review of the complete lockfile
+and the active selected graph, followed by independent review before candidate
+selection. Keep OpenMLS unselected until that review and the other adoption
+gates are satisfied. References: [RUSTSEC-2026-0330](https://rustsec.org/advisories/RUSTSEC-2026-0330),
+[RUSTSEC-2026-0331](https://rustsec.org/advisories/RUSTSEC-2026-0331), and
+[RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173).
+
 At this snapshot, the isolated spike manifest pins OpenMLS 0.9.0,
 `openmls_rust_crypto` 0.6.0, `openmls_basic_credential` 0.6.0, and `tls_codec`
 0.5.0, with Rust 1.91 as its minimum. Its native test source exercises a
