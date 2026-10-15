@@ -67,6 +67,12 @@ offline.
 
 ## Join with the local hub
 
+On first use, the station setup panel explains the three values to enter:
+choose a call sign that participants will see, agree on the same shared room
+code, and enter the WebSocket address provided by the local hub operator.
+These values are saved on the device. Call signs and room codes do not verify
+who a participant is.
+
 1. Start the hub on a device reachable from both clients. Follow the hub's
    [local run instructions](../services/local-hub/README.md).
 2. Open NearLink in each browser. Enter a call sign, the shared room code, and
@@ -88,6 +94,13 @@ offline.
    retention gap. History is bounded and can expire or be evicted.
 6. Reload each page and confirm which messages remain on that device.
 
+If NearLink says the hub is not reachable, check that the hub process is
+running, both devices can reach its host on the local network, and the address
+uses that host's LAN address and the `/ws` path. An HTTPS app page may block a
+plain `ws://` address. Ask the hub operator for a browser-permitted secure
+address when that happens. Messages remain saved on the device while the app
+retries; correct the address and save the setup again if needed.
+
 Older history pages require a hub with versioned history support. If the app
 reports that the hub does not support history pages, update the local hub before
 trying this step. A failed page save can be retried without moving its cursor.
@@ -97,6 +110,12 @@ database can read message contents. Protect it as sensitive data and use only
 test content during beta.
 
 ## Join with a direct peer link
+
+Manual direct peer setup is an optional advanced path in the station controls.
+It remains available when hub access is not being used, but requires the
+participants to exchange signaling data and compare fingerprints through a
+separate authenticated channel. Follow these steps only when that is the
+intended setup.
 
 1. Set the call sign and same room on both devices. Direct signaling does not
    require joining the hub.

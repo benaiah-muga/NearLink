@@ -411,6 +411,36 @@ describe("browser storage retention feedback", () => {
   });
 });
 
+describe("guided station setup", () => {
+  it("explains first-run values and keeps manual peer setup behind an optional path", async () => {
+    messageReadGate.identityPending = Promise.resolve({ sender: IDENTITY.sender, senderName: "" });
+    render(<App />);
+
+    expect(await screen.findByText("Start with three details")).toBeTruthy();
+    expect(screen.getByText(/same shared room code/i)).toBeTruthy();
+    expect(screen.getByText(/WebSocket address from the local hub operator/i)).toBeTruthy();
+    expect(screen.getByText("Optional advanced path: manual direct peer setup").closest("details")?.open).toBe(false);
+
+    fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: "Ari" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save and join room" }));
+    await waitFor(() => expect(screen.queryByText("Start with three details")).toBeNull());
+
+    fireEvent.click(screen.getByText("Optional advanced path: manual direct peer setup"));
+    expect(screen.getByRole("button", { name: "Create offer" })).toBeTruthy();
+  });
+
+  it("shows practical recovery steps after an established hub link drops", async () => {
+    render(<App />);
+    const socket = await connectTestHub();
+
+    act(() => socket.close());
+
+    expect(await screen.findByText("Hub not reachable yet")).toBeTruthy();
+    expect(screen.getByText(/hub is running, both devices can reach it on the local network/i)).toBeTruthy();
+    expect(screen.getByText(/messages remain saved on this device while the app retries/i)).toBeTruthy();
+  });
+});
+
 describe("browser app messaging flow", () => {
   it("exchanges a hub inventory and serves a missing-message batch from accepted local storage", async () => {
     const accepted: StoredMessage = {
@@ -777,6 +807,7 @@ describe("browser app messaging flow", () => {
     externalTab.postMessage({ version: 1, type: "deleting", room: ROOM, sender: "other-tab" });
     await screen.findByText("Another open tab is clearing this room's local messages.");
 
+    fireEvent.click(screen.getByText("Optional advanced path: manual direct peer setup"));
     fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
     expect((screen.getByRole("button", { name: "Save and join room" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(true);
@@ -902,6 +933,8 @@ describe("browser app messaging flow", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/will not connect, send messages, or accept peer packets/i);
     expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByText("Hub not reachable yet")).toBeNull();
+    fireEvent.click(screen.getByText("Optional advanced path: manual direct peer setup"));
     expect((screen.getByRole("button", { name: "Create offer" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Save and join room" }));
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(0));

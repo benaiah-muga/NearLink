@@ -195,7 +195,19 @@ test("reconciles a persisted message over a confirmed direct Chromium session", 
   const body = "Received over direct synchronization";
   try {
     await Promise.all([left.goto("/"), right.goto("/")]);
+    await Promise.all([
+      expect(left.getByText("Start with three details")).toBeVisible(),
+      expect(right.getByText("Start with three details")).toBeVisible(),
+    ]);
     await Promise.all([waitForSetupReady(left), waitForSetupReady(right)]);
+    for (const page of [left, right]) {
+      const directSetup = page.locator(".direct-panel");
+      const summary = directSetup.locator("summary");
+      await summary.focus();
+      await page.keyboard.press("Enter");
+      await expect(directSetup).toHaveAttribute("open", "");
+      await expect(directSetup.getByRole("button", { name: "Create offer" })).toBeVisible();
+    }
     await left.getByLabel("Your call sign").fill("Direct Left");
     await right.getByLabel("Your call sign").fill("Direct Right");
     await left.getByLabel("Room frequency").fill(room);

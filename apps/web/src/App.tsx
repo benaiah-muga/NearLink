@@ -1551,6 +1551,15 @@ function App() {
 
         <section className="control-panel">
           <div className="section-label"><span>01</span><h2>Station setup</h2></div>
+          {!profileSaved && <div className="setup-intro" aria-label="First time setup">
+            <strong>Start with three details</strong>
+            <ol>
+              <li>Choose a call sign that other room participants will see.</li>
+              <li>Use the same shared room code as the people you want to reach.</li>
+              <li>Enter the WebSocket address from the local hub operator.</li>
+            </ol>
+            <p>These details are saved on this device. A call sign and room code do not verify who anyone is.</p>
+          </div>}
           <form className="station-form" onSubmit={saveProfile}>
             <label htmlFor="display-name">Your call sign</label>
             <input id="display-name" autoComplete="nickname" maxLength={48} placeholder="e.g. Sam" value={displayName} onChange={(event) => { callSignEditedRef.current = true; setDisplayName(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
@@ -1572,10 +1581,17 @@ function App() {
             <button className="primary-button" type="submit" disabled={deletingRoom || !canSaveProfile || (linkRequested && sendTransport === "hub")}>
               <span className="button-dot" />{sendTransport === "direct" ? "Save profile for direct link" : linkRequested ? "Station settings saved" : "Save and join room"}
             </button>
+            {linkState === "retrying" && <div className="setup-recovery" role="status" aria-live="polite">
+              <strong>Hub not reachable yet</strong>
+              <p>Check that the hub is running, both devices can reach it on the local network, and this address uses the hub device’s LAN address with <code>/ws</code>. An HTTPS page may block a plain <code>ws://</code> address; ask the hub operator for a browser-permitted secure address.</p>
+              <p>Your messages remain saved on this device while the app retries. Check the address above and save again if it is wrong.</p>
+            </div>}
           </form>
         </section>
 
-        <section className="direct-panel" aria-labelledby="direct-title">
+        <details className="direct-panel">
+          <summary>Optional advanced path: manual direct peer setup</summary>
+          <div className="direct-content" aria-labelledby="direct-title">
           <div className="section-label"><span>02</span><h2 id="direct-title">Direct peer link</h2></div>
           <p className="direct-description">Create an offer on one device, exchange the complete JSON, then accept it on the other device. Compare the fingerprint in person or through an authenticated channel different from the SDP exchange. Otherwise, an intermediary could replace both the signaling data and fingerprint. This host-only connection may require both devices to share a reachable local network. No public STUN or TURN server is configured.</p>
           <div className="direct-actions">
@@ -1599,7 +1615,8 @@ function App() {
             <p className="fingerprint-limit">A match verifies only this DTLS session. It does not prove a lasting device identity or the real-world person you are speaking with.</p>
           </>}
           <button type="button" className="direct-close" onClick={closeDirectTransport} disabled={!directRef.current}>Close direct link</button>
-        </section>
+          </div>
+        </details>
 
         <section className="frequency-card" aria-label="Local range indicator">
           <div className="frequency-head"><span>LOCAL RANGE</span><span className="frequency-index">0{linkState === "online" ? 4 : linkState === "linking" ? 2 : 1}</span></div>
