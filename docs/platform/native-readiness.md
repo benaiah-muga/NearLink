@@ -9,17 +9,20 @@
 The repository contains a React and TypeScript browser application in
 `apps/web`, a protocol package in `packages/protocol`, and Rust crates in
 `crates/protocol-core` and `crates/protocol-wasm`. The core validates protocol
-v1 JSON structures, bounded in-memory message reconciliation, and synchronization
-inventory/request state and deterministic missing-ID selection and request
-batch planning. The WASM facade exposes these APIs to JavaScript. Generated
-browser bindings are built by the checked-in script. The browser uses
-Rust/WASM for packet validation, bounded inventory sequence acceptance,
-bounded request/completion validation and tracking, missing-ID selection, and
-bounded request planning. TypeScript retains pending-exchange bookkeeping and
-owns IndexedDB access, accepted message snapshots, transport sends,
-persist-before-completion verification, rate budgets, and UI state. The Rust
-`MessageIndex` is in-memory and is not persistent browser storage. Neither crate
-implements identity or encryption. There is no Tauri configuration, Tauri
+v1 JSON structures, bounded in-memory message reconciliation, and bounded
+synchronization exchange state. The WASM facade exposes these APIs to
+JavaScript. Generated browser bindings are built by the checked-in script. In
+the browser, Rust/WASM owns bounded inventory sequence acceptance, the frozen
+missing-ID plan and batching, per-peer request replay/conflict checks,
+requested-message matching, and staged completion correlation and validation.
+TypeScript keeps WASM handles and peer scheduling/async continuation. It owns
+bounded IndexedDB reads and durable message acceptance, validates loaded durable
+rows, then asks Rust/WASM to compare exact IDs and packets with tracked state.
+TypeScript computes partial/final status and presents it, and owns transport
+sends, timers, and rate budgets. Rust
+exchange state is in-memory and ephemeral, not persistent browser state. The
+Rust `MessageIndex` is also in-memory and is not persistent browser storage.
+Neither crate implements identity or encryption. There is no Tauri configuration, Tauri
 dependency, native UI, platform adapter, or Android project in the repository.
 
 The browser UI currently uses browser facilities directly. For example,
@@ -103,12 +106,17 @@ limitations must be tested on the actual target.
 
 ### Shared code and boundary gate
 
-- Identify the message and synchronization behavior that belongs in the
-  portable core, then implement it with documented input and output contracts.
-  The browser's current Rust/WASM synchronization state covers bounded
-  inventory sequencing and bounded request/completion validation; TypeScript
-  also retains pending-request bookkeeping. This does not move persistence or
-  transport I/O into Rust.
+- Keep protocol and synchronization transitions transport-independent with
+  documented input and output contracts. The browser's Rust/WASM binding now
+  covers bounded inventory sequencing, frozen missing-ID planning and batching,
+  request replay/conflict, requested-message matching, and staged completion
+  correlation and validation. TypeScript keeps object handles and peer
+  scheduling/async continuation, performs bounded IndexedDB reads and durable
+  acceptance, and validates loaded rows. Rust/WASM compares exact IDs and
+  packets with tracked state. TypeScript computes partial/final status and
+  presents it, while retaining transport I/O, timers, and rate budgets. A native
+  client still needs its own platform adapters and integration tests. This does
+  not move persistence or transport I/O into Rust.
 - Keep native storage, UI, permissions, background lifecycle, and transport I/O
   behind explicit adapters.
 - Run the same protocol vectors and state-transition cases through the browser

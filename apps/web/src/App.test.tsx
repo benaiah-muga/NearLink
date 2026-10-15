@@ -71,11 +71,22 @@ vi.mock("./lib/wasmProtocol", async () => {
     MAX_SYNC_SELECTION_CHUNK_IDS: 4096,
     createWasmSyncInventoryReceiver: () => {
       const ids: string[] = [];
+      let missingIds: string[] | null = null;
+      let nextMissingOffset = 0;
       return {
         acceptPage: (packet: import("@nearlink/protocol").SyncInventoryPagePacket) => {
           ids.push(...packet.messageIds);
           return { outcome: "accepted" as const, ids: [...ids], complete: !packet.hasMore, limitReached: !packet.hasMore && packet.limitReached };
         },
+        setMissingIds: (next: string[]) => { missingIds = [...next]; nextMissingOffset = 0; },
+        nextMissingBatch: () => {
+          if (!missingIds) throw new Error("Missing-ID plan is unavailable.");
+          const batch = missingIds.slice(nextMissingOffset, nextMissingOffset + 100);
+          nextMissingOffset += batch.length;
+          return { ids: batch, hasMore: nextMissingOffset < missingIds.length };
+        },
+        hasMissingPlan: () => missingIds !== null,
+        hasMissingIdsRemaining: () => missingIds !== null && nextMissingOffset < missingIds.length,
         free: () => undefined,
       };
     },
@@ -92,11 +103,84 @@ vi.mock("./lib/wasmProtocol", async () => {
       const nextOffset = offset + ids.length;
       return { ids, nextOffset, hasMore: nextOffset < missingIds.length };
     },
-    createWasmSyncRequestBook: () => ({
-      registerRequest: () => "accepted" as const,
-      acceptCompletion: () => "accepted" as const,
-      free: () => undefined,
-    }),
+    createWasmSyncRequestBook: () => {
+      const requests = new Map<string, {
+        packet: import("@nearlink/protocol").SyncMissingRequestPacket;
+        received: Map<string, MessagePacket>;
+        staged?: import("@nearlink/protocol").SyncPageCompletePacket;
+        completion?: import("@nearlink/protocol").SyncPageCompletePacket;
+      }>();
+      return {
+        registerRequest: (packet: import("@nearlink/protocol").SyncMissingRequestPacket) => {
+          const existing = requests.get(packet.requestId);
+          if (existing) {
+            if (JSON.stringify(existing.packet) !== JSON.stringify(packet)) throw new Error("Request ID conflict.");
+            return "duplicate" as const;
+          }
+          requests.set(packet.requestId, { packet, received: new Map() });
+          return "accepted" as const;
+        },
+        acceptCompletion: (packet: import("@nearlink/protocol").SyncPageCompletePacket) => {
+          const entry = requests.get(packet.requestId);
+          if (!entry || packet.room !== entry.packet.room || packet.syncId !== entry.packet.syncId
+            || packet.sender !== entry.packet.targetSender || packet.targetSender !== entry.packet.sender
+            || packet.messageIds.some((id) => !entry.packet.messageIds.includes(id))) throw new Error("Completion mismatch.");
+          if (entry.completion) {
+            if (JSON.stringify(entry.completion) !== JSON.stringify(packet)) throw new Error("Completion conflict.");
+            return "duplicate" as const;
+          }
+          entry.completion = packet;
+          return "accepted" as const;
+        },
+        observeMessage: (packet: MessagePacket) => {
+          let matched = false;
+          for (const entry of requests.values()) {
+            if (entry.completion || packet.room !== entry.packet.room || packet.sender !== entry.packet.targetSender || !entry.packet.messageIds.includes(packet.id)) continue;
+            if (entry.staged && !entry.staged.messageIds.includes(packet.id)) throw new Error("Message arrived outside staged completion.");
+            const prior = entry.received.get(packet.id);
+            if (prior && JSON.stringify(prior) !== JSON.stringify(packet)) throw new Error("Message conflict.");
+            entry.received.set(packet.id, packet);
+            matched = true;
+          }
+          return matched ? "matched" as const : "unmatched" as const;
+        },
+        hasOutstandingMessageId: (id: string) => [...requests.values()].some((entry) => !entry.completion && entry.packet.messageIds.includes(id)),
+        stageCompletion: (packet: import("@nearlink/protocol").SyncPageCompletePacket) => {
+          const entry = requests.get(packet.requestId);
+          if (!entry) return { outcome: "unknown" as const, requestedIds: [], observedIds: [], completedIds: [], isCompleted: false };
+          const duplicate = Boolean(entry.completion || entry.staged);
+          if (entry.completion && JSON.stringify(entry.completion) !== JSON.stringify(packet)) throw new Error("Completion conflict.");
+          if (entry.staged && JSON.stringify(entry.staged) !== JSON.stringify(packet)) throw new Error("Completion conflict.");
+          if (!entry.completion && !entry.staged) {
+            if (packet.room !== entry.packet.room || packet.syncId !== entry.packet.syncId
+              || packet.sender !== entry.packet.targetSender || packet.targetSender !== entry.packet.sender
+              || packet.messageIds.some((id) => !entry.packet.messageIds.includes(id))
+              || [...entry.received.keys()].some((id) => !packet.messageIds.includes(id))) throw new Error("Completion mismatch.");
+            entry.staged = packet;
+          }
+          return {
+            outcome: duplicate ? "duplicate" as const : "accepted" as const,
+            requestedIds: [...entry.packet.messageIds],
+            observedIds: [...entry.received.keys()].sort(),
+            completedIds: [...packet.messageIds],
+            isCompleted: Boolean(entry.completion),
+          };
+        },
+        finishCompletion: (requestId: string, durable: boolean) => {
+          const entry = requests.get(requestId);
+          if (!entry?.staged) throw new Error("Missing staged completion.");
+          if (durable) { entry.completion = entry.staged; entry.received.clear(); }
+          entry.staged = undefined;
+        },
+        verifyDurableMessages: (requestId: string, packets: MessagePacket[]) => {
+          const entry = requests.get(requestId);
+          if (!entry || entry.received.size !== packets.length) return false;
+          const byId = new Map(packets.map((packet) => [packet.id, packet]));
+          return [...entry.received].every(([id, packet]) => JSON.stringify(byId.get(id)) === JSON.stringify(packet));
+        },
+        free: () => undefined,
+      };
+    },
   };
 });
 

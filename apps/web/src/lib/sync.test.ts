@@ -33,6 +33,8 @@ vi.mock("./wasmProtocol", async () => {
       let complete = false;
       let limitReached = false;
       let freed = false;
+      let missingIds: string[] | null = null;
+      let nextMissingOffset = 0;
       return {
         acceptPage(packet: import("@nearlink/protocol").SyncInventoryPagePacket) {
           if (freed) wasmState.acceptAfterFree += 1;
@@ -57,11 +59,20 @@ vi.mock("./wasmProtocol", async () => {
           limitReached = complete && packet.limitReached;
           return { outcome: "accepted" as const, ids: [...ids], complete, limitReached };
         },
+        setMissingIds(nextIds: string[]) { missingIds = [...nextIds]; nextMissingOffset = 0; },
+        nextMissingBatch() {
+          if (missingIds === null) throw new Error("missing plan unavailable");
+          const batch = missingIds.slice(nextMissingOffset, nextMissingOffset + 100);
+          nextMissingOffset += batch.length;
+          return { ids: batch, hasMore: nextMissingOffset < missingIds.length };
+        },
+        hasMissingPlan: () => missingIds !== null,
+        hasMissingIdsRemaining: () => missingIds !== null && nextMissingOffset < missingIds.length,
         free: () => { freed = true; wasmState.frees += 1; },
       };
     },
     createWasmSyncRequestBook: () => {
-      const requests = new Map<string, { packet: import("@nearlink/protocol").SyncMissingRequestPacket; completion?: import("@nearlink/protocol").SyncPageCompletePacket }>();
+      const requests = new Map<string, { packet: import("@nearlink/protocol").SyncMissingRequestPacket; completion?: import("@nearlink/protocol").SyncPageCompletePacket; staged?: import("@nearlink/protocol").SyncPageCompletePacket; received: Map<string, MessagePacket> }>();
       let identity = "";
       return {
         registerRequest(packet: import("@nearlink/protocol").SyncMissingRequestPacket) {
@@ -75,7 +86,7 @@ vi.mock("./wasmProtocol", async () => {
             return "duplicate" as const;
           }
           identity = nextIdentity;
-          requests.set(packet.requestId, { packet });
+          requests.set(packet.requestId, { packet, received: new Map() });
           return "accepted" as const;
         },
         acceptCompletion(packet: import("@nearlink/protocol").SyncPageCompletePacket) {
@@ -90,6 +101,51 @@ vi.mock("./wasmProtocol", async () => {
             || packet.messageIds.some((id) => !entry.packet.messageIds.includes(id))) throw new Error("completion mismatch");
           entry.completion = packet;
           return "accepted" as const;
+        },
+        observeMessage(packet: MessagePacket) {
+          let matched = false;
+          for (const entry of requests.values()) {
+            if (entry.completion || packet.room !== entry.packet.room || packet.sender !== entry.packet.targetSender || !entry.packet.messageIds.includes(packet.id)) continue;
+            if (entry.staged && !entry.staged.messageIds.includes(packet.id)) throw new Error("message arrived outside staged completion");
+            const prior = entry.received.get(packet.id);
+            if (prior && JSON.stringify(prior) !== JSON.stringify(packet)) throw new Error("message conflict");
+            matched = true;
+            entry.received.set(packet.id, packet);
+          }
+          return matched ? "matched" as const : "unmatched" as const;
+        },
+        hasOutstandingMessageId(id: string) {
+          return [...requests.values()].some((entry) => !entry.completion && entry.packet.messageIds.includes(id));
+        },
+        stageCompletion(packet: import("@nearlink/protocol").SyncPageCompletePacket) {
+          const entry = requests.get(packet.requestId);
+          if (!entry) return { outcome: "unknown" as const, requestedIds: [], observedIds: [], completedIds: [], isCompleted: false };
+          const stagedPrior = entry.staged;
+          const committedPrior = entry.completion;
+          const outcome = stagedPrior || committedPrior ? "duplicate" as const : "accepted" as const;
+          if ((stagedPrior && JSON.stringify(stagedPrior) !== JSON.stringify(packet)) || (committedPrior && JSON.stringify(committedPrior) !== JSON.stringify(packet))) throw new Error("completion conflict");
+          if (!stagedPrior && !committedPrior) {
+            if (packet.room !== entry.packet.room || packet.syncId !== entry.packet.syncId || packet.sender !== entry.packet.targetSender || packet.targetSender !== entry.packet.sender
+              || packet.messageIds.some((id) => !entry.packet.messageIds.includes(id))
+              || [...entry.received.keys()].some((id) => !packet.messageIds.includes(id))) throw new Error("completion mismatch");
+            entry.staged = packet;
+          }
+          return { outcome, requestedIds: [...entry.packet.messageIds], observedIds: [...entry.received.keys()].sort(), completedIds: [...packet.messageIds], isCompleted: Boolean(committedPrior) };
+        },
+        finishCompletion(requestId: string, durable: boolean) {
+          const entry = requests.get(requestId);
+          if (!entry?.staged) throw new Error("missing staged completion");
+          if (durable) {
+            entry.completion = entry.staged;
+            entry.received.clear();
+          }
+          entry.staged = undefined;
+        },
+        verifyDurableMessages(requestId: string, packets: MessagePacket[]) {
+          const entry = requests.get(requestId);
+          if (!entry || entry.received.size !== packets.length) return false;
+          const byId = new Map(packets.map((packet) => [packet.id, packet]));
+          return [...entry.received].every(([id, packet]) => JSON.stringify(byId.get(id)) === JSON.stringify(packet));
         },
         free: () => { wasmState.frees += 1; },
       };
@@ -174,6 +230,45 @@ describe("SyncCoordinator", () => {
     expect(state).toBe("partial");
     expect(wasmState.frees).toBe(2);
     coordinator.stop();
+  });
+
+  it("bounds blocked sender identities and stops cleanly when the cap is full", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({ sender: "local-a", room, makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => []), validateMessage: () => true, onState: (next) => { state = next; } });
+    const internal = coordinator as unknown as { stopped: boolean; blockedSenders: Set<string>; remote: Map<string, unknown>; wasmRequestBooks: Map<string, unknown> };
+    await coordinator.start();
+
+    for (let peer = 0; peer < 16; peer += 1) {
+      const sender = `blocked-peer-${peer}`;
+      for (let index = 0; index < 193; index += 1) {
+        await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: `blocked-${peer}-${index}`, sender, targetSender: "local-a", messageIds: ["saved"] });
+      }
+    }
+    expect(internal.blockedSenders.size).toBe(16);
+    expect(state).toBe("partial");
+
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "overflow-session", sender: "overflow-peer", cursor: null, messageIds: [], nextCursor: null, hasMore: false, limitReached: false });
+    expect(internal.remote.size).toBe(1);
+    const freesBeforeOverflow = wasmState.frees;
+    for (let index = 0; index < 193; index += 1) {
+      await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: `overflow-${index}`, sender: "overflow-peer", targetSender: "local-a", messageIds: ["saved"] });
+    }
+
+    expect(state).toBe("partial");
+    expect(internal.stopped).toBe(true);
+    expect(internal.blockedSenders.size).toBe(0);
+    expect(internal.remote.size).toBe(0);
+    expect(internal.wasmRequestBooks.size).toBe(0);
+    expect(wasmState.frees).toBeGreaterThan(freesBeforeOverflow);
+    const requestCountAtStop = wasmState.registeredRequests.length;
+    for (let peer = 0; peer < 32; peer += 1) {
+      await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: `after-stop-${peer}`, sender: `after-stop-peer-${peer}`, targetSender: "local-a", messageIds: ["saved"] });
+    }
+    expect(wasmState.registeredRequests).toHaveLength(requestCountAtStop);
+    expect(internal.blockedSenders.size).toBe(0);
+    expect(internal.remote.size).toBe(0);
+    expect(internal.wasmRequestBooks.size).toBe(0);
   });
 
   it("abandons a response when its sender is blocked during storage loading", async () => {
@@ -529,6 +624,50 @@ describe("SyncCoordinator", () => {
     expect(state).toBe("partial");
     expect(detail).toContain("Reconnect");
     expect(sent.filter((value) => value.type === "sync_missing_request")).toHaveLength(1);
+    coordinator.stop();
+  });
+
+  it("frees exchange state on stop and prevents stale async completion from reviving after restart", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let requestId = 0;
+    let releaseDurableCheck!: (rows: StoredMessage[]) => void;
+    const pendingDurableCheck = new Promise<StoredMessage[]>((resolve) => { releaseDurableCheck = resolve; });
+    let durableLoads = 0;
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: () => `lifecycle-${++requestId}`,
+      send: (value) => sent.push(value),
+      ...boundedStorage(async () => []),
+      loadRequestedMessages: async (ids: string[]) => {
+        if (ids.length > 0) {
+          durableLoads += 1;
+          return pendingDurableCheck;
+        }
+        return [];
+      },
+      validateMessage: () => true,
+      onState: (next) => { state = next; },
+    });
+    await coordinator.start();
+    const remote: SyncPacket = { version: 1, type: "sync_inventory_page", room, syncId: "remote-life", sender: "local-b", cursor: null, messageIds: ["pending"], nextCursor: "pending", hasMore: false, limitReached: false };
+    await coordinator.receive(remote);
+    await vi.waitFor(() => expect(sent.some((value) => value.type === "sync_missing_request")).toBe(true));
+    const request = sent.find((value): value is Extract<SyncPacket, { type: "sync_missing_request" }> => value.type === "sync_missing_request")!;
+    coordinator.observeAcceptedMessage(packet("pending", "local-b"));
+    const completing = coordinator.receive({ version: 1, type: "sync_page_complete", room, syncId: request.syncId, requestId: request.requestId, sender: "local-b", targetSender: "local-a", messageIds: ["pending"] });
+    await vi.waitFor(() => expect(durableLoads).toBe(1));
+    const freedBeforeRestart = wasmState.frees;
+    coordinator.stop();
+    expect(wasmState.frees).toBeGreaterThan(freedBeforeRestart);
+    await coordinator.start();
+    const freshSentCount = sent.length;
+    releaseDurableCheck([stored("pending", "local-b")]);
+    await completing;
+    await Promise.resolve();
+    expect(state).toBe("syncing");
+    expect(sent.slice(freshSentCount).some((value) => value.type === "sync_missing_request" || value.type === "sync_page_complete")).toBe(false);
     coordinator.stop();
   });
 

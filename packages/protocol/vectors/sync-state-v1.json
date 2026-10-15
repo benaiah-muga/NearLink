@@ -143,5 +143,55 @@
     "operations": [
     {"kind":"plan_batch","value":{"missingIds":["a"],"offset":2},"expected":{"ok":false,"code":"invalid_page_limit"}}
     ]
+  },
+  {
+    "name": "received message matching conflict and staged completion lifecycle",
+    "operations": [
+      {"kind":"request","value":{"version":1,"type":"sync_missing_request","room":"room1","syncId":"sync-1","requestId":"stage-1","sender":"device-a","targetSender":"device-b","messageIds":["alpha","beta"]},"expected":{"ok":true,"outcome":"accepted"}},
+      {"kind":"observe_message","value":{"version":1,"type":"message","id":"alpha","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:00Z","body":"one"},"expected":{"ok":true,"outcome":"matched"}},
+      {"kind":"observe_message","value":{"version":1,"type":"message","id":"alpha","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:00Z","body":"two"},"expected":{"ok":false,"code":"message_conflict"}},
+      {"kind":"stage_completion","value":{"version":1,"type":"sync_page_complete","room":"room1","syncId":"sync-1","requestId":"stage-1","sender":"device-b","targetSender":"device-a","messageIds":[]},"expected":{"ok":false,"code":"invalid_sync_completion"}},
+      {"kind":"stage_completion","value":{"version":1,"type":"sync_page_complete","room":"room1","syncId":"sync-1","requestId":"stage-1","sender":"device-b","targetSender":"device-a","messageIds":["alpha"]},"expected":{"ok":true,"outcome":"accepted","requestedIds":["alpha","beta"],"observedIds":["alpha"],"completedIds":["alpha"],"isCompleted":false}},
+      {"kind":"observe_message","value":{"version":1,"type":"message","id":"alpha","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:00Z","body":"changed during storage verification"},"expected":{"ok":false,"code":"message_conflict"}},
+      {"kind":"finish_completion","value":{"requestId":"stage-1","durable":false},"expected":{"ok":true}},
+      {"kind":"stage_completion","value":{"version":1,"type":"sync_page_complete","room":"room1","syncId":"sync-1","requestId":"stage-1","sender":"device-b","targetSender":"device-a","messageIds":["alpha"]},"expected":{"ok":true,"outcome":"accepted","requestedIds":["alpha","beta"],"observedIds":["alpha"],"completedIds":["alpha"],"isCompleted":false}},
+      {"kind":"finish_completion","value":{"requestId":"stage-1","durable":true},"expected":{"ok":true}},
+      {"kind":"stage_completion","value":{"version":1,"type":"sync_page_complete","room":"room1","syncId":"sync-1","requestId":"stage-1","sender":"device-b","targetSender":"device-a","messageIds":["alpha"]},"expected":{"ok":true,"outcome":"duplicate","requestedIds":["alpha","beta"],"observedIds":[],"completedIds":["alpha"],"isCompleted":true}},
+      {"kind":"reset_state","value":{},"expected":{"ok":true}},
+      {"kind":"request","value":{"version":1,"type":"sync_missing_request","room":"room1","syncId":"sync-1","requestId":"stage-1","sender":"device-a","targetSender":"device-b","messageIds":["alpha","beta"]},"expected":{"ok":true,"outcome":"accepted"}}
+    ]
+  },
+  {
+    "name": "request state enforces its fixed capacity",
+    "operations": [
+      {"kind":"fill_requests","value":{"count":64},"expected":{"ok":true,"count":64}},
+      {"kind":"request","value":{"version":1,"type":"sync_missing_request","room":"room1","syncId":"sync-1","requestId":"over-limit","sender":"device-a","targetSender":"device-b","messageIds":["alpha"]},"expected":{"ok":false,"code":"sync_request_limit"}}
+    ]
+  },
+  {
+    "name": "inventory missing plan and batch cursor are bounded Rust state",
+    "operations": [
+      {"kind":"inventory_page","value":{"version":1,"type":"sync_inventory_page","room":"room1","syncId":"sync-1","sender":"device-a","cursor":null,"messageIds":["a","b","c"],"nextCursor":"c","hasMore":false,"limitReached":false},"expected":{"ok":true,"outcome":"accepted","ids":["a","b","c"],"complete":true,"limitReached":false}},
+      {"kind":"set_missing_ids","value":{"ids":["a","c"]},"expected":{"ok":true}},
+      {"kind":"inventory_batch","value":{},"expected":{"ok":true,"ids":["a","c"],"hasMore":false}},
+      {"kind":"inventory_batch","value":{},"expected":{"ok":true,"ids":[],"hasMore":false}},
+      {"kind":"reset_state","value":{},"expected":{"ok":true}},
+      {"kind":"inventory_batch","value":{},"expected":{"ok":false,"code":"invalid_sync_request"}}
+    ]
+  },
+  {
+    "name": "staged completion remains observable until the async durable check commits",
+    "operations": [
+      {"kind":"request","value":{"version":1,"type":"sync_missing_request","room":"room1","syncId":"sync-1","requestId":"race-1","sender":"device-a","targetSender":"device-b","messageIds":["alpha","beta"]},"expected":{"ok":true,"outcome":"accepted"}},
+      {"kind":"observe_message","value":{"version":1,"type":"message","id":"alpha","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:00Z","body":"one"},"expected":{"ok":true,"outcome":"matched"}},
+      {"kind":"outstanding","value":{"id":"alpha"},"expected":{"ok":true,"outstanding":true}},
+      {"kind":"stage_completion","value":{"version":1,"type":"sync_page_complete","room":"room1","syncId":"sync-1","requestId":"race-1","sender":"device-b","targetSender":"device-a","messageIds":["alpha","beta"]},"expected":{"ok":true,"outcome":"accepted","requestedIds":["alpha","beta"],"observedIds":["alpha"],"completedIds":["alpha","beta"],"isCompleted":false}},
+      {"kind":"outstanding","value":{"id":"beta"},"expected":{"ok":true,"outstanding":true}},
+      {"kind":"observe_message","value":{"version":1,"type":"message","id":"beta","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:01Z","body":"two"},"expected":{"ok":true,"outcome":"matched"}},
+      {"kind":"durable_check","value":{"requestId":"race-1","packets":[{"version":1,"type":"message","id":"alpha","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:00Z","body":"one"}]},"expected":{"ok":true,"matches":false}},
+      {"kind":"durable_check","value":{"requestId":"race-1","packets":[{"version":1,"type":"message","id":"alpha","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:00Z","body":"one"},{"version":1,"type":"message","id":"beta","room":"room1","sender":"device-b","senderName":"B","createdAt":"2026-10-14T12:00:01Z","body":"two"}]},"expected":{"ok":true,"matches":true}},
+      {"kind":"finish_completion","value":{"requestId":"race-1","durable":true},"expected":{"ok":true}},
+      {"kind":"outstanding","value":{"id":"beta"},"expected":{"ok":true,"outstanding":false}}
+    ]
   }
 ]

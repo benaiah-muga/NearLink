@@ -84,11 +84,20 @@ describe("WASM protocol validator bridge", () => {
       .mockReturnValueOnce(JSON.stringify({ ok: false, code: "inventory_conflict" }));
     class WasmSyncInventoryReceiver {
       accept_page_json = acceptPage;
+      set_missing_ids_json = vi.fn(() => JSON.stringify({ ok: true }));
+      next_missing_batch_json = vi.fn(() => JSON.stringify({ ok: true, ids: ["a"], hasMore: false }));
+      has_missing_plan = vi.fn(() => true);
+      has_missing_ids_remaining = vi.fn(() => false);
       free = inventoryFree;
     }
     class WasmSyncRequestBook {
       register_request_json = vi.fn(() => JSON.stringify({ ok: true, outcome: "accepted" }));
       accept_completion_json = vi.fn(() => JSON.stringify({ ok: true, outcome: "duplicate" }));
+      observe_message_json = vi.fn(() => JSON.stringify({ ok: true, outcome: "matched" }));
+      has_outstanding_message_id = vi.fn(() => true);
+      stage_completion_json = vi.fn(() => JSON.stringify({ ok: true, outcome: "accepted", requestedIds: ["a"], observedIds: ["a"], completedIds: ["a"], isCompleted: false }));
+      finish_completion_json = vi.fn(() => JSON.stringify({ ok: true }));
+      verify_durable_messages_json = vi.fn(() => JSON.stringify({ ok: true, matches: true }));
       free = requestFree;
     }
     const planMissingBatch = vi.fn(() => JSON.stringify({ ok: true, ids: ["b"], nextOffset: 1, hasMore: false }));
@@ -116,10 +125,19 @@ describe("WASM protocol validator bridge", () => {
     const inventory = bridge.createWasmSyncInventoryReceiver();
     expect(inventory.acceptPage({ type: "sync_inventory_page" } as never)).toEqual({ outcome: "accepted", ids: ["a"], complete: true, limitReached: false });
     expect(() => inventory.acceptPage({ type: "sync_inventory_page" } as never)).toThrow("WASM rejected synchronization inventory state.");
+    inventory.setMissingIds(["a"]);
+    expect(inventory.nextMissingBatch()).toEqual({ ids: ["a"], hasMore: false });
+    expect(inventory.hasMissingPlan()).toBe(true);
+    expect(inventory.hasMissingIdsRemaining()).toBe(false);
     inventory.free();
     const requests = bridge.createWasmSyncRequestBook();
     expect(requests.registerRequest({ type: "sync_missing_request" } as never)).toBe("accepted");
     expect(requests.acceptCompletion({ type: "sync_page_complete" } as never)).toBe("duplicate");
+    expect(requests.observeMessage({ type: "message" } as never)).toBe("matched");
+    expect(requests.hasOutstandingMessageId("a")).toBe(true);
+    expect(requests.stageCompletion({ type: "sync_page_complete" } as never)).toEqual({ outcome: "accepted", requestedIds: ["a"], observedIds: ["a"], completedIds: ["a"], isCompleted: false });
+    requests.finishCompletion("request-1", true);
+    expect(requests.verifyDurableMessages("request-1", [{ type: "message" } as never])).toBe(true);
     requests.free();
     const selector = bridge.createWasmMissingIdSelector(["a", "b"]);
     selector.observeLocalIds(["a"]);
@@ -134,8 +152,8 @@ describe("WASM protocol validator bridge", () => {
     expect(bridge.planWasmMissingBatch(["b"], 0)).toEqual({ ids: ["b"], nextOffset: 1, hasMore: false });
     expect(observeLocalIds).toHaveBeenCalledWith('["a"]');
     expect(planMissingBatch).toHaveBeenCalledWith('["b"]', 0);
-    expect(inventoryFree).toHaveBeenCalledOnce();
-    expect(requestFree).toHaveBeenCalledOnce();
+    expect(inventoryFree).toHaveBeenCalledTimes(2);
+    expect(requestFree).toHaveBeenCalledTimes(2);
     expect(selectorFree).toHaveBeenCalledTimes(2);
   });
 });

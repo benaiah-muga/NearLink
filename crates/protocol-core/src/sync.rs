@@ -38,6 +38,10 @@ use crate::{
 
 /// Maximum request IDs retained by one ephemeral sync exchange.
 pub const MAX_SYNC_REQUESTS: usize = 64;
+/// Maximum packet bytes retained while matching messages to open requests.
+pub const MAX_SYNC_OBSERVED_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum packet count retained while matching messages to open requests.
+pub const MAX_SYNC_OBSERVED_MESSAGES: usize = 128;
 
 /// Maximum number of unique message packets retained by one index.
 pub const MAX_INDEX_MESSAGES: usize = 4_096;
@@ -195,6 +199,8 @@ pub enum SyncError {
     SyncRequestLimit,
     /// A request ID was reused with different contents.
     SyncRequestConflict,
+    /// Retained requested messages exceed the exchange count or byte bound.
+    SyncObservedLimit,
     /// A completion did not match its request or contained unrequested IDs.
     InvalidSyncCompletion,
 }
@@ -220,6 +226,9 @@ impl fmt::Display for SyncError {
             Self::InvalidSyncRequest => "invalid synchronization request",
             Self::SyncRequestLimit => "outstanding synchronization requests exceed count limit",
             Self::SyncRequestConflict => "synchronization request ID conflicts",
+            Self::SyncObservedLimit => {
+                "retained synchronization messages exceed the exchange limit"
+            }
             Self::InvalidSyncCompletion => "synchronization completion does not match its request",
         };
         formatter.write_str(message)
@@ -252,6 +261,8 @@ pub struct SyncInventoryReceiver {
     pages: BTreeMap<Option<String>, Value>,
     complete: bool,
     limit_reached: bool,
+    missing_ids: Option<Vec<String>>,
+    next_missing_offset: usize,
 }
 
 impl Default for SyncInventoryReceiver {
@@ -271,6 +282,8 @@ impl SyncInventoryReceiver {
             pages: BTreeMap::new(),
             complete: false,
             limit_reached: false,
+            missing_ids: None,
+            next_missing_offset: 0,
         }
     }
 
@@ -356,6 +369,52 @@ impl SyncInventoryReceiver {
     pub fn limit_reached(&self) -> bool {
         self.complete && self.limit_reached
     }
+
+    /// Store the result of comparing this inventory with the local snapshot.
+    pub fn set_missing_ids(&mut self, missing_ids: Vec<String>) -> Result<(), SyncError> {
+        if !self.complete {
+            return Err(SyncError::InvalidInventorySequence);
+        }
+        validate_ordered_ids(&missing_ids)?;
+        if missing_ids
+            .iter()
+            .any(|id| self.ids.binary_search(id).is_err())
+        {
+            return Err(SyncError::InvalidSyncRequest);
+        }
+        if let Some(previous) = &self.missing_ids {
+            return if previous == &missing_ids {
+                Ok(())
+            } else {
+                Err(SyncError::SyncRequestConflict)
+            };
+        }
+        self.missing_ids = Some(missing_ids);
+        self.next_missing_offset = 0;
+        Ok(())
+    }
+
+    /// Return and consume the next bounded request batch from the frozen plan.
+    pub fn next_missing_batch(&mut self) -> Result<(Vec<String>, bool), SyncError> {
+        let missing_ids = self
+            .missing_ids
+            .as_ref()
+            .ok_or(SyncError::InvalidSyncRequest)?;
+        let ids = plan_missing_batch(missing_ids, self.next_missing_offset)?;
+        self.next_missing_offset += ids.len();
+        let has_more = self.next_missing_offset < missing_ids.len();
+        Ok((ids, has_more))
+    }
+
+    pub fn has_missing_plan(&self) -> bool {
+        self.missing_ids.is_some()
+    }
+
+    pub fn has_missing_ids_remaining(&self) -> bool {
+        self.missing_ids
+            .as_ref()
+            .is_some_and(|ids| self.next_missing_offset < ids.len())
+    }
 }
 
 /// Result of recording a missing-message request or completion.
@@ -365,20 +424,32 @@ pub enum SyncRequestOutcome {
     Duplicate,
 }
 
+/// Result of matching a durably accepted message to an outstanding request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMessageOutcome {
+    Matched,
+    Unmatched,
+}
+
 #[derive(Debug, Clone)]
 struct TrackedRequest {
     packet: Value,
+    received: BTreeMap<String, Value>,
+    staged_completion: Option<Value>,
     completion: Option<Value>,
 }
 
 /// Bounded validator for requests and their completion packets in one exchange.
 ///
 /// Each request contains at most 100 sorted IDs. Up to 64 request packets and
-/// their completion packets are retained, preventing unbounded replay state.
+/// their completion packets are retained. Observed packet copies are capped at
+/// 128 messages and 2 MiB per book, preventing unbounded replay and match state.
 #[derive(Debug, Clone, Default)]
 pub struct SyncRequestBook {
     requests: BTreeMap<String, TrackedRequest>,
     session: Option<(String, String, String, String)>,
+    observed_bytes: usize,
+    observed_count: usize,
 }
 
 impl SyncRequestBook {
@@ -427,6 +498,8 @@ impl SyncRequestBook {
             request_id.to_owned(),
             TrackedRequest {
                 packet,
+                received: BTreeMap::new(),
+                staged_completion: None,
                 completion: None,
             },
         );
@@ -435,6 +508,109 @@ impl SyncRequestBook {
     }
 
     pub fn accept_completion(&mut self, packet: Value) -> Result<SyncRequestOutcome, SyncError> {
+        match self.stage_completion(packet.clone())? {
+            SyncRequestOutcome::Duplicate => Ok(SyncRequestOutcome::Duplicate),
+            SyncRequestOutcome::Accepted => {
+                self.finish_completion(
+                    packet["requestId"].as_str().expect("validated request ID"),
+                    true,
+                )?;
+                Ok(SyncRequestOutcome::Accepted)
+            }
+        }
+    }
+
+    /// Observe a message after the caller has durably accepted it.
+    /// The packet is retained only when it matches an outstanding request.
+    pub fn observe_message(&mut self, packet: Value) -> Result<SyncMessageOutcome, SyncError> {
+        if !is_message_packet(&packet) {
+            return Err(SyncError::InvalidMessage);
+        }
+        let id = packet["id"].as_str().expect("validated message ID");
+        let room = packet["room"].as_str().expect("validated message room");
+        let sender = packet["sender"].as_str().expect("validated message sender");
+        let matches_request = |tracked: &TrackedRequest| {
+            tracked.completion.is_none()
+                && tracked.packet["room"] == room
+                && tracked.packet["targetSender"] == sender
+                && tracked.packet["messageIds"]
+                    .as_array()
+                    .expect("validated request IDs")
+                    .iter()
+                    .any(|requested| requested.as_str() == Some(id))
+        };
+        let matching_requests = self
+            .requests
+            .values()
+            .filter(|tracked| matches_request(tracked))
+            .collect::<Vec<_>>();
+        if matching_requests.iter().any(|tracked| {
+            tracked
+                .staged_completion
+                .as_ref()
+                .is_some_and(|completion| {
+                    !completion["messageIds"]
+                        .as_array()
+                        .expect("validated completion IDs")
+                        .iter()
+                        .any(|completed| completed.as_str() == Some(id))
+                })
+        }) {
+            return Err(SyncError::InvalidSyncCompletion);
+        }
+        if matching_requests.iter().any(|tracked| {
+            tracked
+                .received
+                .get(id)
+                .is_some_and(|previous| previous != &packet)
+        }) {
+            return Err(SyncError::MessageConflict);
+        }
+        if matching_requests.is_empty() {
+            return Ok(SyncMessageOutcome::Unmatched);
+        }
+        let additional = matching_requests
+            .iter()
+            .filter(|tracked| !tracked.received.contains_key(id))
+            .count();
+        if additional > 0 {
+            let packet_bytes = compact_json_len_with_limit(&packet, MAX_ENVELOPE_BYTES)
+                .ok_or(SyncError::EnvelopeTooLarge)?;
+            if self.observed_count.saturating_add(additional) > MAX_SYNC_OBSERVED_MESSAGES
+                || self
+                    .observed_bytes
+                    .saturating_add(packet_bytes.saturating_mul(additional))
+                    > MAX_SYNC_OBSERVED_BYTES
+            {
+                return Err(SyncError::SyncObservedLimit);
+            }
+            self.observed_count += additional;
+            self.observed_bytes += packet_bytes * additional;
+        }
+        for tracked in self.requests.values_mut() {
+            if tracked.completion.is_some()
+                || tracked.packet["room"] != room
+                || tracked.packet["targetSender"] != sender
+                || !tracked.packet["messageIds"]
+                    .as_array()
+                    .expect("validated request IDs")
+                    .iter()
+                    .any(|requested| requested.as_str() == Some(id))
+            {
+                continue;
+            }
+            if let Some(previous) = tracked.received.get(id) {
+                debug_assert_eq!(previous, &packet);
+                continue;
+            }
+            tracked.received.insert(id.to_owned(), packet.clone());
+        }
+        Ok(SyncMessageOutcome::Matched)
+    }
+
+    /// Validate a completion and stage it while the caller checks durable storage.
+    /// The staged value is not considered complete until `finish_completion(true)`.
+    pub fn stage_completion(&mut self, packet: Value) -> Result<SyncRequestOutcome, SyncError> {
         if !is_sync_page_complete_packet(&packet) {
             return Err(SyncError::InvalidSyncCompletion);
         }
@@ -444,6 +620,13 @@ impl SyncRequestBook {
             .get_mut(request_id)
             .ok_or(SyncError::InvalidSyncCompletion)?;
         if let Some(previous) = &tracked.completion {
+            return if previous == &packet {
+                Ok(SyncRequestOutcome::Duplicate)
+            } else {
+                Err(SyncError::SyncRequestConflict)
+            };
+        }
+        if let Some(previous) = &tracked.staged_completion {
             return if previous == &packet {
                 Ok(SyncRequestOutcome::Duplicate)
             } else {
@@ -477,8 +660,125 @@ impl SyncRequestBook {
             }
             request_offset += 1;
         }
-        tracked.completion = Some(packet);
+        let completed_ids = packet["messageIds"]
+            .as_array()
+            .expect("validated completion IDs");
+        if tracked
+            .received
+            .keys()
+            .any(|id| !completed_ids.iter().any(|value| value.as_str() == Some(id)))
+        {
+            return Err(SyncError::InvalidSyncCompletion);
+        }
+        tracked.staged_completion = Some(packet);
         Ok(SyncRequestOutcome::Accepted)
+    }
+
+    /// Commit or discard a previously staged completion after durable checks.
+    pub fn finish_completion(&mut self, request_id: &str, durable: bool) -> Result<(), SyncError> {
+        let tracked = self
+            .requests
+            .get_mut(request_id)
+            .ok_or(SyncError::InvalidSyncCompletion)?;
+        let staged = tracked
+            .staged_completion
+            .take()
+            .ok_or(SyncError::InvalidSyncCompletion)?;
+        if durable {
+            for packet in tracked.received.values() {
+                if let Some(bytes) = compact_json_len_with_limit(packet, MAX_ENVELOPE_BYTES) {
+                    self.observed_bytes = self.observed_bytes.saturating_sub(bytes);
+                    self.observed_count = self.observed_count.saturating_sub(1);
+                }
+            }
+            tracked.completion = Some(staged);
+            tracked.received.clear();
+        }
+        Ok(())
+    }
+
+    pub fn requested_ids(&self, request_id: &str) -> Option<Vec<String>> {
+        self.requests.get(request_id).map(|tracked| {
+            tracked.packet["messageIds"]
+                .as_array()
+                .expect("validated request IDs")
+                .iter()
+                .map(|value| value.as_str().expect("validated ID").to_owned())
+                .collect()
+        })
+    }
+
+    pub fn observed_ids(&self, request_id: &str) -> Option<Vec<String>> {
+        self.requests
+            .get(request_id)
+            .map(|tracked| tracked.received.keys().cloned().collect())
+    }
+
+    pub fn completion_ids(&self, request_id: &str) -> Option<Vec<String>> {
+        self.requests.get(request_id).and_then(|tracked| {
+            tracked
+                .staged_completion
+                .as_ref()
+                .or(tracked.completion.as_ref())
+                .map(|packet| {
+                    packet["messageIds"]
+                        .as_array()
+                        .expect("validated completion IDs")
+                        .iter()
+                        .map(|value| value.as_str().expect("validated ID").to_owned())
+                        .collect()
+                })
+        })
+    }
+
+    pub fn is_completed(&self, request_id: &str) -> bool {
+        self.requests
+            .get(request_id)
+            .is_some_and(|tracked| tracked.completion.is_some())
+    }
+
+    pub fn verify_durable_messages(
+        &self,
+        request_id: &str,
+        packets: &[Value],
+    ) -> Result<bool, SyncError> {
+        let tracked = self
+            .requests
+            .get(request_id)
+            .ok_or(SyncError::InvalidSyncCompletion)?;
+        let mut durable = BTreeMap::new();
+        for packet in packets {
+            if !is_message_packet(packet) || packet["room"] != tracked.packet["room"] {
+                return Err(SyncError::InvalidMessage);
+            }
+            let id = packet["id"]
+                .as_str()
+                .expect("validated message ID")
+                .to_owned();
+            if durable.insert(id, packet).is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(tracked.received.len() == durable.len()
+            && tracked
+                .received
+                .iter()
+                .all(|(id, expected)| durable.get(id).is_some_and(|actual| *actual == expected)))
+    }
+
+    pub fn has_request(&self, request_id: &str) -> bool {
+        self.requests.contains_key(request_id)
+    }
+
+    pub fn has_outstanding_message_id(&self, id: &str) -> bool {
+        self.requests.values().any(|tracked| {
+            tracked.completion.is_none()
+                && tracked.packet["messageIds"]
+                    .as_array()
+                    .expect("validated request IDs")
+                    .iter()
+                    .any(|value| value.as_str() == Some(id))
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -876,6 +1176,28 @@ mod tests {
                             },
                         }),
                     },
+                    "set_missing_ids" => {
+                        let ids: Vec<String> =
+                            serde_json::from_value(value["ids"].clone()).unwrap();
+                        match inventory.set_missing_ids(ids) {
+                            Ok(()) => serde_json::json!({"ok": true}),
+                            Err(error) => serde_json::json!({"ok": false, "code": match error {
+                                SyncError::InvalidInventorySequence => "invalid_inventory_sequence",
+                                SyncError::InvalidSyncRequest => "invalid_sync_request",
+                                SyncError::InvalidIdentifier => "invalid_identifier",
+                                _ => panic!("unexpected missing-plan vector error: {error}"),
+                            }}),
+                        }
+                    }
+                    "inventory_batch" => match inventory.next_missing_batch() {
+                        Ok((ids, has_more)) => {
+                            serde_json::json!({"ok": true, "ids": ids, "hasMore": has_more})
+                        }
+                        Err(error) => serde_json::json!({"ok": false, "code": match error {
+                            SyncError::InvalidSyncRequest => "invalid_sync_request",
+                            _ => panic!("unexpected inventory-batch vector error: {error}"),
+                        }}),
+                    },
                     "request" => match requests.register_request(value) {
                         Ok(outcome) => serde_json::json!({
                             "ok": true,
@@ -888,6 +1210,7 @@ mod tests {
                             "ok": false,
                             "code": match error {
                                 SyncError::SyncRequestConflict => "sync_request_conflict",
+                                SyncError::SyncRequestLimit => "sync_request_limit",
                                 _ => panic!("unexpected request vector error: {error}"),
                             },
                         }),
@@ -909,6 +1232,97 @@ mod tests {
                             },
                         }),
                     },
+                    "observe_message" => match requests.observe_message(value) {
+                        Ok(outcome) => serde_json::json!({
+                            "ok": true,
+                            "outcome": match outcome {
+                                SyncMessageOutcome::Matched => "matched",
+                                SyncMessageOutcome::Unmatched => "unmatched",
+                            },
+                        }),
+                        Err(error) => serde_json::json!({
+                            "ok": false,
+                            "code": match error {
+                                SyncError::MessageConflict => "message_conflict",
+                                SyncError::InvalidMessage => "invalid_message",
+                                SyncError::SyncObservedLimit => "sync_observed_limit",
+                                _ => panic!("unexpected observed-message vector error: {error}"),
+                            },
+                        }),
+                    },
+                    "stage_completion" => match requests.stage_completion(value) {
+                        Ok(outcome) => {
+                            let request_id = operation["value"]["requestId"].as_str().unwrap();
+                            serde_json::json!({
+                                "ok": true,
+                                "outcome": match outcome {
+                                    SyncRequestOutcome::Accepted => "accepted",
+                                    SyncRequestOutcome::Duplicate => "duplicate",
+                                },
+                                "requestedIds": requests.requested_ids(request_id).unwrap_or_default(),
+                                "observedIds": requests.observed_ids(request_id).unwrap_or_default(),
+                                "completedIds": requests.completion_ids(request_id).unwrap_or_default(),
+                                "isCompleted": requests.is_completed(request_id),
+                            })
+                        }
+                        Err(error) => serde_json::json!({
+                            "ok": false,
+                            "code": match error {
+                                SyncError::InvalidSyncCompletion => "invalid_sync_completion",
+                                SyncError::SyncRequestConflict => "sync_request_conflict",
+                                _ => panic!("unexpected staged-completion vector error: {error}"),
+                            },
+                        }),
+                    },
+                    "finish_completion" => {
+                        let request_id = value["requestId"].as_str().unwrap();
+                        match requests
+                            .finish_completion(request_id, value["durable"].as_bool().unwrap())
+                        {
+                            Ok(()) => serde_json::json!({"ok": true}),
+                            Err(error) => serde_json::json!({"ok": false, "code": match error {
+                                SyncError::InvalidSyncCompletion => "invalid_sync_completion",
+                                _ => panic!("unexpected finish-completion vector error: {error}"),
+                            }}),
+                        }
+                    }
+                    "outstanding" => serde_json::json!({
+                        "ok": true,
+                        "outstanding": requests.has_outstanding_message_id(value["id"].as_str().unwrap())
+                    }),
+                    "durable_check" => {
+                        let packets: Vec<Value> =
+                            serde_json::from_value(value["packets"].clone()).unwrap();
+                        match requests
+                            .verify_durable_messages(value["requestId"].as_str().unwrap(), &packets)
+                        {
+                            Ok(matches) => serde_json::json!({"ok": true, "matches": matches}),
+                            Err(error) => serde_json::json!({"ok": false, "code": match error {
+                                SyncError::InvalidSyncCompletion => "invalid_sync_completion",
+                                SyncError::InvalidMessage => "invalid_message",
+                                _ => panic!("unexpected durable-check vector error: {error}"),
+                            }}),
+                        }
+                    }
+                    "reset_state" => {
+                        inventory = SyncInventoryReceiver::new();
+                        requests = SyncRequestBook::new();
+                        serde_json::json!({"ok": true})
+                    }
+                    "fill_requests" => {
+                        let count = value["count"].as_u64().unwrap() as usize;
+                        for index in 0..count {
+                            let request = serde_json::json!({
+                                "version": 1, "type": "sync_missing_request", "room": "room1",
+                                "syncId": "sync-1", "requestId": format!("bounded-{index}"),
+                                "sender": "device-a", "targetSender": "device-b", "messageIds": ["alpha"]
+                            });
+                            requests
+                                .register_request(request)
+                                .expect("fill within request bound");
+                        }
+                        serde_json::json!({"ok": true, "count": requests.len()})
+                    }
                     kind => panic!("unknown sync vector operation: {kind}"),
                 };
                 assert_eq!(actual, operation["expected"], "vector: {}", vector["name"]);
@@ -1141,6 +1555,47 @@ mod tests {
             book.register_request(sync_request("one-too-many", &["a"])),
             Err(SyncError::SyncRequestLimit)
         );
+    }
+
+    #[test]
+    fn request_book_bounds_observed_packets_and_keeps_limit_failure_atomic() {
+        let mut book = SyncRequestBook::new();
+        for index in 0..MAX_SYNC_REQUESTS {
+            let request = sync_request(&format!("request-{index}"), &["a", "b", "c"]);
+            book.register_request(request).unwrap();
+        }
+        let observed = |id: &str| {
+            serde_json::json!({
+                "version": 1,
+                "type": "message",
+                "id": id,
+                "room": "room1",
+                "sender": "device-b",
+                "senderName": "B",
+                "createdAt": "2026-10-14T12:00:00Z",
+                "body": "payload",
+            })
+        };
+        assert_eq!(
+            book.observe_message(observed("a")),
+            Ok(SyncMessageOutcome::Matched)
+        );
+        assert_eq!(
+            book.observe_message(observed("b")),
+            Ok(SyncMessageOutcome::Matched)
+        );
+        assert_eq!(book.observed_count, MAX_SYNC_OBSERVED_MESSAGES);
+        assert_eq!(
+            book.observe_message(observed("c")),
+            Err(SyncError::SyncObservedLimit)
+        );
+        assert_eq!(book.observed_count, MAX_SYNC_OBSERVED_MESSAGES);
+        for index in 0..MAX_SYNC_REQUESTS {
+            assert_eq!(
+                book.observed_ids(&format!("request-{index}")).unwrap(),
+                ["a", "b"]
+            );
+        }
     }
 
     fn packet(id: &str, body: &str, created_at: &str) -> Value {

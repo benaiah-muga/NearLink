@@ -109,26 +109,41 @@ try {
     check(result(index.insert_json(" ".repeat(18 * 1024 + 1))).code === "input_too_large", "input limit missing");
 
     for (const vector of syncVectors) {
-      const inventory = new WasmSyncInventoryReceiver();
-      const requests = new WasmSyncRequestBook();
+      let inventory = new WasmSyncInventoryReceiver();
+      let requests = new WasmSyncRequestBook();
       let selector = null;
       for (const operation of vector.operations) {
         const encoded = JSON.stringify(operation.value);
-        const actual = operation.kind === "inventory_page"
-          ? result(inventory.accept_page_json(encoded))
-          : operation.kind === "selector_start"
-            ? (selector = new WasmMissingIdSelector(JSON.stringify(operation.value.peerIds)), result(selector.status_json()))
-            : operation.kind === "selector_local"
-              ? result(selector.observe_local_ids_json(JSON.stringify(operation.value.localIds)))
-              : operation.kind === "selector_finish"
-                ? result(selector.finish_json())
-                : operation.kind === "plan_batch"
-              ? result(plan_missing_batch_json(JSON.stringify(operation.value.missingIds), operation.value.offset))
-          : operation.kind === "request"
-            ? result(requests.register_request_json(encoded))
-            : operation.kind === "completion"
-              ? result(requests.accept_completion_json(encoded))
-              : (() => { throw new Error("unknown sync vector operation"); })();
+        let actual;
+        if (operation.kind === "inventory_page") actual = result(inventory.accept_page_json(encoded));
+        else if (operation.kind === "set_missing_ids") actual = result(inventory.set_missing_ids_json(JSON.stringify(operation.value.ids)));
+        else if (operation.kind === "inventory_batch") actual = result(inventory.next_missing_batch_json());
+        else if (operation.kind === "selector_start") {
+          selector = new WasmMissingIdSelector(JSON.stringify(operation.value.peerIds));
+          actual = result(selector.status_json());
+        } else if (operation.kind === "selector_local") actual = result(selector.observe_local_ids_json(JSON.stringify(operation.value.localIds)));
+        else if (operation.kind === "selector_finish") actual = result(selector.finish_json());
+        else if (operation.kind === "plan_batch") actual = result(plan_missing_batch_json(JSON.stringify(operation.value.missingIds), operation.value.offset));
+        else if (operation.kind === "request") actual = result(requests.register_request_json(encoded));
+        else if (operation.kind === "completion") actual = result(requests.accept_completion_json(encoded));
+        else if (operation.kind === "observe_message") actual = result(requests.observe_message_json(encoded));
+        else if (operation.kind === "stage_completion") actual = result(requests.stage_completion_json(encoded));
+        else if (operation.kind === "finish_completion") actual = result(requests.finish_completion_json(operation.value.requestId, operation.value.durable));
+        else if (operation.kind === "outstanding") actual = { ok: true, outstanding: requests.has_outstanding_message_id(operation.value.id) };
+        else if (operation.kind === "durable_check") actual = result(requests.verify_durable_messages_json(operation.value.requestId, JSON.stringify(operation.value.packets)));
+        else if (operation.kind === "reset_state") {
+          inventory.free();
+          requests.free();
+          inventory = new WasmSyncInventoryReceiver();
+          requests = new WasmSyncRequestBook();
+          actual = { ok: true };
+        } else if (operation.kind === "fill_requests") {
+          for (let index = 0; index < operation.value.count; index += 1) {
+            const request = { version: 1, type: "sync_missing_request", room: "room1", syncId: "sync-1", requestId: "bounded-" + index, sender: "device-a", targetSender: "device-b", messageIds: ["alpha"] };
+            requests.register_request_json(JSON.stringify(request));
+          }
+          actual = { ok: true, count: operation.value.count };
+        } else throw new Error("unknown sync vector operation");
         check(
           JSON.stringify(stable(actual)) === JSON.stringify(stable(operation.expected)),
           "sync state vector mismatch: " + vector.name + " (" + operation.kind + ")",
@@ -137,6 +152,8 @@ try {
           check(Object.keys(actual).sort().join(",") === "code,ok", "sync error leaked packet data");
         }
       }
+      inventory.free();
+      requests.free();
       selector?.free();
     }
     const oversized = " ".repeat(600 * 1024 + 1);

@@ -13,13 +13,30 @@ type WasmValidator = (validator: string, valueJson: string) => string;
 
 export interface SyncInventoryState {
   acceptPage(packet: SyncInventoryPagePacket): { outcome: "accepted" | "duplicate"; ids: string[]; complete: boolean; limitReached: boolean };
+  setMissingIds(ids: string[]): void;
+  nextMissingBatch(): { ids: string[]; hasMore: boolean };
+  hasMissingPlan(): boolean;
+  hasMissingIdsRemaining(): boolean;
   free(): void;
 }
 
 export interface SyncRequestState {
   registerRequest(packet: SyncMissingRequestPacket): "accepted" | "duplicate";
   acceptCompletion(packet: SyncPageCompletePacket): "accepted" | "duplicate";
+  observeMessage(packet: MessagePacket): "matched" | "unmatched";
+  hasOutstandingMessageId(id: string): boolean;
+  stageCompletion(packet: SyncPageCompletePacket): SyncStagedCompletion;
+  finishCompletion(requestId: string, durable: boolean): void;
+  verifyDurableMessages(requestId: string, packets: MessagePacket[]): boolean;
   free(): void;
+}
+
+export interface SyncStagedCompletion {
+  outcome: "accepted" | "duplicate" | "unknown";
+  requestedIds: string[];
+  observedIds: string[];
+  completedIds: string[];
+  isCompleted: boolean;
 }
 
 export interface SyncMissingBatch {
@@ -42,14 +59,27 @@ interface WasmSyncModule {
     finish_json(): string;
     free(): void;
   };
-  WasmSyncInventoryReceiver: new () => {
-    accept_page_json(pageJson: string): string;
-    free(): void;
+  WasmSyncInventoryReceiver: {
+    new (): {
+      accept_page_json(pageJson: string): string;
+      set_missing_ids_json(missingIdsJson: string): string;
+      next_missing_batch_json(): string;
+      has_missing_plan(): boolean;
+      has_missing_ids_remaining(): boolean;
+      free(): void;
+    };
   };
-  WasmSyncRequestBook: new () => {
-    register_request_json(requestJson: string): string;
-    accept_completion_json(completionJson: string): string;
-    free(): void;
+  WasmSyncRequestBook: {
+    new (): {
+      register_request_json(requestJson: string): string;
+      accept_completion_json(completionJson: string): string;
+      observe_message_json(messageJson: string): string;
+      has_outstanding_message_id(id: string): boolean;
+      stage_completion_json(completionJson: string): string;
+      finish_completion_json(requestId: string, durable: boolean): string;
+      verify_durable_messages_json(requestId: string, messagesJson: string): string;
+      free(): void;
+    };
   };
 }
 
@@ -80,10 +110,27 @@ export function initializeWasmProtocol(): Promise<boolean> {
       if (!validator || !acceptanceClassifier) throw new Error("Required WASM protocol exports are unavailable.");
       wasmValidator = validator;
       wasmAcceptanceClassifier = acceptanceClassifier;
+      const inventoryProbe = "WasmSyncInventoryReceiver" in wasm && typeof wasm.WasmSyncInventoryReceiver === "function"
+        ? new wasm.WasmSyncInventoryReceiver() : null;
+      const requestProbe = "WasmSyncRequestBook" in wasm && typeof wasm.WasmSyncRequestBook === "function"
+        ? new wasm.WasmSyncRequestBook() : null;
+      const inventoryApiReady = inventoryProbe !== null && typeof inventoryProbe.set_missing_ids_json === "function"
+        && typeof inventoryProbe.next_missing_batch_json === "function"
+        && typeof inventoryProbe.has_missing_plan === "function"
+        && typeof inventoryProbe.has_missing_ids_remaining === "function";
+      const requestApiReady = requestProbe !== null && typeof requestProbe.observe_message_json === "function"
+        && typeof requestProbe.stage_completion_json === "function"
+        && typeof requestProbe.finish_completion_json === "function"
+        && typeof requestProbe.verify_durable_messages_json === "function"
+        && typeof requestProbe.has_outstanding_message_id === "function";
+      inventoryProbe?.free();
+      requestProbe?.free();
       wasmSyncModule = "WasmSyncInventoryReceiver" in wasm && "WasmSyncRequestBook" in wasm
         && "WasmMissingIdSelector" in wasm && "plan_missing_batch_json" in wasm
         && typeof wasm.WasmSyncInventoryReceiver === "function"
         && typeof wasm.WasmSyncRequestBook === "function"
+        && inventoryApiReady
+        && requestApiReady
         && typeof wasm.WasmMissingIdSelector === "function"
         && typeof wasm.plan_missing_batch_json === "function" ? wasm : null;
       return true;
@@ -119,6 +166,17 @@ export function createWasmSyncInventoryReceiver(): SyncInventoryState {
       }
       return { outcome: result.outcome, ids: result.ids, complete: result.complete, limitReached: result.limitReached };
     },
+    setMissingIds(ids) {
+      const result = parseSyncResult(receiver.set_missing_ids_json(JSON.stringify(ids)));
+      if (result.ok !== true) throw new Error("WASM rejected the synchronization missing-ID plan.");
+    },
+    nextMissingBatch() {
+      const result = parseSyncResult(receiver.next_missing_batch_json());
+      if (result.ok !== true || !Array.isArray(result.ids) || !result.ids.every((id) => typeof id === "string") || typeof result.hasMore !== "boolean") throw new Error("WASM rejected synchronization request planning.");
+      return { ids: result.ids, hasMore: result.hasMore };
+    },
+    hasMissingPlan: () => receiver.has_missing_plan(),
+    hasMissingIdsRemaining: () => receiver.has_missing_ids_remaining(),
     free: () => receiver.free(),
   };
 }
@@ -136,6 +194,29 @@ export function createWasmSyncRequestBook(): SyncRequestState {
   return {
     registerRequest: (packet) => outcome(book.register_request_json(JSON.stringify(packet))),
     acceptCompletion: (packet) => outcome(book.accept_completion_json(JSON.stringify(packet))),
+    observeMessage(packet) {
+      const result = parseSyncResult(book.observe_message_json(JSON.stringify(packet)));
+      if (result.ok !== true || (result.outcome !== "matched" && result.outcome !== "unmatched")) throw new Error("WASM rejected synchronization message state.");
+      return result.outcome;
+    },
+    hasOutstandingMessageId: (id) => book.has_outstanding_message_id(id),
+    stageCompletion(packet) {
+      const result = parseSyncResult(book.stage_completion_json(JSON.stringify(packet)));
+      if (result.ok !== true || (result.outcome !== "accepted" && result.outcome !== "duplicate" && result.outcome !== "unknown")) throw new Error("WASM rejected synchronization completion state.");
+      const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every((id) => typeof id === "string");
+      if (result.outcome === "unknown") return { outcome: "unknown", requestedIds: [], observedIds: [], completedIds: [], isCompleted: false };
+      if (!stringArray(result.requestedIds) || !stringArray(result.observedIds) || !stringArray(result.completedIds) || typeof result.isCompleted !== "boolean") throw new Error("WASM returned malformed synchronization completion state.");
+      return { outcome: result.outcome, requestedIds: result.requestedIds, observedIds: result.observedIds, completedIds: result.completedIds, isCompleted: result.isCompleted };
+    },
+    finishCompletion(requestId, durable) {
+      const result = parseSyncResult(book.finish_completion_json(requestId, durable));
+      if (result.ok !== true) throw new Error("WASM could not finish synchronization completion state.");
+    },
+    verifyDurableMessages(requestId, packets) {
+      const result = parseSyncResult(book.verify_durable_messages_json(requestId, JSON.stringify(packets)));
+      if (result.ok !== true || typeof result.matches !== "boolean") throw new Error("WASM could not verify durable synchronization messages.");
+      return result.matches;
+    },
     free: () => book.free(),
   };
 }

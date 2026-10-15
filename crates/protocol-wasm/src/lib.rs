@@ -14,8 +14,8 @@
 
 use nearlink_protocol_core::sync::{
     plan_missing_batch, InsertOutcome, InventoryPageOutcome, MessageIndex, MissingIdSelector,
-    SyncError, SyncInventoryReceiver, SyncRequestBook, SyncRequestOutcome, MAX_ENVELOPE_BYTES,
-    MAX_SYNC_SELECTION_CHUNK_IDS,
+    SyncError, SyncInventoryReceiver, SyncMessageOutcome, SyncRequestBook, SyncRequestOutcome,
+    MAX_ENVELOPE_BYTES, MAX_SYNC_SELECTION_CHUNK_IDS,
 };
 use nearlink_protocol_core::{
     classify_inbound_acceptance, is_client_packet, is_history_page_complete_packet,
@@ -57,6 +57,7 @@ enum ErrorCode {
     InvalidSyncRequest,
     SyncRequestLimit,
     SyncRequestConflict,
+    SyncObservedLimit,
     InvalidSyncCompletion,
 }
 
@@ -84,6 +85,7 @@ impl ErrorCode {
             Self::InvalidSyncRequest => "invalid_sync_request",
             Self::SyncRequestLimit => "sync_request_limit",
             Self::SyncRequestConflict => "sync_request_conflict",
+            Self::SyncObservedLimit => "sync_observed_limit",
             Self::InvalidSyncCompletion => "invalid_sync_completion",
         }
     }
@@ -155,6 +157,7 @@ impl From<SyncError> for ErrorCode {
             SyncError::InvalidSyncRequest => Self::InvalidSyncRequest,
             SyncError::SyncRequestLimit => Self::SyncRequestLimit,
             SyncError::SyncRequestConflict => Self::SyncRequestConflict,
+            SyncError::SyncObservedLimit => Self::SyncObservedLimit,
             SyncError::InvalidSyncCompletion => Self::InvalidSyncCompletion,
         }
     }
@@ -436,6 +439,35 @@ impl WasmSyncInventoryReceiver {
             Err(error) => sync_error_json(error),
         }
     }
+
+    pub fn set_missing_ids_json(&mut self, missing_ids_json: &str) -> String {
+        if missing_ids_json.len() > MAX_KNOWN_IDS_JSON_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let missing_ids: Vec<String> = match serde_json::from_str(missing_ids_json) {
+            Ok(ids) => ids,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        match self.inner.set_missing_ids(missing_ids) {
+            Ok(()) => "{\"ok\":true}".to_owned(),
+            Err(error) => sync_error_json(error),
+        }
+    }
+
+    pub fn next_missing_batch_json(&mut self) -> String {
+        match self.inner.next_missing_batch() {
+            Ok((ids, has_more)) => json!({"ok": true, "ids": ids, "hasMore": has_more}).to_string(),
+            Err(error) => sync_error_json(error),
+        }
+    }
+
+    pub fn has_missing_plan(&self) -> bool {
+        self.inner.has_missing_plan()
+    }
+
+    pub fn has_missing_ids_remaining(&self) -> bool {
+        self.inner.has_missing_ids_remaining()
+    }
 }
 
 impl Default for WasmSyncInventoryReceiver {
@@ -493,6 +525,80 @@ impl WasmSyncRequestBook {
             Ok(SyncRequestOutcome::Duplicate) => {
                 json!({"ok": true, "outcome": "duplicate"}).to_string()
             }
+            Err(error) => sync_error_json(error),
+        }
+    }
+
+    /// Record a message only after the browser has durably accepted it.
+    pub fn observe_message_json(&mut self, message_json: &str) -> String {
+        if message_json.len() > MAX_ENVELOPE_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let message: Value = match serde_json::from_str(message_json) {
+            Ok(message) => message,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        match self.inner.observe_message(message) {
+            Ok(SyncMessageOutcome::Matched) => {
+                json!({"ok": true, "outcome": "matched"}).to_string()
+            }
+            Ok(SyncMessageOutcome::Unmatched) => {
+                json!({"ok": true, "outcome": "unmatched"}).to_string()
+            }
+            Err(error) => sync_error_json(error),
+        }
+    }
+
+    pub fn has_outstanding_message_id(&self, id: &str) -> bool {
+        self.inner.has_outstanding_message_id(id)
+    }
+
+    /// Validate and stage a peer completion while the browser checks storage.
+    pub fn stage_completion_json(&mut self, completion_json: &str) -> String {
+        if completion_json.len() > MAX_ENVELOPE_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let completion: Value = match serde_json::from_str(completion_json) {
+            Ok(completion) => completion,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        let request_id = completion
+            .get("requestId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if !self.inner.has_request(&request_id) {
+            return json!({"ok": true, "outcome": "unknown"}).to_string();
+        }
+        match self.inner.stage_completion(completion) {
+            Ok(outcome) => {
+                let requested = self.inner.requested_ids(&request_id).unwrap_or_default();
+                let observed = self.inner.observed_ids(&request_id).unwrap_or_default();
+                let completed = self.inner.completion_ids(&request_id).unwrap_or_default();
+                json!({"ok": true, "outcome": match outcome { SyncRequestOutcome::Accepted => "accepted", SyncRequestOutcome::Duplicate => "duplicate" }, "requestedIds": requested, "observedIds": observed, "completedIds": completed, "isCompleted": self.inner.is_completed(&request_id)}).to_string()
+            }
+            Err(error) => sync_error_json(error),
+        }
+    }
+
+    /// Finish a staged completion after durable validation, or discard its stage.
+    pub fn finish_completion_json(&mut self, request_id: &str, durable: bool) -> String {
+        match self.inner.finish_completion(request_id, durable) {
+            Ok(()) => "{\"ok\":true}".to_owned(),
+            Err(error) => sync_error_json(error),
+        }
+    }
+
+    pub fn verify_durable_messages_json(&self, request_id: &str, messages_json: &str) -> String {
+        if messages_json.len() > 2 * 1024 * 1024 {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let messages: Vec<Value> = match serde_json::from_str(messages_json) {
+            Ok(messages) => messages,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        match self.inner.verify_durable_messages(request_id, &messages) {
+            Ok(matches) => json!({"ok": true, "matches": matches}).to_string(),
             Err(error) => sync_error_json(error),
         }
     }
@@ -798,5 +904,71 @@ mod tests {
             parse_result(&requests.accept_completion_json(&completion.to_string())),
             json!({"ok": true, "outcome": "duplicate"})
         );
+    }
+
+    #[test]
+    fn shared_sync_exchange_vectors_match_through_wasm_facade() {
+        let vectors: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../packages/protocol/vectors/sync-state-v1.json"
+        ))
+        .expect("shared synchronization vectors are valid JSON");
+        for vector in vectors {
+            let mut inventory = WasmSyncInventoryReceiver::new();
+            let mut requests = WasmSyncRequestBook::new();
+            for operation in vector["operations"].as_array().unwrap() {
+                let kind = operation["kind"].as_str().unwrap();
+                let value = &operation["value"];
+                let actual = match kind {
+                    "inventory_page" => {
+                        parse_result(&inventory.accept_page_json(&value.to_string()))
+                    }
+                    "set_missing_ids" => {
+                        parse_result(&inventory.set_missing_ids_json(&value["ids"].to_string()))
+                    }
+                    "inventory_batch" => parse_result(&inventory.next_missing_batch_json()),
+                    "request" => parse_result(&requests.register_request_json(&value.to_string())),
+                    "completion" => {
+                        parse_result(&requests.accept_completion_json(&value.to_string()))
+                    }
+                    "observe_message" => {
+                        parse_result(&requests.observe_message_json(&value.to_string()))
+                    }
+                    "stage_completion" => {
+                        parse_result(&requests.stage_completion_json(&value.to_string()))
+                    }
+                    "finish_completion" => parse_result(&requests.finish_completion_json(
+                        value["requestId"].as_str().unwrap(),
+                        value["durable"].as_bool().unwrap(),
+                    )),
+                    "outstanding" => json!({
+                        "ok": true,
+                        "outstanding": requests.has_outstanding_message_id(value["id"].as_str().unwrap())
+                    }),
+                    "durable_check" => parse_result(&requests.verify_durable_messages_json(
+                        value["requestId"].as_str().unwrap(),
+                        &value["packets"].to_string(),
+                    )),
+                    "reset_state" => {
+                        inventory = WasmSyncInventoryReceiver::new();
+                        requests = WasmSyncRequestBook::new();
+                        json!({"ok": true})
+                    }
+                    "fill_requests" => {
+                        let count = value["count"].as_u64().unwrap() as usize;
+                        for index in 0..count {
+                            let request = json!({
+                                "version": 1, "type": "sync_missing_request", "room": "room1",
+                                "syncId": "sync-1", "requestId": format!("bounded-{index}"),
+                                "sender": "device-a", "targetSender": "device-b", "messageIds": ["alpha"]
+                            });
+                            requests.register_request_json(&request.to_string());
+                        }
+                        json!({"ok": true, "count": count})
+                    }
+                    _ => continue,
+                };
+                assert_eq!(actual, operation["expected"], "vector: {}", vector["name"]);
+            }
+        }
     }
 }
