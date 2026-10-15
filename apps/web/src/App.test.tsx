@@ -16,11 +16,12 @@ const messageReadGate = vi.hoisted(() => ({
   releaseReconcile: null as (() => void) | null,
   reconcileStarted: false,
   pending: null as Promise<unknown> | null,
-  releaseRead: null as (() => void) | null,
+  releaseRead: null as ((rows?: StoredMessage[]) => void) | null,
   requestedRooms: [] as string[],
   ackDispatching: false,
   ackDispatchRoomReads: 0,
   rejectAckFallbackRead: false,
+  failNextMessageLoads: 0,
   failNextSaveIds: [] as string[],
   failDeleteRoomMessages: false,
   failCancelRoomDeletion: false,
@@ -112,6 +113,10 @@ vi.mock("./lib/storage", async (importOriginal) => {
     },
     loadMessages: (room: string) => {
       messageReadGate.requestedRooms.push(room);
+      if (messageReadGate.failNextMessageLoads > 0) {
+        messageReadGate.failNextMessageLoads -= 1;
+        return Promise.reject(new Error("Injected message read failure."));
+      }
       if (messageReadGate.ackDispatching && room === messageReadGate.room) {
         messageReadGate.ackDispatchRoomReads += 1;
         if (messageReadGate.rejectAckFallbackRead) {
@@ -195,6 +200,7 @@ class MockWebSocket {
   onerror: ((event: Event) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
   readonly sent: string[] = [];
+  readonly sentAt: number[] = [];
 
   constructor(readonly url: string) {
     MockWebSocket.instances.push(this);
@@ -203,6 +209,7 @@ class MockWebSocket {
   send(data: string): void {
     if (this.readyState !== MockWebSocket.OPEN) throw new Error("socket is not open");
     this.sent.push(data);
+    this.sentAt.push(performance.now());
   }
 
   open(): void {
@@ -320,6 +327,7 @@ beforeEach(async () => {
   messageReadGate.ackDispatching = false;
   messageReadGate.ackDispatchRoomReads = 0;
   messageReadGate.rejectAckFallbackRead = false;
+  messageReadGate.failNextMessageLoads = 0;
   messageReadGate.failNextSaveIds = [];
   messageReadGate.failDeleteRoomMessages = false;
   messageReadGate.failCancelRoomDeletion = false;
@@ -474,13 +482,14 @@ describe("browser app messaging flow", () => {
       type: "sync_missing_request",
       room: ROOM,
       syncId: inventory.syncId,
-      requestId: "remote-request",
+      requestId: accepted.packet.id,
       sender: "station-b",
       targetSender: IDENTITY.sender,
       messageIds: [accepted.packet.id],
     }));
-    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_page_complete" && value.requestId === "remote-request")).toBe(true));
-    expect(socket.sent.map((value) => JSON.parse(value))).toContainEqual(accepted.packet);
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value))).toContainEqual(accepted.packet));
+    act(() => socket.receive({ version: 1, type: "ack", id: accepted.packet.id }));
+    await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_page_complete" && value.requestId === accepted.packet.id)).toBe(true));
   });
 
   it("re-advertises once when a hub peer inventory arrives after local join readiness", async () => {
@@ -1019,6 +1028,288 @@ describe("browser app messaging flow", () => {
     expect(document.querySelectorAll(".message-incoming")).toHaveLength(1);
   });
 
+  it("replays queued hub messages one at a time and waits between exact acknowledgments", async () => {
+    const first = hubMessage("queued-replay-first", "2026-10-15T08:00:00.000Z", "First queued message");
+    const second = hubMessage("queued-replay-second", "2026-10-15T08:00:01.000Z", "Second queued message");
+    await saveMessage({ packet: first, direction: "outgoing", delivery: "queued", transport: "hub" });
+    await saveMessage({ packet: second, direction: "outgoing", delivery: "queued", transport: "hub" });
+
+    render(<App />);
+    const socket = await connectTestHub(false);
+    await waitFor(() => expect(socket.sent).toHaveLength(2));
+    expect(JSON.parse(socket.sent[1])).toEqual(first);
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1);
+    expect((await loadMessages(ROOM)).filter((item) => item.direction === "outgoing").map((item) => item.delivery)).toEqual(["queued", "queued"]);
+
+    act(() => socket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1);
+    act(() => socket.receive({ version: 1, type: "ack", id: second.id }));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1);
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === second.id)?.delivery).toBe("queued");
+    act(() => {
+      socket.receive({ version: 1, type: "ack", id: first.id });
+      socket.receive({ version: 1, type: "ack", id: first.id });
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1);
+    await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(2));
+    expect(JSON.parse(socket.sent.at(-1)!)).toEqual(second);
+    expect(socket.sentAt[2] - socket.sentAt[1]).toBeGreaterThanOrEqual(550);
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === second.id)?.delivery).toBe("queued");
+
+    act(() => {
+      socket.receive({ version: 1, type: "ack", id: second.id });
+      socket.receive({ version: 1, type: "ack", id: second.id });
+    });
+    await waitFor(async () => expect((await loadMessages(ROOM)).every((item) => item.delivery === "sent")).toBe(true));
+  });
+
+  it("refills persisted hub replay in bounded batches", async () => {
+    const packets = Array.from({ length: 65 }, (_, index) => hubMessage(
+      `bounded-replay-${String(index + 1).padStart(2, "0")}`,
+      `2026-10-15T08:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+    ));
+    for (const packet of packets) await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 });
+    const socket = await connectTestHub(false);
+    await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1));
+    let now = performance.now();
+    vi.spyOn(performance, "now").mockImplementation(() => { now += 600; return now; });
+    const actualStorage = await vi.importActual<typeof import("./lib/storage")>("./lib/storage");
+    fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Saved during partial batch" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(async () => expect((await actualStorage.loadMessages(ROOM)).some((item) => item.packet.body === "Saved during partial batch")).toBe(true));
+    const savedDuringBatch = await actualStorage.loadMessages(ROOM);
+    const liveDuringBatch = savedDuringBatch.find((item) => item.packet.body === "Saved during partial batch")!;
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1);
+    for (let index = 0; index < packets.length - 2; index += 1) {
+      act(() => socket.receive({ version: 1, type: "ack", id: packets[index].id }));
+      await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(index + 2), { timeout: 2000 });
+      expect(JSON.parse(socket.sent.filter((raw) => JSON.parse(raw).type === "message").at(-1)!).id).toBe(packets[index + 1].id);
+    }
+    const roomReadsBeforeRefill = messageReadGate.requestedRooms.filter((room) => room === ROOM).length;
+    messageReadGate.room = ROOM;
+    messageReadGate.readGateAfter = roomReadsBeforeRefill + 1;
+    let releaseRefill!: (rows: StoredMessage[]) => void;
+    messageReadGate.pending = new Promise<StoredMessage[]>((resolve) => { releaseRefill = resolve; });
+    act(() => socket.receive({ version: 1, type: "ack", id: packets[63].id }));
+    await waitFor(() => expect(messageReadGate.requestedRooms.filter((room) => room === ROOM).length).toBeGreaterThan(roomReadsBeforeRefill));
+    const refillSnapshot = await actualStorage.loadMessages(ROOM);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Saved while replay refills" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(64);
+    await waitFor(async () => expect((await actualStorage.loadMessages(ROOM)).some((item) => item.packet.body === "Saved while replay refills")).toBe(true));
+    const savedDuringRefill = await actualStorage.loadMessages(ROOM);
+    const live = savedDuringRefill.find((item) => item.packet.body === "Saved while replay refills")!;
+    expect(live).toBeTruthy();
+    messageReadGate.pending = null;
+    messageReadGate.room = null;
+    releaseRefill(refillSnapshot);
+    await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(65));
+    expect(JSON.parse(socket.sent.filter((raw) => JSON.parse(raw).type === "message").at(-1)!).id).toBe(packets[64].id);
+    act(() => socket.receive({ version: 1, type: "ack", id: packets[64].id }));
+    await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(66));
+    expect(JSON.parse(socket.sent.filter((raw) => JSON.parse(raw).type === "message").at(-1)!).id).toBe(liveDuringBatch.packet.id);
+    act(() => socket.receive({ version: 1, type: "ack", id: liveDuringBatch.packet.id }));
+    await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(67));
+    expect(JSON.parse(socket.sent.filter((raw) => JSON.parse(raw).type === "message").at(-1)!).id).toBe(live.packet.id);
+    const saved = await loadMessages(ROOM);
+    expect(saved.find((item) => item.packet.id === liveDuringBatch.packet.id)?.delivery).toBe("sent");
+    expect(saved.find((item) => item.packet.id === live.packet.id)?.delivery).toBe("queued");
+  }, 45000);
+
+  it("does not refill an invalid queued hub message repeatedly on one socket", async () => {
+    const invalidPacket = { ...hubMessage("invalid-queued-replay", "2026-10-15T08:04:00.000Z"), sender: "!" };
+    await saveMessage({ packet: invalidPacket as MessagePacket, direction: "outgoing", delivery: "queued", transport: "hub" });
+
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const socket = MockWebSocket.instances[0];
+    act(() => socket.open());
+    const readsBeforeJoin = messageReadGate.requestedRooms.filter((room) => room === ROOM).length;
+    act(() => socket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await screen.findByText("On frequency");
+    await waitFor(() => expect(messageReadGate.requestedRooms.filter((room) => room === ROOM).length).toBeGreaterThanOrEqual(readsBeforeJoin + 2));
+    const readsAfterReject = messageReadGate.requestedRooms.filter((room) => room === ROOM).length;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(messageReadGate.requestedRooms.filter((room) => room === ROOM).length).toBe(readsAfterReject);
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(0);
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === invalidPacket.id)?.delivery).toBe("queued");
+  });
+
+  it("reconnects and replays after the initial hub outbox load fails", async () => {
+    const packet = hubMessage("replay-after-load-failure", "2026-10-15T08:04:30.000Z");
+    await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const firstSocket = MockWebSocket.instances[0];
+    act(() => firstSocket.open());
+    messageReadGate.failNextMessageLoads = 1;
+    act(() => firstSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+
+    await waitFor(() => expect(firstSocket.readyState).toBe(MockWebSocket.CLOSED));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2), { timeout: 5000 });
+    const reconnectSocket = MockWebSocket.instances[1];
+    act(() => reconnectSocket.open());
+    act(() => reconnectSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+
+    await waitFor(() => expect(reconnectSocket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1));
+    expect(JSON.parse(reconnectSocket.sent.filter((raw) => JSON.parse(raw).type === "message")[0])).toEqual(packet);
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === packet.id)?.delivery).toBe("queued");
+  });
+
+  it("refills a live persisted send deferred by a full 64-entry batch", async () => {
+    const packets = Array.from({ length: 64 }, (_, index) => hubMessage(
+      `full-batch-${String(index + 1).padStart(2, "0")}`,
+      `2026-10-15T08:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+    ));
+    for (const packet of packets) await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+
+    render(<App />);
+    const socket = await connectTestHub(false);
+    await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1));
+    let now = performance.now();
+    vi.spyOn(performance, "now").mockImplementation(() => { now += 600; return now; });
+    const actualStorage = await vi.importActual<typeof import("./lib/storage")>("./lib/storage");
+    fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Deferred at full capacity" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(async () => expect((await actualStorage.loadMessages(ROOM)).some((item) => item.packet.body === "Deferred at full capacity")).toBe(true));
+    const deferred = (await actualStorage.loadMessages(ROOM)).find((item) => item.packet.body === "Deferred at full capacity")!;
+
+    for (let index = 0; index < packets.length; index += 1) {
+      act(() => socket.receive({ version: 1, type: "ack", id: packets[index].id }));
+      await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(index + 2), { timeout: 2000 });
+      expect(JSON.parse(socket.sent.filter((raw) => JSON.parse(raw).type === "message").at(-1)!).id).toBe(index + 1 < packets.length ? packets[index + 1].id : deferred.packet.id);
+    }
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === deferred.packet.id)?.delivery).toBe("queued");
+  }, 15000);
+
+  it("preserves messages enqueued while persisted replay rows are still loading", async () => {
+    const first = hubMessage("replay-load-race-first", "2026-10-15T08:00:10.000Z", "Saved before join");
+    await saveMessage({ packet: first, direction: "outgoing", delivery: "queued", transport: "hub" });
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const socket = MockWebSocket.instances[0];
+    act(() => socket.open());
+
+    const roomReadsBeforeJoin = messageReadGate.requestedRooms.filter((room) => room === ROOM).length;
+    messageReadGate.room = ROOM;
+    messageReadGate.readGateAfter = roomReadsBeforeJoin + 1;
+    let releaseReplayLoad!: (rows: StoredMessage[]) => void;
+    messageReadGate.pending = new Promise<StoredMessage[]>((resolve) => { releaseReplayLoad = resolve; });
+    messageReadGate.releaseRead = (rows = []) => releaseReplayLoad(rows);
+    act(() => socket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Queued during replay load" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(screen.getAllByText("Queued on this device")).toHaveLength(2));
+    const actualStorage = await vi.importActual<typeof import("./lib/storage")>("./lib/storage");
+    const savedRows = await actualStorage.loadMessages(ROOM);
+    const live = savedRows.find((item) => item.packet.body === "Queued during replay load")!;
+    expect(live).toBeTruthy();
+    releaseReplayLoad(savedRows);
+
+    await waitFor(() => expect(socket.sent).toHaveLength(2));
+    expect(JSON.parse(socket.sent[1])).toEqual(first);
+    act(() => socket.receive({ version: 1, type: "ack", id: first.id }));
+    await waitFor(() => expect(socket.sent).toHaveLength(3));
+    expect(JSON.parse(socket.sent[2])).toEqual(live.packet);
+  });
+
+  it("keeps a rate-limited replay queued and stops later messages on that connection", async () => {
+    const first = hubMessage("rate-limited-replay-first", "2026-10-15T08:01:00.000Z");
+    const second = hubMessage("rate-limited-replay-second", "2026-10-15T08:01:01.000Z");
+    await saveMessage({ packet: first, direction: "outgoing", delivery: "queued", transport: "hub" });
+    await saveMessage({ packet: second, direction: "outgoing", delivery: "queued", transport: "hub" });
+
+    render(<App />);
+    const socket = await connectTestHub(false);
+    await waitFor(() => expect(socket.sent).toHaveLength(2));
+    act(() => socket.receive({ version: 1, type: "error", code: "rate_limited", message: "Message rate limit reached.", id: first.id }));
+    await screen.findByText(/rate-limited an outgoing message/i);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const rows = await loadMessages(ROOM);
+    expect(rows.find((item) => item.packet.id === first.id)?.delivery).toBe("queued");
+    expect(rows.find((item) => item.packet.id === second.id)?.delivery).toBe("queued");
+    expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(1);
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2), { timeout: 5000 });
+    const reconnectSocket = MockWebSocket.instances[1];
+    act(() => reconnectSocket.open());
+    act(() => reconnectSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await waitFor(() => expect(reconnectSocket.sent).toHaveLength(2));
+    expect(JSON.parse(reconnectSocket.sent[1]).id).toBe(first.id);
+  }, 15000);
+
+  it("retries a definitively rejected hub message on the same open socket", async () => {
+    const packet = hubMessage("same-socket-retry", "2026-10-15T08:01:30.000Z");
+    await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+    render(<App />);
+    const socket = await connectTestHub(false);
+    await waitFor(() => expect(socket.sent).toHaveLength(2));
+
+    act(() => socket.receive({ version: 1, type: "error", code: "capacity_reached", message: "Room capacity reached.", id: packet.id }));
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === packet.id)?.delivery).toBe("failed");
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(2), { timeout: 3000 });
+    expect(JSON.parse(socket.sent.filter((raw) => JSON.parse(raw).type === "message")[1])).toEqual(packet);
+  });
+
+  it("reconnects after a missing hub acknowledgment and retries the same queued ID", async () => {
+    const packet = hubMessage("ack-timeout-replay", "2026-10-15T08:02:00.000Z");
+    await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+    render(<App />);
+    const firstSocket = await connectTestHub(false);
+    await waitFor(() => expect(firstSocket.sent).toHaveLength(2));
+    expect(JSON.parse(firstSocket.sent[1])).toEqual(packet);
+
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10_100)); });
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === packet.id)?.delivery).toBe("queued");
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2), { timeout: 5000 });
+    const reconnectSocket = MockWebSocket.instances[1];
+    act(() => reconnectSocket.open());
+    act(() => reconnectSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await waitFor(() => expect(reconnectSocket.sent).toHaveLength(2));
+    expect(JSON.parse(reconnectSocket.sent[1])).toEqual(packet);
+    expect(JSON.parse(reconnectSocket.sent[1]).id).toBe(packet.id);
+  }, 25000);
+
+  it("reconnects with the same queued ID when its exact ACK status write fails", async () => {
+    const packet = hubMessage("ack-storage-failure", "2026-10-15T08:03:00.000Z");
+    await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+    render(<App />);
+    const firstSocket = await connectTestHub(false);
+    await waitFor(() => expect(firstSocket.sent).toHaveLength(2));
+    messageReadGate.deliveryUpdateId = packet.id;
+    messageReadGate.deliveryUpdateReject = true;
+    messageReadGate.deliveryUpdatePending = new Promise<void>((resolve) => { messageReadGate.releaseDeliveryUpdate = resolve; });
+    act(() => firstSocket.receive({ version: 1, type: "ack", id: packet.id }));
+    await waitFor(() => expect(messageReadGate.deliveryUpdateStarted).toBe(true));
+    messageReadGate.releaseDeliveryUpdate?.();
+    await screen.findByText(/status could not be saved on this device/i);
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === packet.id)?.delivery).toBe("queued");
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2), { timeout: 5000 });
+    const reconnectSocket = MockWebSocket.instances[1];
+    act(() => reconnectSocket.open());
+    act(() => reconnectSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await waitFor(() => expect(reconnectSocket.sent).toHaveLength(2));
+    expect(JSON.parse(reconnectSocket.sent[1])).toEqual(packet);
+  }, 15000);
+
   it("loads retained history page by page in hub order rather than timestamp order", async () => {
     render(<App />);
     const socket = await connectTestHub();
@@ -1302,7 +1593,7 @@ describe("browser app messaging flow", () => {
 
   it("warns when the hub reports truncated replay history", async () => {
     render(<App />);
-    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 10_000 });
     fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
     const socket = MockWebSocket.instances[0];

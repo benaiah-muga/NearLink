@@ -85,6 +85,17 @@ who a participant is.
    participant in the connected count.
 4. Send short test messages in both directions. The sender should see hub
    acceptance; the recipient should see the message after saving it locally.
+   Hub message packets are paced below the hub's 120-per-minute connection
+   limit and the next queued packet waits for the current packet's acceptance ACK.
+   The live scheduler holds at most 64 pending hub entries. Larger persisted
+   outboxes refill in batches as each batch drains; older saved messages stay
+   ahead of newly composed messages, which remain queued until their turn.
+   Synchronization packets
+   fail the current exchange if the scheduler is full, so the app does not
+   report a skipped sync packet as complete.
+   If the hub does not acknowledge a message within 10 seconds, the app
+   reconnects and retries the same saved ID. A rate-limited message remains
+   queued on this device while the app reconnects before retrying it.
 5. Disconnect one browser, send a test message from the other, then reconnect.
    The hub replays its joined-room messages first. Use **Load older messages**
    to request retained pages, and confirm each page appears in the hub's

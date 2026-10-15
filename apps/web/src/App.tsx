@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
-import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPacket } from "@nearlink/protocol";
+import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPageCompletePacket, type SyncPacket } from "@nearlink/protocol";
 import { browserConversationStore as conversationStore, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
@@ -18,11 +18,19 @@ interface PendingHistoryRequest {
   packets: Map<string, MessagePacket>;
   timeout: number;
 }
+interface HubOutboundQueueItem {
+  packet: MessagePacket | SyncPageCompletePacket;
+  persisted: boolean;
+}
 const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8000/ws`;
 const HUB_KEY = "nearlink.hub";
 const ROOM_KEY = "nearlink.room";
 const RECENT_ROOMS_KEY = "nearlink.recent-rooms";
 const MAX_RECENT_ROOMS = 10;
+// Leave headroom below the hub's 120 messages per fixed 60-second window.
+const HUB_MESSAGE_RATE_INTERVAL_MS = 550;
+const HUB_MESSAGE_ACK_TIMEOUT_MS = 10_000;
+const MAX_HUB_OUTBOUND_QUEUE_ENTRIES = 64;
 const ROOM_DELETION_CHANNEL = "nearlink-room-deletion-v1";
 const HUB_REPLAY_FAILURE_NOTICE = "A hub message could not be saved or checked on this device. It was not accepted and can be retried after reconnecting.";
 const WASM_PROTOCOL_FAILURE_NOTICE = "Protocol checks could not start. NearLink will not connect, send messages, or accept peer packets. Reload the page. If this continues, update the browser and report this error.";
@@ -216,6 +224,23 @@ function App() {
   const joinedHistoryHubUrlRef = useRef<string | null>(null);
   const lastHubPeersRef = useRef<number | null>(null);
   const hubReplayOrderRef = useRef<{ socket: WebSocket; room: string; ids: string[] } | null>(null);
+  const hubOutboundQueueRef = useRef<{
+    socket: WebSocket;
+    room: string;
+    items: HubOutboundQueueItem[];
+    loaded: boolean;
+    refillInProgress: boolean;
+    hasPersistedBacklog: boolean;
+    deferredPersistedMessageIds: Set<string>;
+    invalidMessageIds: Set<string>;
+    nextIndex: number;
+    inFlightId: string | null;
+    ackProcessingId: string | null;
+    lastSentAt: number | null;
+    timer: number | null;
+    ackTimer: number | null;
+    stopped: boolean;
+  } | null>(null);
   const skipHistoryAutoScrollRef = useRef(false);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const messageEndRef = useRef<HTMLDivElement>(null);
@@ -322,7 +347,8 @@ function App() {
     hubSyncRef.current?.stop();
     const coordinator = makeSyncCoordinator("hub", connectionRoom, (packet) => {
       if (socketRef.current !== socket || socket.readyState !== WebSocket.OPEN || currentRoomRef.current !== connectionRoom) throw new Error("The hub session ended.");
-      socket.send(JSON.stringify(packet));
+      if (packet.type === "message" || packet.type === "sync_page_complete") enqueueHubSyncPacket(packet, socket, connectionRoom);
+      else socket.send(JSON.stringify(packet));
     });
     hubSyncRef.current = coordinator;
     setSyncStatus({ state: "syncing", detail: "Exchanging bounded local message inventories over the hub." });
@@ -366,6 +392,7 @@ function App() {
       setHistoryPagingMessage("The connection closed before this history page finished. Retry the same cursor after reconnecting.");
     }
     const socket = socketRef.current;
+    stopHubOutboundQueue();
     hubSyncRef.current?.stop();
     hubSyncRef.current = null;
     socketRef.current = null;
@@ -399,6 +426,237 @@ function App() {
     if (!replayOrder || replayOrder.socket !== socket || replayOrder.room !== selectedRoom) return true;
     if (!replayOrder.ids.includes(messageId)) replayOrder.ids.push(messageId);
     return conversationStore.reconcileHubReplayOrder(selectedRoom, replayOrder.ids);
+  }
+
+  function stopHubOutboundQueue(socket?: WebSocket) {
+    const queue = hubOutboundQueueRef.current;
+    if (!queue || (socket && queue.socket !== socket)) return;
+    if (queue.timer !== null) window.clearTimeout(queue.timer);
+    if (queue.ackTimer !== null) window.clearTimeout(queue.ackTimer);
+    queue.timer = null;
+    queue.ackTimer = null;
+    queue.ackProcessingId = null;
+    queue.stopped = true;
+    if (hubOutboundQueueRef.current === queue) hubOutboundQueueRef.current = null;
+  }
+
+  function advanceHubOutboundQueue(queue: NonNullable<typeof hubOutboundQueueRef.current>) {
+    queue.items.splice(0, queue.nextIndex + 1);
+    queue.nextIndex = 0;
+  }
+
+  function mergeHubOutboundBatch(queue: NonNullable<typeof hubOutboundQueueRef.current>, persisted: StoredMessage[]) {
+    const persistedMessageIds = new Set(persisted
+      .filter((saved) => saved.direction === "outgoing"
+        && saved.delivery === "queued"
+        && (saved.transport ?? "hub") === "hub")
+      .map((saved) => saved.packet.id));
+    for (const deferredId of queue.deferredPersistedMessageIds) {
+      if (persistedMessageIds.has(deferredId)) queue.deferredPersistedMessageIds.delete(deferredId);
+    }
+    const validPersisted = persisted.filter((saved) => saved.direction === "outgoing"
+      && saved.delivery === "queued"
+      && (saved.transport ?? "hub") === "hub"
+      && !queue.invalidMessageIds.has(saved.packet.id)
+      && !conflictedHubMessageKeysRef.current.has(`${saved.packet.room}\u0000${saved.packet.id}`));
+    const liveItems = queue.items;
+    const ephemeral = liveItems.filter((item) => !item.persisted);
+    const persistedIds = new Set(validPersisted.map((saved) => saved.packet.id));
+    const livePersisted = liveItems.filter((item) => item.persisted && item.packet.type === "message" && !persistedIds.has(item.packet.id));
+    const pendingIds = new Set<string>();
+    const persistedItems: HubOutboundQueueItem[] = [];
+    for (const saved of [...validPersisted.map((item) => ({ packet: item.packet, persisted: true })), ...livePersisted]) {
+      if (saved.packet.type !== "message" || pendingIds.has(saved.packet.id)) continue;
+      pendingIds.add(saved.packet.id);
+      persistedItems.push(saved);
+    }
+    const ephemeralKeys = new Set<string>();
+    const uniqueEphemeral = ephemeral.filter((item) => {
+      const key = item.packet.type === "message" ? `message:${item.packet.id}` : `sync_page_complete:${item.packet.requestId}`;
+      if (ephemeralKeys.has(key)) return false;
+      ephemeralKeys.add(key);
+      return true;
+    });
+    const persistedCapacity = Math.max(0, MAX_HUB_OUTBOUND_QUEUE_ENTRIES - uniqueEphemeral.length);
+    queue.hasPersistedBacklog = persistedItems.length > persistedCapacity || queue.deferredPersistedMessageIds.size > 0;
+    queue.items = [...persistedItems.slice(0, persistedCapacity), ...uniqueEphemeral];
+    queue.nextIndex = 0;
+  }
+
+  function refillHubOutboundQueue(queue: NonNullable<typeof hubOutboundQueueRef.current>) {
+    if (hubOutboundQueueRef.current !== queue || queue.stopped || !queue.loaded || queue.refillInProgress || queue.items.length > 0) return;
+    queue.refillInProgress = true;
+    void conversationStore.loadMessages(queue.room).then((persisted) => {
+      if (hubOutboundQueueRef.current !== queue || socketRef.current !== queue.socket || currentRoomRef.current !== queue.room) return;
+      queue.refillInProgress = false;
+      mergeHubOutboundBatch(queue, persisted);
+      if (queue.items.length > 0 || queue.hasPersistedBacklog) pumpHubOutboundQueue(queue);
+    }).catch(() => {
+      if (hubOutboundQueueRef.current !== queue || socketRef.current !== queue.socket || currentRoomRef.current !== queue.room) return;
+      queue.refillInProgress = false;
+      queue.stopped = true;
+      setNotice("Your queued messages are saved, but could not be loaded to retry. The radio will try again after reconnecting.");
+      queue.socket.close();
+    });
+  }
+
+  function pumpHubOutboundQueue(queue: NonNullable<typeof hubOutboundQueueRef.current>) {
+    if (hubOutboundQueueRef.current !== queue || queue.stopped || !queue.loaded || queue.refillInProgress || queue.inFlightId !== null || queue.timer !== null) return;
+    if (socketRef.current !== queue.socket || queue.socket.readyState !== WebSocket.OPEN || currentRoomRef.current !== queue.room) return;
+    if (queue.nextIndex >= queue.items.length) {
+      refillHubOutboundQueue(queue);
+      return;
+    }
+    const item = queue.items[queue.nextIndex];
+    const waitMs = item.packet.type === "message" && queue.lastSentAt !== null
+      ? Math.max(0, queue.lastSentAt + HUB_MESSAGE_RATE_INTERVAL_MS - performance.now())
+      : 0;
+    if (waitMs > 0) {
+      queue.timer = window.setTimeout(() => {
+        queue.timer = null;
+        pumpHubOutboundQueue(queue);
+      }, waitMs);
+      return;
+    }
+    if (item.packet.type !== "message") {
+      try {
+        queue.socket.send(JSON.stringify(item.packet));
+        advanceHubOutboundQueue(queue);
+        pumpHubOutboundQueue(queue);
+      } catch {
+        setNotice("Your queued messages are saved. The radio will retry.");
+        queue.socket.close();
+      }
+      return;
+    }
+    const messageId = item.packet.id;
+    if (!validateWithWasm("message", item.packet)) {
+      queue.invalidMessageIds.add(messageId);
+      advanceHubOutboundQueue(queue);
+      setNotice("A saved message did not pass protocol checks and was not sent.");
+      pumpHubOutboundQueue(queue);
+      return;
+    }
+    try {
+      queue.socket.send(JSON.stringify(item.packet));
+      queue.lastSentAt = performance.now();
+      const messageId = item.packet.id;
+      queue.inFlightId = messageId;
+      queue.ackTimer = window.setTimeout(() => {
+        if (hubOutboundQueueRef.current !== queue || queue.inFlightId !== messageId) return;
+        queue.ackTimer = null;
+        queue.stopped = true;
+        setNotice("The hub did not acknowledge a queued message. The radio will reconnect and retry the same saved message.");
+        queue.socket.close();
+      }, HUB_MESSAGE_ACK_TIMEOUT_MS);
+    } catch {
+      setNotice("Your queued messages are saved. The radio will retry.");
+      queue.socket.close();
+    }
+  }
+
+  function ensureHubOutboundQueue(socket: WebSocket, selectedRoom: string) {
+    let queue = hubOutboundQueueRef.current;
+    if (queue?.socket === socket && queue.room === selectedRoom) return queue;
+    stopHubOutboundQueue();
+    queue = {
+      socket,
+      room: selectedRoom,
+      items: [],
+      loaded: false,
+      refillInProgress: false,
+      hasPersistedBacklog: false,
+      deferredPersistedMessageIds: new Set(),
+      invalidMessageIds: new Set(),
+      nextIndex: 0,
+      inFlightId: null,
+      ackProcessingId: null,
+      lastSentAt: null,
+      timer: null,
+      ackTimer: null,
+      stopped: false,
+    };
+    hubOutboundQueueRef.current = queue;
+    void conversationStore.loadMessages(selectedRoom).then((persisted) => {
+      if (hubOutboundQueueRef.current !== queue || socketRef.current !== socket || currentRoomRef.current !== selectedRoom) return;
+      queue!.loaded = true;
+      mergeHubOutboundBatch(queue!, persisted);
+      pumpHubOutboundQueue(queue!);
+    }).catch(() => {
+      if (hubOutboundQueueRef.current === queue && socketRef.current === socket && currentRoomRef.current === selectedRoom) {
+        queue!.stopped = true;
+        setNotice("Your queued messages are saved, but could not be loaded to retry. The radio will try again after reconnecting.");
+        socket.close();
+      }
+    });
+    return queue;
+  }
+
+  function enqueueHubMessage(item: StoredMessage, socket = socketRef.current, selectedRoom = item.packet.room) {
+    if (!socket || socket.readyState !== WebSocket.OPEN || currentRoomRef.current !== selectedRoom || item.packet.room !== selectedRoom) return;
+    const queue = ensureHubOutboundQueue(socket, selectedRoom);
+    if (!queue.items.some((queued) => queued.packet.type === "message" && queued.packet.id === item.packet.id)) {
+      if (!queue.hasPersistedBacklog && queue.deferredPersistedMessageIds.size === 0 && queue.items.length < MAX_HUB_OUTBOUND_QUEUE_ENTRIES) queue.items.push({ packet: item.packet, persisted: true });
+      else {
+        queue.deferredPersistedMessageIds.add(item.packet.id);
+        queue.hasPersistedBacklog = true;
+      }
+    }
+    pumpHubOutboundQueue(queue);
+  }
+
+  function enqueueHubSyncPacket(packet: SyncPacket | MessagePacket, socket: WebSocket, selectedRoom: string) {
+    if (socketRef.current !== socket || socket.readyState !== WebSocket.OPEN || currentRoomRef.current !== selectedRoom) throw new Error("The hub session ended.");
+    if (packet.type !== "message" && packet.type !== "sync_page_complete") {
+      socket.send(JSON.stringify(packet));
+      return;
+    }
+    const queue = ensureHubOutboundQueue(socket, selectedRoom);
+    const packetKey = packet.type === "message" ? `message:${packet.id}` : `sync_page_complete:${packet.requestId}`;
+    if (!queue.items.some((queued) => {
+      const queuedKey = queued.packet.type === "message" ? `message:${queued.packet.id}` : `sync_page_complete:${queued.packet.requestId}`;
+      return queuedKey === packetKey;
+    })) {
+      if (queue.items.length >= MAX_HUB_OUTBOUND_QUEUE_ENTRIES) throw new Error("The hub outbound queue is full.");
+      queue.items.push({ packet, persisted: false });
+    }
+    pumpHubOutboundQueue(queue);
+  }
+
+  function startHubReconnectReplay(socket: WebSocket, selectedRoom: string) {
+    const existing = hubOutboundQueueRef.current;
+    if (existing?.socket === socket && existing.room === selectedRoom) return;
+    stopHubOutboundQueue();
+    const queue = {
+      socket,
+      room: selectedRoom,
+      items: [] as HubOutboundQueueItem[],
+      loaded: false,
+      refillInProgress: false,
+      hasPersistedBacklog: false,
+      deferredPersistedMessageIds: new Set<string>(),
+      invalidMessageIds: new Set<string>(),
+      nextIndex: 0,
+      inFlightId: null as string | null,
+      ackProcessingId: null as string | null,
+      lastSentAt: null as number | null,
+      timer: null as number | null,
+      ackTimer: null as number | null,
+      stopped: false,
+    };
+    hubOutboundQueueRef.current = queue;
+    void conversationStore.loadMessages(selectedRoom).then((persisted) => {
+      if (hubOutboundQueueRef.current !== queue || socketRef.current !== socket || currentRoomRef.current !== selectedRoom) return;
+      queue.loaded = true;
+      mergeHubOutboundBatch(queue, persisted);
+      pumpHubOutboundQueue(queue);
+    }).catch(() => {
+      if (hubOutboundQueueRef.current === queue && socketRef.current === socket && currentRoomRef.current === selectedRoom) {
+        queue.stopped = true;
+        setNotice("Your queued messages are saved, but could not be loaded to retry. The radio will try again after reconnecting.");
+        socket.close();
+      }
+    });
   }
 
   useEffect(() => {
@@ -674,14 +932,7 @@ function App() {
           setNotice(packet.historyTruncated
             ? "The hub could not replay the full room history. Older messages may be unavailable."
             : hasHubInboundFailure(hubInboundFailuresRef.current, room.trim()) ? HUB_REPLAY_FAILURE_NOTICE : "");
-          for (const item of messagesRef.current) {
-            const messageKey = `${item.packet.room}\u0000${item.packet.id}`;
-            if (item.direction === "outgoing" && item.delivery === "queued" && (item.transport ?? "hub") === "hub" && !conflictedHubMessageKeysRef.current.has(messageKey)) {
-              if (!validateWithWasm("message", item.packet)) { setNotice("A saved message did not pass protocol checks and was not sent."); continue; }
-              try { socket.send(JSON.stringify(item.packet)); }
-              catch { setNotice("Your queued messages are saved. The radio will retry."); socket.close(); break; }
-            }
-          }
+          startHubReconnectReplay(socket, packet.room);
           return;
         }
         if (packet.type === "sync_inventory_page" || packet.type === "sync_missing_request" || packet.type === "sync_page_complete") {
@@ -709,14 +960,35 @@ function App() {
         if (packet.type === "ack") {
           const connectionRoom = room.trim();
           if (currentRoomRef.current !== connectionRoom) return;
+          const outboundQueue = hubOutboundQueueRef.current;
+          const activeOutboundQueue = outboundQueue?.socket === socket && outboundQueue.room === connectionRoom ? outboundQueue : null;
+          const queuedPacket = activeOutboundQueue?.inFlightId === packet.id ? activeOutboundQueue.items[activeOutboundQueue.nextIndex] : null;
+          const queuedMessageMatch = activeOutboundQueue?.items.some((item) => item.packet.type === "message" && item.packet.id === packet.id) ?? false;
+          const exactInFlightMessage = queuedPacket?.packet.type === "message" && queuedPacket.packet.id === packet.id;
+          if (queuedMessageMatch && !exactInFlightMessage) return;
+          if (queuedPacket?.packet.type === "message" && outboundQueue?.ackProcessingId === packet.id) return;
+          if (queuedPacket?.packet.type === "message" && queuedPacket.persisted === false) {
+            if (outboundQueue!.ackTimer !== null) window.clearTimeout(outboundQueue!.ackTimer);
+            outboundQueue!.ackTimer = null;
+            outboundQueue!.inFlightId = null;
+            advanceHubOutboundQueue(outboundQueue!);
+            pumpHubOutboundQueue(outboundQueue!);
+            return;
+          }
+          if (queuedPacket?.packet.type === "message" && queuedPacket.persisted) outboundQueue!.ackProcessingId = packet.id;
           let pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
           if (!pending) {
             let persisted: StoredMessage[];
             try {
               persisted = await conversationStore.loadMessages(connectionRoom);
             } catch {
+              if (outboundQueue?.ackProcessingId === packet.id) outboundQueue.ackProcessingId = null;
               if (socketRef.current === socket && currentRoomRef.current === connectionRoom) {
                 setNotice("The hub acknowledged a message, but the saved outgoing message could not be checked on this device. Its status was not changed.");
+              }
+              if (queuedPacket?.packet.type === "message" && outboundQueue && hubOutboundQueueRef.current === outboundQueue) {
+                stopHubOutboundQueue(socket);
+                socket.close();
               }
               return;
             }
@@ -727,13 +999,27 @@ function App() {
           try {
             await conversationStore.updateDelivery(connectionRoom, packet.id, "sent");
           } catch {
+            if (outboundQueue?.ackProcessingId === packet.id) outboundQueue.ackProcessingId = null;
             if (socketRef.current === socket && currentRoomRef.current === connectionRoom) {
-              setNotice("The hub accepted your message, but its status could not be saved on this device. It may be retried after reload.");
+              setNotice("The hub accepted your message, but its status could not be saved on this device. The radio will reconnect and retry the same message.");
+            }
+            if (queuedPacket?.packet.type === "message" && outboundQueue && hubOutboundQueueRef.current === outboundQueue) {
+              stopHubOutboundQueue(socket);
+              socket.close();
             }
             return;
           }
           if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
           setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub" ? { ...item, delivery: "sent" } : item));
+          if (queuedPacket?.packet.type === "message" && queuedPacket.persisted && outboundQueue && hubOutboundQueueRef.current === outboundQueue
+            && outboundQueue.inFlightId === packet.id && outboundQueue.items[outboundQueue.nextIndex] === queuedPacket) {
+            if (outboundQueue.ackTimer !== null) window.clearTimeout(outboundQueue.ackTimer);
+            outboundQueue.ackTimer = null;
+            outboundQueue.ackProcessingId = null;
+            outboundQueue.inFlightId = null;
+            advanceHubOutboundQueue(outboundQueue);
+            pumpHubOutboundQueue(outboundQueue);
+          }
           return;
         }
         if (packet.type === "error") {
@@ -791,7 +1077,44 @@ function App() {
             hubSyncRef.current?.noteControlRateLimited("The hub rate-limited a synchronization control. This exchange is incomplete. Reconnect to restart from saved messages.");
           }
           if (packet.id) {
-            const rejected = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing");
+            const outboundQueue = hubOutboundQueueRef.current;
+            const currentOutbound = outboundQueue?.socket === socket && outboundQueue.room === connectionRoom
+              && outboundQueue.inFlightId === packet.id ? outboundQueue.items[outboundQueue.nextIndex] : null;
+            const isCurrentMessage = currentOutbound?.packet.type === "message" && currentOutbound.packet.id === packet.id;
+            if (outboundQueue?.socket === socket && outboundQueue.room === connectionRoom && outboundQueue.inFlightId !== null && !isCurrentMessage) return;
+            if (isCurrentMessage && packet.code === "rate_limited") {
+              if (outboundQueue) {
+                if (outboundQueue.timer !== null) window.clearTimeout(outboundQueue.timer);
+                if (outboundQueue.ackTimer !== null) window.clearTimeout(outboundQueue.ackTimer);
+                outboundQueue.timer = null;
+                outboundQueue.ackTimer = null;
+                outboundQueue.stopped = true;
+              }
+              setNotice("The hub rate-limited an outgoing message. It remains queued on this device. The radio will reconnect before retrying it.");
+              socket.close();
+              return;
+            }
+            if (isCurrentMessage && currentOutbound && !currentOutbound.persisted) {
+              if (outboundQueue?.ackTimer !== null && outboundQueue?.ackTimer !== undefined) window.clearTimeout(outboundQueue.ackTimer);
+              if (outboundQueue) {
+                outboundQueue.ackTimer = null;
+                outboundQueue.stopped = true;
+              }
+              hubSyncRef.current?.noteMessageRateLimited("The hub rejected a synchronization message. Reconnect to restart synchronization from saved messages.");
+              socket.close();
+              return;
+            }
+            if (isCurrentMessage && outboundQueue?.ackProcessingId === packet.id) return;
+            if (isCurrentMessage && outboundQueue) outboundQueue.ackProcessingId = packet.id;
+            let rejected = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing");
+            if (!rejected && isCurrentMessage && currentOutbound?.persisted) {
+              try {
+                rejected = (await conversationStore.loadMessages(connectionRoom)).find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
+              } catch {
+                rejected = undefined;
+              }
+              if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+            }
             if (rejected) {
               const rejectedKey = `${rejected.packet.room}\u0000${rejected.packet.id}`;
               if (packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub") {
@@ -801,10 +1124,31 @@ function App() {
               let saved = true;
               try { await conversationStore.updateDelivery(rejected.packet.room, packet.id, "failed", packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub" ? "message_conflict" : undefined); }
               catch { saved = false; }
-              setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === rejected.packet.room
-                ? { ...item, delivery: "failed", ...(packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub" ? { failure: "message_conflict" as const } : {}) }
-                : item));
-              if (!saved && socketRef.current === socket && currentRoomRef.current === rejected.packet.room) setNotice("The hub rejected your message, but its status could not be saved on this device.");
+              if (saved) {
+                setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === rejected!.packet.room
+                  ? { ...item, delivery: "failed", ...(packet.code === "message_conflict" && (rejected!.transport ?? "hub") === "hub" ? { failure: "message_conflict" as const } : {}) }
+                  : item));
+              } else if (socketRef.current === socket && currentRoomRef.current === rejected.packet.room) {
+                setNotice("The hub rejected your message, but its status could not be saved on this device. It remains queued for retry.");
+              }
+              if (isCurrentMessage && currentOutbound?.persisted && outboundQueue && hubOutboundQueueRef.current === outboundQueue) {
+                if (!saved) {
+                  stopHubOutboundQueue(socket);
+                  socket.close();
+                  return;
+                }
+                if (outboundQueue.ackTimer !== null) window.clearTimeout(outboundQueue.ackTimer);
+                outboundQueue.ackTimer = null;
+                outboundQueue.ackProcessingId = null;
+                outboundQueue.inFlightId = null;
+                advanceHubOutboundQueue(outboundQueue);
+                pumpHubOutboundQueue(outboundQueue);
+              }
+            }
+            if (isCurrentMessage && currentOutbound?.persisted && !rejected && outboundQueue && hubOutboundQueueRef.current === outboundQueue) {
+              stopHubOutboundQueue(socket);
+              socket.close();
+              return;
             }
           }
           if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
@@ -980,6 +1324,7 @@ function App() {
       };
       socket.onerror = () => setNotice("The radio link reported a socket error. Retrying automatically.");
       socket.onclose = () => {
+        stopHubOutboundQueue(socket);
         if (socketRef.current === socket) socketRef.current = null;
         if (hubSyncRef.current) {
           hubSyncRef.current.stop();
@@ -999,6 +1344,7 @@ function App() {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);
       shouldReconnectRef.current = false;
+      stopHubOutboundQueue();
       socketRef.current?.close();
       socketRef.current = null;
       attemptRef.current = 0;
@@ -1375,15 +1721,7 @@ function App() {
       if (message.transport === "direct") {
         sendDirectMessage(message);
       } else if ((message.transport ?? "hub") === "hub" && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
-        if (!validateWithWasm("message", message.packet)) {
-          setNotice("The saved message did not pass protocol checks and was not sent.");
-          return;
-        }
-        try { socketRef.current.send(JSON.stringify(message.packet)); }
-        catch {
-          setNotice("The message is queued on this device. The radio will reconnect and retry it.");
-          socketRef.current.close();
-        }
+        enqueueHubMessage({ ...message, delivery: "queued", failure: undefined });
       }
     }
   }
@@ -1436,11 +1774,7 @@ function App() {
         if (sendTransport === "direct") {
           sendDirectMessage(item);
         } else if (sendTransport === "hub" && linkState === "online" && socketRef.current?.readyState === WebSocket.OPEN) {
-          try { socketRef.current.send(JSON.stringify(packet)); }
-          catch {
-            setNotice("The message is saved on this device. The radio will reconnect and retry it.");
-            socketRef.current.close();
-          }
+          enqueueHubMessage(item);
         }
       }
     } finally {
