@@ -17,4 +17,8 @@ See the root README for the web client and local hub setup.
 
 ## Security reports
 
-Do not include sensitive vulnerability details in public issues. Until a private reporting channel is configured, open a minimal issue requesting contact from a maintainer.
+GitHub private vulnerability reporting is currently disabled for this repository (checked 2026-10-15). Do not post vulnerability details in public issues, discussions, pull requests, or other public channels.
+
+Until private reporting is enabled, open a GitHub issue titled `Maintainer contact request` with only this message: `Please provide a private channel for a security report. I have not included report details here.` This request lets a maintainer contact you without disclosing that information publicly. Do not include affected versions or commits, impact, reproduction steps, vulnerable components or endpoints, proof-of-concept code, payloads, exploit instructions, screenshots, logs, personal data, or secrets in that issue. Do not attach files. Once a maintainer provides a private channel, send the report there.
+
+The repository owner must enable GitHub private vulnerability reporting and verify that the reporting option is available to repository users before controlled beta.

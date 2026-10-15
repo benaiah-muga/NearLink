@@ -6,11 +6,13 @@ Only the latest published release and the current `main` branch are supported fo
 
 ## Reporting a vulnerability
 
-Do not report vulnerabilities in public issues. Use GitHub's private vulnerability reporting for this repository. Include affected versions or commits, impact, reproduction steps, and any suggested mitigation. Avoid including real user data or secrets.
+GitHub private vulnerability reporting is currently disabled for this repository (checked 2026-10-15). Do not post vulnerability details in public issues, discussions, pull requests, or other public channels.
 
-If private vulnerability reporting is unavailable, contact the maintainers using the contact information displayed on the repository profile and ask for a private reporting channel.
+Until private reporting is enabled, open a GitHub issue titled `Maintainer contact request` with only this message: `Please provide a private channel for a security report. I have not included report details here.` This request lets a maintainer contact you without disclosing that information publicly. Do not include affected versions or commits, impact, reproduction steps, vulnerable components or endpoints, proof-of-concept code, payloads, exploit instructions, screenshots, logs, personal data, or secrets in that issue. Do not attach files. Once a maintainer provides a private channel, send the report there.
 
 Maintainers will acknowledge reports within seven days, investigate with the reporter, and coordinate a fix and disclosure timeline. This response target is an operational goal, not a guarantee of resolution time.
+
+Before controlled beta, the repository owner must enable GitHub private vulnerability reporting and verify that the reporting option is available to repository users.
 
 ## Current security status
 
