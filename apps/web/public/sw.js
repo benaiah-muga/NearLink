@@ -1,6 +1,6 @@
 const CACHE_NAME = "nearlink-shell-v1";
 const APP_SHELL = ["/", "/manifest.webmanifest", "/icon.svg"];
-const ASSET_REFERENCE = /\/assets\/[A-Za-z0-9._-]+\.(?:js|css|wasm)/g;
+const ASSET_REFERENCE = /(?:\/assets\/[A-Za-z0-9._-]+\.(?:js|css|wasm)|\.{1,2}\/[A-Za-z0-9._-]+\.(?:js|css|wasm))/g;
 
 async function cacheAppShell() {
   const cache = await caches.open(CACHE_NAME);
@@ -21,7 +21,8 @@ async function cacheAppShell() {
     const source = path.endsWith(".js") ? await response.clone().text() : "";
     await cache.put(path, response);
     for (const reference of source.match(ASSET_REFERENCE) ?? []) {
-      if (!visited.has(reference)) pending.push(reference);
+      const asset = new URL(reference, new URL(path, self.location.origin)).pathname;
+      if (asset.startsWith("/assets/") && !visited.has(asset)) pending.push(asset);
     }
   }
 }
@@ -50,7 +51,12 @@ self.addEventListener("fetch", (event) => {
     }).catch(() => caches.match("/")));
     return;
   }
-  event.respondWith(caches.match(request).then((cached) => cached || fetch(request).then((response) => {
+  event.respondWith(caches.open(CACHE_NAME).then((cache) => {
+    if (url.pathname.startsWith("/assets/")) {
+      return cache.match(request, { ignoreSearch: true, ignoreVary: true });
+    }
+    return cache.match(request);
+  }).then((cached) => cached || fetch(request).then((response) => {
     if (response.ok) {
       const copy = response.clone();
       caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
