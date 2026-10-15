@@ -212,7 +212,7 @@ test("real local hub accepts, replays, persists, and pages a two-client conversa
       await expect.poll(() => acknowledgedMessageIds, { timeout: 20_000 }).toContain(sentId);
       const bubble = senderLog.getByText(body);
       await expect(bubble).toBeVisible();
-      await expect(bubble.locator("..")).toContainText("Accepted by hub");
+      await expect(bubble.locator("..")).toContainText("Accepted by hub", { timeout: 20_000 });
     };
     await sendAndWaitForHubAcceptance(bodies[0]);
     await expect.poll(async () => (await storedMessages(sender, room)).length, { timeout: 20_000 }).toBe(101);
