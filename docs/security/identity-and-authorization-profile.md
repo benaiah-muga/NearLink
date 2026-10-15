@@ -1,6 +1,6 @@
 # Identity and authorization profile proposal
 
-Status: proposed initial profile, pending independent security review
+Status: proposed initial profile, design review complete; implementation feasibility and third-party security review remain open
 
 This document specifies identity, group authorization, delivery, and storage
 policy for NearLink's proposed initial deployment. The candidate-neutral

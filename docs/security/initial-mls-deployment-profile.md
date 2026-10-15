@@ -1,6 +1,6 @@
 # Initial MLS deployment profile and decision register
 
-Status: candidate-neutral design baseline, proposed for independent review
+Status: candidate-neutral design baseline, independently design-reviewed; implementation feasibility and third-party audit remain open
 
 This document consolidates NearLink's initial MLS deployment decisions. It is
 an audit input, not an implementation description, protocol conformance result,
