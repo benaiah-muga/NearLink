@@ -150,6 +150,11 @@ browser, operating system, network, or device works. Record browser version,
 operating system, test date, network setup, and the linked run or test evidence
 before changing a row to verified.
 
+CI runs a small local persistence smoke in Chromium, Firefox, and WebKit. The
+Firefox and WebKit smoke is automated engine coverage only. It is not Firefox,
+Safari, mobile, or operating system support sign-off. In particular, Playwright
+WebKit does not replace testing Safari on Apple devices.
+
 | Target or behavior | Current evidence | Status |
 | --- | --- | --- |
 | TypeScript production bundle | Build command is part of the repository verification workflow. | Automated check available; latest run must be linked in the release record. |
@@ -157,7 +162,7 @@ before changing a row to verified.
 | Chromium desktop | No browser-specific release run or manual smoke-test evidence is recorded here. | Pending |
 | Chromium Android, installed and browser modes | No physical Android device check is recorded here. | Pending |
 | Safari on macOS and iOS, installed and browser modes | No real Safari or Apple device check is recorded here. | Pending |
-| Firefox desktop | No real Firefox release run is recorded here. | Pending |
+| Firefox desktop | CI runs a local persistence smoke in Playwright Firefox. | Automated engine smoke only; manual support check pending |
 | Microsoft Edge desktop | No real Edge release run is recorded here. | Pending |
 | Local hub, same-network two-device exchange without internet | Automated hub and client tests cover parts of the flow. No physical two-device run is recorded here. | Pending device check |
 | Hub reconnect, replay, and bounded history | Automated hub and client tests cover persistence, replay, and related failure handling. | Automated checks available; runtime and operator recovery check pending |

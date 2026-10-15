@@ -20,34 +20,37 @@ The verification command generates the pinned Rust/WASM protocol module, builds
 the web client, runs the web unit and FastAPI hub test suites, and scans tracked
 and non-ignored untracked project files for the em dash character. The
 end-to-end command builds the production client, starts Vite preview and the
-checked-in FastAPI hub, and runs Chromium journeys. The real-hub journey uses
-two independent browser contexts and a temporary SQLite database. It checks hub
-acceptance separately from recipient persistence, then exercises live delivery,
-reconnect replay, and a bounded history response. It blocks and fails on
+checked-in FastAPI hub, and runs Chromium journeys. `npm run test:e2e:compat`
+runs a smaller local persistence journey in Playwright Firefox and WebKit. The
+real-hub journey uses two independent browser contexts and a temporary SQLite
+database. It checks hub acceptance separately from recipient persistence, then
+exercises live delivery, reconnect replay, and a bounded history response. It
+blocks and fails on
 non-loopback HTTP and WebSocket requests. Other journeys cover local queue
 behavior, offline service-worker behavior, synchronization, and direct browser
 communication. The accessibility journeys scan relevant screens for WCAG 2.1
-A/AA and WCAG 2.2 AA issues with axe. Install the
-Playwright Chromium build with:
+A/AA and WCAG 2.2 AA issues with axe. Install the Playwright browsers with:
 
 ```sh
-npx playwright install chromium
+npx playwright install chromium firefox webkit
 ```
 
 On a clean Linux host, install the system browser dependencies as well:
 
 ```sh
-npx playwright install --with-deps chromium
+npx playwright install --with-deps chromium firefox webkit
 ```
 
 Generated output, dependency folders, and the ignored `.unlazy` work ledgers
 are excluded from the em dash scan.
 
-GitHub Actions runs the same build, unit, hub, Chromium journeys, Rust, and
-em dash checks on pushes to `main` and pull requests. It also audits npm,
-Python, and Rust dependencies for known advisories. The browser journey covers
-Chromium desktop only. It does not replace the physical-device and browser
-compatibility checks in `docs/product-beta.md`.
+GitHub Actions runs the same build, unit, hub, Chromium journeys, Firefox and
+WebKit persistence smoke journeys, Rust, and em dash checks on pushes to `main`
+and pull requests. It also audits npm, Python, and Rust dependencies for known
+advisories. The full browser journey covers Chromium desktop. Firefox and
+Playwright WebKit receive only a local persistence smoke, which does not
+establish Firefox desktop or Safari support and does not replace the
+physical-device and browser compatibility checks in `docs/product-beta.md`.
 
 ## Rust protocol core and browser binding
 

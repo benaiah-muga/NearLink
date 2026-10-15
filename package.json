@@ -14,7 +14,8 @@
     "build:wasm": "node scripts/build-protocol-wasm.mjs",
     "pretest:unit": "npm run build:wasm",
     "test:unit": "node scripts/run-unit-tests.mjs",
-    "test:e2e": "npm run build && playwright test",
+    "test:e2e": "npm run build && playwright test --project=chromium",
+    "test:e2e:compat": "npm run build && playwright test --project=firefox-smoke --project=webkit-smoke",
     "test:wasm": "node scripts/test-protocol-wasm.mjs",
     "verify:all": "node scripts/verify-foundation.mjs",
     "verify:foundation": "node scripts/verify-foundation.mjs"

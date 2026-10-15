@@ -9,14 +9,32 @@ export default defineConfig({
   retries: 0,
   reporter: "list",
   use: {
-    ...devices["Desktop Chrome"],
     baseURL: "http://127.0.0.1:4173",
     serviceWorkers: "block",
-    launchOptions: localChromiumPath ? { executablePath: localChromiumPath } : undefined,
     trace: "off",
     screenshot: "off",
     video: "off",
   },
+  projects: [
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"],
+        launchOptions: localChromiumPath ? { executablePath: localChromiumPath } : undefined,
+      },
+      testIgnore: "cross-browser-smoke.spec.ts",
+    },
+    {
+      name: "firefox-smoke",
+      testMatch: "cross-browser-smoke.spec.ts",
+      use: { ...devices["Desktop Firefox"] },
+    },
+    {
+      name: "webkit-smoke",
+      testMatch: "cross-browser-smoke.spec.ts",
+      use: { ...devices["Desktop Safari"] },
+    },
+  ],
   webServer: [
     {
       command: "npm run preview --workspace @nearlink/web -- --host 127.0.0.1 --port 4173 --strictPort",
