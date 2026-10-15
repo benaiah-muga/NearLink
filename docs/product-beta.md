@@ -166,36 +166,42 @@ and do not attach it to bug reports.
 
 ## Compatibility and verification status
 
-The table distinguishes automated software coverage from runtime verification.
-Automated tests and a successful bundle build do not prove that an actual
-browser, operating system, network, or device works. Record browser version,
-operating system, test date, network setup, and the linked run or test evidence
-before changing a row to verified.
-
-CI runs a small local persistence smoke in Chromium, Firefox, and WebKit. The
-Firefox and WebKit smoke is automated engine coverage only. It is not Firefox,
-Safari, mobile, or operating system support sign-off. In particular, Playwright
-WebKit does not replace testing Safari on Apple devices.
+The most recent completed CI run for this implementation baseline used
+source commit
+[`98325cae1bcdd304960d2558395a68e88721bf58`](https://github.com/benaiah-muga/NearLink/commit/98325cae1bcdd304960d2558395a68e88721bf58)
+and successful GitHub Actions run
+[`38706774941`](https://github.com/benaiah-muga/NearLink/actions/runs/38706774941).
+The run used Ubuntu 24.04, Node 24, and Playwright's Chromium, Firefox, and
+WebKit projects. It passed both `verify` and `security-audit`. These results
+describe automated CI on that runner and commit. They do not establish support
+for a named operating system, physical device, browser release, or network
+configuration.
 
 | Target or behavior | Current evidence | Status |
 | --- | --- | --- |
-| TypeScript production bundle | Build command is part of the repository verification workflow. | Automated check available; latest run must be linked in the release record. |
-| Browser application behavior | Unit and UI tests run in a simulated DOM with browser storage test support. | Automated coverage only; no real-browser verification is recorded here. |
-| Chromium desktop | No browser-specific release run or manual smoke-test evidence is recorded here. | Pending |
-| Chromium Android, installed and browser modes | No physical Android device check is recorded here. | Pending |
-| Safari on macOS and iOS, installed and browser modes | No real Safari or Apple device check is recorded here. | Pending |
-| Firefox desktop | CI runs a local persistence smoke in Playwright Firefox. | Automated engine smoke only; manual support check pending |
-| Microsoft Edge desktop | No real Edge release run is recorded here. | Pending |
-| Local hub, same-network two-device exchange without internet | Automated hub and client tests cover parts of the flow. No physical two-device run is recorded here. | Pending device check |
-| Hub reconnect, replay, and bounded history | Automated hub and client tests cover persistence, replay, and related failure handling. | Automated checks available; runtime and operator recovery check pending |
-| Direct WebRTC, same reachable local network | Automated transport and app-flow tests cover connection behavior. No cross-browser two-device run is recorded here. | Pending device check |
-| Direct WebRTC across separate networks | No public STUN or TURN service is configured. | Not supported as a beta expectation |
-| PWA installation and offline shell | Service worker and install affordance exist in the client. No browser installation matrix is recorded here. | Pending browser checks |
-| Accessibility and responsive layout | Automated UI assertions may catch regressions, but no independent assistive technology or device review is recorded here. | Pending manual review |
+| Production build and foundation checks | CI run [38706774941](https://github.com/benaiah-muga/NearLink/actions/runs/38706774941), source commit [`98325ca`](https://github.com/benaiah-muga/NearLink/commit/98325cae1bcdd304960d2558395a68e88721bf58), passed `npm run verify:all`, the production build, protocol checks, and `test:wasm`. `verify:all` reported 174 unit and UI tests. | Automated CI passed on the recorded commit. This is not a release artifact or device sign-off. |
+| Chromium production E2E | The same CI run passed 6 of 6 Playwright tests against the production build served by the preview server in Chromium. Coverage includes local queued-message persistence, narrow viewport layout, hub history paging, a real local hub conversation with two browser contexts, a direct WebRTC session between browser contexts, and service-worker offline emulation with hub resume. External requests are blocked in the real-hub test. | Automated Chromium coverage passed on the CI runner. Browser contexts run on one CI host, not on two physical devices. |
+| Firefox and WebKit persistence | The same CI run passed one persistence-across-reload smoke in each Playwright Firefox and WebKit engine project. The tested path saves a profile and queued message, reloads, and checks that both remain. | Automated engine smokes passed. This is not Firefox or Safari release support, mobile support, or OS sign-off. Playwright WebKit does not replace testing Safari on Apple devices. |
+| Automated accessibility checks | Chromium E2E invokes axe scans on selected setup, diagnostics, queue, deletion, narrow viewport, and history states, using WCAG 2.0 A/AA, WCAG 2.1 A/AA, and WCAG 2.2 AA tags. Those scans passed in the recorded CI run. | Automated axe coverage only. It is not a complete accessibility audit or manual assistive-technology review. |
+| Unit and simulated DOM UI behavior | `npm run verify:all` in the recorded CI run reported 174 passing Vitest tests across 10 test files. The app UI tests run in jsdom and use test storage setup. | Automated unit and simulated DOM UI coverage passed. It does not prove real browser, operating system, or device behavior. |
+| Chromium on a named desktop OS or physical device | CI runs Playwright Chromium on Ubuntu 24.04. No actual end-user OS or device acceptance record is included. | Pending manual OS and device acceptance. |
+| Chromium Android, installed and browser modes | No physical Android device check or installation record is included. | Pending. No Android support claim. |
+| Safari on macOS and iOS, installed and browser modes | WebKit engine smoke only; no real Safari, Apple OS, or device acceptance record is included. | Pending. No Safari or Apple device support claim. |
+| Firefox desktop or Microsoft Edge desktop | Firefox engine persistence smoke only; no release browser or OS acceptance record is included. No Edge run is recorded. | Pending manual acceptance. No Firefox or Edge support claim. |
+| Local hub, same-network two-device exchange without internet | CI exercises a local hub with two browser contexts on one host. No physical two-device LAN run or offline-from-internet acceptance record is included. | Pending two-device acceptance. |
+| Hub reconnect, replay, and bounded history | Chromium E2E covers local hub acceptance, replay, persistence, and history paging on the CI host. No physical-device or operator recovery record is included. | Automated flow passed; manual runtime and operator checks pending. |
+| Direct WebRTC between separate physical devices | Chromium E2E covers a direct session between browser contexts on the CI host. No physical two-device or cross-browser acceptance record is included. | Pending device acceptance. |
+| Direct WebRTC across separate networks | The app uses host-only ICE candidates and no public STUN or TURN service. | Not a beta expectation. |
+| PWA installation and offline shell | Chromium E2E verifies the production service worker shell using browser network-offline emulation, reloads the saved conversation, and resumes the hub after restoring network access. No installed PWA or browser installation matrix is recorded. | Automated Chromium offline-shell flow passed; installation and device checks pending. |
+| Accessibility and responsive behavior on actual devices | Automated axe scans and Chromium viewport assertions cover selected UI states. No independent assistive-technology or physical-device review is recorded. | Manual review pending. |
+| Controlled technical beta readiness | The [release record checklist](release/README.md) requires a dated candidate record, named reviewers, and actual two-device hub and direct acceptance. No completed candidate record is included. | Not ready to describe as a controlled technical beta. |
 
-Do not convert a pending row to verified based on a simulated DOM test, a
-developer's assumption, or a successful build. The release record must include
-the exact tested app commit and test conditions.
+Do not convert a pending row to verified based on simulated DOM tests,
+browser-engine automation, a developer assumption, or a successful build. A
+future release record must include the exact tested app commit, linked run,
+browser and version, operating system and version, device, test date, network
+setup, and named reviewer. The present CI evidence is tied to the source commit
+and run linked above; it is not a manual acceptance record.
 
 ## Diagnostics and feedback
 
