@@ -140,6 +140,16 @@ vi.mock("./lib/storage", async (importOriginal) => {
       }
       return actual.saveMessage(message);
     },
+    acceptInboundMessage: async (message: Parameters<typeof actual.acceptInboundMessage>[0]) => {
+      const id = message.packet.id;
+      messageReadGate.saveAttempts.set(id, (messageReadGate.saveAttempts.get(id) ?? 0) + 1);
+      const failureIndex = messageReadGate.failNextSaveIds.indexOf(id);
+      if (failureIndex !== -1) {
+        messageReadGate.failNextSaveIds.splice(failureIndex, 1);
+        throw new Error("Injected local storage failure.");
+      }
+      return actual.acceptInboundMessage(message);
+    },
     resumeRoomMessages: async (room: string) => {
       if (room === messageReadGate.resumeRoom && messageReadGate.resumePending) {
         messageReadGate.resumeStarted = true;
@@ -1450,11 +1460,11 @@ describe("browser app messaging flow", () => {
     const staleRows = await loadMessages(ROOM);
     messageReadGate.requestedRooms = [];
     messageReadGate.room = ROOM;
-    messageReadGate.readGateAfter = 2;
+    messageReadGate.readGateAfter = 1;
     messageReadGate.pending = new Promise((resolve) => { messageReadGate.releaseRead = () => resolve(staleRows); });
 
     act(() => socket.receive(replay.packet));
-    await waitFor(() => expect(messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === ROOM)).toHaveLength(2));
+    await waitFor(() => expect(messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === ROOM)).toHaveLength(1));
     fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "next-room" } });
     await screen.findByRole("log", { name: "Messages in next-room" });
     await waitFor(() => expect((screen.getByLabelText("Room frequency") as HTMLInputElement).value).toBe("next-room"));
@@ -1613,7 +1623,7 @@ describe("browser app messaging flow", () => {
     expect(await loadMessages(ROOM)).toMatchObject([saved]);
     expect(screen.getByText(saved.packet.body)).toBeTruthy();
     expect(screen.queryByText("Different replay content")).toBeNull();
-    expect(messageReadGate.saveAttempts.get(saved.packet.id) ?? 0).toBe(0);
+    expect(messageReadGate.saveAttempts.get(saved.packet.id) ?? 0).toBe(1);
   });
 
   it("warns when the hub reports truncated replay history", async () => {

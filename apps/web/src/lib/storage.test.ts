@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
-import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { acceptInboundMessage, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const DATABASE_NAME = "nearlink-local";
 
@@ -74,6 +74,71 @@ describe("local IndexedDB storage", () => {
     await saveMessage(duplicate);
 
     await expect(loadMessages("alpha")).resolves.toEqual([{ ...duplicate, displayOrder: 0 }]);
+  });
+
+  it("atomically accepts a new inbound packet and recognizes an exact duplicate", async () => {
+    const incoming: StoredMessage = { packet: packet("accepted-once", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" };
+    await expect(acceptInboundMessage(incoming)).resolves.toBe("saved");
+    await expect(acceptInboundMessage(incoming)).resolves.toBe("duplicate");
+    await expect(loadMessages("alpha")).resolves.toMatchObject([{ packet: incoming.packet, direction: "incoming", delivery: "sent", transport: "direct", displayOrder: 0 }]);
+    await expect(acceptInboundMessage({ ...incoming, transport: "hub" })).resolves.toBe("duplicate");
+    await expect(loadMessages("alpha")).resolves.toMatchObject([{ packet: incoming.packet, direction: "incoming", delivery: "sent", transport: "hub", displayOrder: 0 }]);
+  });
+
+  it("rejects a conflicting packet without replacing the previously accepted contents", async () => {
+    const original: StoredMessage = { packet: packet("accepted-conflict", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" };
+    await expect(acceptInboundMessage(original)).resolves.toBe("saved");
+    await expect(acceptInboundMessage({ ...original, packet: { ...original.packet, body: "conflicting body" }, transport: "hub" })).resolves.toBe("conflict");
+    await expect(loadMessages("alpha")).resolves.toMatchObject([{ packet: original.packet, transport: "direct" }]);
+  });
+
+  it("does not accept inbound packets after the room deletion tombstone is set", async () => {
+    await beginRoomDeletion("alpha");
+    await deleteRoomMessages("alpha");
+    await expect(acceptInboundMessage({ packet: packet("after-delete", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" })).resolves.toBe("room_deleted");
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+  });
+
+  it("serializes competing inbound acceptance so only one insert wins", async () => {
+    const incoming: StoredMessage = { packet: packet("competing-accept", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" };
+    await expect(Promise.all([acceptInboundMessage(incoming), acceptInboundMessage(incoming)])).resolves.toEqual(["saved", "duplicate"]);
+    await expect(loadMessages("alpha")).resolves.toHaveLength(1);
+  });
+
+  it("keeps a racing inbound acceptance out of a room being deleted", async () => {
+    const incoming: StoredMessage = { packet: packet("accept-delete-race", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" };
+    const [acceptance] = await Promise.all([
+      acceptInboundMessage(incoming),
+      beginRoomDeletion("alpha").then(() => deleteRoomMessages("alpha")),
+    ]);
+
+    expect(["saved", "room_deleted"]).toContain(acceptance);
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
+  });
+
+  it("removes an inbound message accepted before room deletion", async () => {
+    const incoming: StoredMessage = { packet: packet("accepted-before-delete", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" };
+    await expect(acceptInboundMessage(incoming)).resolves.toBe("saved");
+    await beginRoomDeletion("alpha");
+    await deleteRoomMessages("alpha");
+
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+    await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
+  });
+
+  it("surfaces inbound write failures and leaves no partial row", async () => {
+    const originalAdd = IDBObjectStore.prototype.add;
+    vi.spyOn(IDBObjectStore.prototype, "add").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["add"]>) {
+      if (this.name === "messages") throw new DOMException("Storage quota exceeded.", "QuotaExceededError");
+      return originalAdd.apply(this, args);
+    });
+    await expect(acceptInboundMessage({ packet: packet("accept-write-failure", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" })).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("Storage quota exceeded"),
+    });
+    vi.restoreAllMocks();
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
   });
 
   it("persists the optional transport hint and keeps legacy rows hub-compatible", async () => {

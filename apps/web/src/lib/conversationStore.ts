@@ -3,6 +3,7 @@ import type {
   StoragePersistenceResult,
   StoredMessage,
   DeliveryState,
+  InboundAcceptanceResult,
 } from "./storage";
 
 /** Persistence operations used by the browser application layer. */
@@ -11,6 +12,7 @@ export interface ConversationStore {
   saveIdentity(identity: LocalIdentity): Promise<void>;
   loadMessages(room: string): Promise<StoredMessage[]>;
   saveMessage(message: StoredMessage): Promise<boolean>;
+  acceptInboundMessage(message: StoredMessage): Promise<InboundAcceptanceResult>;
   updateDelivery(room: string, id: string, delivery: DeliveryState, failure?: StoredMessage["failure"] | null): Promise<void>;
   beginRoomDeletion(room: string): Promise<void>;
   cancelRoomDeletion(room: string): Promise<void>;

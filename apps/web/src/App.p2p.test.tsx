@@ -85,6 +85,13 @@ vi.mock("./lib/storage", async (importOriginal) => {
       }
       return actual.saveMessage(message);
     },
+    acceptInboundMessage: async (message: Parameters<typeof actual.acceptInboundMessage>[0]) => {
+      if (message.packet.id === storageGate.packetId || message.packet.body === storageGate.body) {
+        await new Promise<void>((resolve) => { storageGate.finish = resolve; });
+        if (storageGate.reject) throw new Error("Test storage write rejected.");
+      }
+      return actual.acceptInboundMessage(message);
+    },
   };
   return {
     ...actual,
@@ -315,6 +322,7 @@ describe("direct peer app flow", () => {
     await act(async () => {
       const finish = storageGate.finish;
       storageGate.finish = null;
+      storageGate.packetId = null;
       finish?.();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });

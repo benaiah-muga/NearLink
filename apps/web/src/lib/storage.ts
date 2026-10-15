@@ -19,6 +19,8 @@ export interface LocalIdentity {
 
 export type StoragePersistenceResult = "granted" | "denied" | "unavailable";
 
+export type InboundAcceptanceResult = "saved" | "duplicate" | "conflict" | "room_deleted";
+
 /** Ask the browser to protect this site's storage from automatic eviction. */
 export async function requestStoragePersistence(): Promise<StoragePersistenceResult> {
   if (typeof navigator === "undefined" || !navigator.storage) return "unavailable";
@@ -399,6 +401,67 @@ export async function saveMessage(message: StoredMessage): Promise<boolean> {
   );
 }
 
+/** Accept a received packet atomically with the room tombstone and message row checks. */
+export async function acceptInboundMessage(message: StoredMessage): Promise<InboundAcceptanceResult> {
+  return withTransaction<InboundAcceptanceResult>(
+    "Could not accept the local message",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readwrite",
+    (store, complete, setFailure, transaction) => {
+      const tombstoneRequest = transaction.objectStore(ROOM_DELETION_STORE).get(message.packet.room);
+      const existingRequest = store.get([message.packet.room, message.packet.id]) as IDBRequest<StoredMessage | undefined>;
+      const range = IDBKeyRange.bound([message.packet.room, ""], [message.packet.room, "\uffff"]);
+      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
+      let tombstoneReady = false;
+      let deleted = false;
+      let existingReady = false;
+      let existing: StoredMessage | undefined;
+      let roomMessages: StoredMessage[] | undefined;
+      const maybeAccept = () => {
+        if (!tombstoneReady || !existingReady || !roomMessages) return;
+        if (deleted) {
+          complete("room_deleted");
+          return;
+        }
+        if (existing && !samePacket(existing.packet, message.packet)) {
+          complete("conflict");
+          return;
+        }
+        if (existing) {
+          const accepted: StoredMessage = message.transport === "hub"
+            ? { ...existing, transport: "hub", delivery: "sent" }
+            : existing;
+          if (accepted === existing || (existing.transport === "hub" && existing.delivery === "sent")) {
+            complete("duplicate");
+            return;
+          }
+          try {
+            observe(store.put(accepted), () => complete("duplicate"), setFailure);
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
+          }
+          return;
+        }
+        const nextOrder = roomMessages.reduce((maximum, item) => Math.max(maximum, Number.isFinite(item.displayOrder) ? item.displayOrder! : -1), -1) + 1;
+        const accepted: StoredMessage = { ...message, delivery: "sent", displayOrder: nextOrder };
+        try {
+          observe(store.add(accepted), () => complete("saved"), setFailure);
+        } catch (error) {
+          setFailure(error);
+          transaction.abort();
+        }
+      };
+      tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeAccept(); };
+      existingRequest.onsuccess = () => { existingReady = true; existing = existingRequest.result; maybeAccept(); };
+      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeAccept(); };
+      tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
+      existingRequest.onerror = () => setFailure(existingRequest.error ?? new Error("Could not read the existing local message."));
+      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read local message order."));
+    },
+  );
+}
+
 /** Reorder replayed hub rows into the order their packets arrived, keeping other rows in their current slots. */
 export async function reconcileHubReplayOrder(room: string, orderedIds: string[]): Promise<boolean> {
   if (orderedIds.length < 2) return true;
@@ -649,6 +712,7 @@ export const browserConversationStore: ConversationStore = {
   saveIdentity,
   loadMessages,
   saveMessage,
+  acceptInboundMessage,
   updateDelivery,
   beginRoomDeletion,
   cancelRoomDeletion,

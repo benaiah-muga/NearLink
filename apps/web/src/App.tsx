@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPageCompletePacket, type SyncPacket } from "@nearlink/protocol";
-import { browserConversationStore as conversationStore, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
+import { browserConversationStore as conversationStore, type InboundAcceptanceResult, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, WebRtcTransportError, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
 import { createSecureUuid, SecureRandomUnavailableError } from "./lib/secureId";
@@ -1237,54 +1237,11 @@ function App() {
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
             const pending = historyRequestRef.current;
             if (pending?.socket === socket && pending.room === connectionRoom) pending.packets.set(packet.id, packet);
-            const persisted = await conversationStore.loadMessages(connectionRoom).catch(() => null);
-            if (!persisted || socketRef.current !== socket || currentRoomRef.current !== connectionRoom) {
-              if (!persisted && currentRoomRef.current === connectionRoom) {
-                hubSyncRef.current?.rejectMessage(packet, "A requested sync message could not be read from storage. Reconnect to restart synchronization.");
-                hubInboundFailuresRef.current.add(messageKey);
-                setNotice(HUB_REPLAY_FAILURE_NOTICE);
-              }
-              return;
-            }
-            const existing = persisted.find((entry) => entry.packet.id === packet.id);
-            if (existing) {
-              if (!sameMessagePacket(existing.packet, packet)) {
-                hubSyncRef.current?.rejectMessage(packet, "A requested sync message conflicted with saved content. Reconnect to restart synchronization.");
-                setNotice("The hub replay used an ID that conflicts with saved message content. The saved message was kept and the replay was ignored.");
-                return;
-              }
-              if (existing.transport !== "hub" || existing.delivery !== "sent") {
-                try {
-                  const saved = await conversationStore.saveMessage({ ...existing, transport: "hub", delivery: "sent" });
-                  if (!saved) throw new Error("Room deletion blocked this replay.");
-                } catch {
-              hubSyncRef.current?.rejectMessage(packet, "A requested sync message could not be saved. Reconnect to restart synchronization.");
-                  hubInboundFailuresRef.current.add(messageKey);
-                  setNotice(HUB_REPLAY_FAILURE_NOTICE);
-                  return;
-                }
-              }
-              try {
-                const reconciled = await reconcileHubReplayPacket(connectionRoom, socket, packet.id);
-                if (!reconciled) return;
-              } catch {
-                hubInboundFailuresRef.current.add(messageKey);
-                setNotice(HUB_REPLAY_FAILURE_NOTICE);
-                return;
-              }
-              hubInboundFailuresRef.current.delete(messageKey);
-              hubSyncRef.current?.observeAcceptedMessage(packet);
-              messageKeysRef.current.add(messageKey);
-              if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
-              const refreshed = await conversationStore.loadMessages(connectionRoom);
-              if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
-              setMessages(refreshed);
-              return;
-            }
             const item: StoredMessage = { packet, direction: packet.sender === identity.sender ? "outgoing" : "incoming", delivery: "sent", transport: "hub" };
+            let acceptance: InboundAcceptanceResult;
             try {
-              const saved = await conversationStore.saveMessage(item);
-              if (!saved) {
+              acceptance = await conversationStore.acceptInboundMessage(item);
+              if (acceptance === "room_deleted") {
                 if (currentRoomRef.current === connectionRoom) setNotice("This room was cleared on this device. Reconnect to resume the room; hub-retained history may replay.");
                 return;
               }
@@ -1294,6 +1251,12 @@ function App() {
                 hubInboundFailuresRef.current.add(messageKey);
                 setNotice(HUB_REPLAY_FAILURE_NOTICE);
               }
+              return;
+            }
+            if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+            if (acceptance === "conflict") {
+              hubSyncRef.current?.rejectMessage(packet, "A requested sync message conflicted with saved content. Reconnect to restart synchronization.");
+              setNotice("The hub replay used an ID that conflicts with saved message content. The saved message was kept and the replay was ignored.");
               return;
             }
             try {
@@ -1519,34 +1482,11 @@ function App() {
     const previous = directInboundOperationsRef.current.get(messageKey) ?? Promise.resolve();
     const operation = previous.catch(() => undefined).then(async () => {
       if (directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
-      const existing = await conversationStore.loadMessages(connectionRoom).catch(() => null);
-      if (!existing || directRef.current !== transport || currentRoomRef.current !== connectionRoom) {
-        if (!existing && currentRoomRef.current === connectionRoom) {
-          directSyncRef.current?.rejectMessage(packet, "A requested sync message could not be checked in storage. Reconnect to restart synchronization.");
-          setNotice("The direct message could not be checked against local storage, so it was not accepted.");
-        }
-        return;
-      }
-      const duplicate = existing.find((item) => item.packet.id === packet.id);
-      if (duplicate) {
-        if (!sameMessagePacket(duplicate.packet, packet)) {
-          directSyncRef.current?.rejectMessage(packet, "A requested sync message conflicted with saved content. Reconnect to restart synchronization.");
-          if (currentRoomRef.current === connectionRoom) setNotice("A conflicting direct message used an already saved message ID. It was ignored.");
-          return;
-        }
-        directSyncRef.current?.observeAcceptedMessage(packet);
-        messageKeysRef.current.add(messageKey);
-        if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
-          const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
-          if (!validateWithWasm("server", ack)) return;
-          try { transport.send(JSON.stringify(ack)); } catch { setNotice("The saved duplicate could not be acknowledged. It remains saved on this device."); }
-        }
-        return;
-      }
       const item: StoredMessage = { packet, direction: "incoming", delivery: "sent", transport: "direct" };
+      let acceptance: InboundAcceptanceResult;
       try {
-        const saved = await conversationStore.saveMessage(item);
-        if (!saved) {
+        acceptance = await conversationStore.acceptInboundMessage(item);
+        if (acceptance === "room_deleted") {
           if (currentRoomRef.current === connectionRoom) setNotice("This room was cleared on this device. Reconnect to resume the room; hub-retained history may replay.");
           return;
         }
@@ -1555,10 +1495,17 @@ function App() {
         if (currentRoomRef.current === connectionRoom) setNotice("The direct message arrived, but could not be saved. No acknowledgment was sent.");
         return;
       }
+      if (acceptance === "conflict") {
+        directSyncRef.current?.rejectMessage(packet, "A requested sync message conflicted with saved content. Reconnect to restart synchronization.");
+        if (currentRoomRef.current === connectionRoom) setNotice("A conflicting direct message used an already saved message ID. It was ignored.");
+        return;
+      }
       if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
       directSyncRef.current?.observeAcceptedMessage(packet);
       messageKeysRef.current.add(messageKey);
-      setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id) ? current : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+      if (acceptance === "saved") {
+        setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id) ? current : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+      }
       if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
         const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
         if (!validateWithWasm("server", ack)) return;
