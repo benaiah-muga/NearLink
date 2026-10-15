@@ -16,11 +16,15 @@ async function expectAccessible(page: import("@playwright/test").Page, state: st
 
 async function waitForSetupReady(page: import("@playwright/test").Page) {
   const diagnostics = page.locator(".diagnostics-panel");
-  if (!(await diagnostics.evaluate((element) => (element as HTMLDetailsElement).open))) {
+  const wasOpen = await diagnostics.evaluate((element) => (element as HTMLDetailsElement).open);
+  if (!wasOpen) {
     await diagnostics.locator("summary").click();
   }
   await expect(diagnostics.locator(".diagnostics-grid").getByText("ready")).toBeVisible();
   await expect(page.getByLabel("Your call sign")).toBeEnabled();
+  if (!wasOpen) {
+    await diagnostics.locator("summary").click();
+  }
 }
 
 test("saves a station profile and keeps a message queued through reload without a hub", async ({ page }) => {
@@ -38,7 +42,7 @@ test("saves a station profile and keeps a message queued through reload without 
   });
 
   await page.goto("/");
-  await expect(page.getByText("Messages save locally until a hub is connected")).toBeVisible();
+  await waitForSetupReady(page);
   await expectAccessible(page, "the loaded station screen");
   const diagnostics = page.locator(".diagnostics-panel");
   const diagnosticsSummary = diagnostics.locator("summary");
@@ -103,6 +107,103 @@ test("saves a station profile and keeps a message queued through reload without 
   await expect(page.getByText(/Hub history was not deleted and may appear after you reconnect/)).toBeVisible();
   await expectAccessible(page, "the cleared local conversation screen");
 });
+
+test("keeps the first-run queue journey usable at narrow Chromium widths", async ({ browser }) => {
+  for (const width of [320, 375]) {
+    const context = await browser.newContext({ viewport: { width, height: 844 } });
+    const page = await context.newPage();
+    try {
+      await page.goto("/");
+      await expect(page.getByText("Messages save locally until a hub is connected")).toBeVisible();
+      const callSign = page.getByLabel("Your call sign");
+      const roomFrequency = page.getByLabel("Room frequency");
+      const save = page.getByRole("button", { name: "Save and join room" });
+      await expect(callSign).toBeVisible();
+      await expect(roomFrequency).toBeVisible();
+      await expect(save).toBeVisible();
+      await expectWithinViewport(callSign, width, "call sign field");
+      await expectWithinViewport(roomFrequency, width, "room frequency field");
+      await expectWithinViewport(save, width, "save button");
+      await expectNoHorizontalOverflow(page, width);
+      await expectAccessible(page, `the first-run screen at ${width}px`);
+
+      const diagnostics = page.locator(".diagnostics-panel");
+      const diagnosticsSummary = diagnostics.locator("summary");
+      await diagnosticsSummary.focus();
+      await page.keyboard.press("Enter");
+      await expect(diagnostics).toHaveAttribute("open", "");
+      await expectWithinViewport(diagnosticsSummary, width, "diagnostics summary");
+      await expectNoHorizontalOverflow(page, width);
+      await expectAccessible(page, `keyboard-opened diagnostics at ${width}px`);
+
+      const copyDiagnostics = diagnostics.getByRole("button", { name: "Copy diagnostics summary" });
+      await expect(copyDiagnostics).toBeVisible();
+      await expectWithinViewport(copyDiagnostics, width, "copy diagnostics button");
+      await callSign.fill("Narrow Test Station");
+      await roomFrequency.fill(`chromium-narrow-${width}`);
+      await page.getByLabel("Hub address").fill("ws://127.0.0.1:1/ws");
+      await expect(save).toBeEnabled();
+      await expectWithinViewport(save, width, "save button before submission");
+      await save.focus();
+      await page.keyboard.press("Enter");
+      await expect(page.getByRole("button", { name: "Station settings saved" })).toBeVisible();
+
+      const message = `Narrow queue at ${width}px`;
+      const composer = page.getByRole("textbox", { name: "Write a message" });
+      await expect(composer).toBeVisible();
+      await expect(composer).toBeEnabled();
+      await expectWithinViewport(composer, width, "message composer");
+      await composer.fill(message);
+      const send = page.getByRole("button", { name: "Send message" });
+      await expect(send).toBeEnabled();
+      await expectWithinViewport(send, width, "send button before submission");
+      await send.focus();
+      await page.keyboard.press("Enter");
+
+      const messageLog = page.getByRole("log", { name: `Messages in chromium-narrow-${width}` });
+      await expect(messageLog.getByText(message)).toBeVisible();
+      await expect(messageLog.getByText("Queued on this device")).toBeVisible();
+      await expectWithinViewport(messageLog, width, "message log");
+      await expectNoHorizontalOverflow(page, width);
+      await expectAccessible(page, `the queued conversation at ${width}px`);
+    } finally {
+      await context.close();
+    }
+  }
+});
+
+async function expectNoHorizontalOverflow(page: import("@playwright/test").Page, width: number) {
+  const dimensions = await page.evaluate(() => ({
+    document: document.documentElement.scrollWidth,
+    body: document.body.scrollWidth,
+    viewport: window.innerWidth,
+    containers: Array.from(document.querySelectorAll(".station-shell, .station-sidebar, .diagnostics-panel, .message-scroll, .composer-wrap, .composer, .composer-tools, .composer-foot"))
+      .map((element) => ({
+        selector: element.className || element.tagName.toLowerCase(),
+        scroll: element.scrollWidth,
+        client: element.clientWidth,
+      })),
+  }));
+  expect(dimensions.viewport).toBe(width);
+  expect(dimensions.document, `Document overflow at ${width}px: ${JSON.stringify(dimensions)}`).toBeLessThanOrEqual(width);
+  expect(dimensions.body, `Body overflow at ${width}px: ${JSON.stringify(dimensions)}`).toBeLessThanOrEqual(width);
+  for (const container of dimensions.containers) {
+    expect(container.scroll, `Horizontal overflow in ${container.selector} at ${width}px: ${JSON.stringify(container)}`).toBeLessThanOrEqual(container.client);
+  }
+}
+
+async function expectWithinViewport(locator: import("@playwright/test").Locator, width: number, label: string) {
+  await locator.evaluate((element) => element.scrollIntoView({ block: "center", inline: "nearest" }));
+  const bounds = await locator.evaluate((element) => {
+    const { left, right, top, bottom } = element.getBoundingClientRect();
+    return { left, right, top, bottom, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight };
+  });
+  expect(bounds.viewportWidth).toBe(width);
+  expect(bounds.left, `${label} extends past the left edge at ${width}px: ${JSON.stringify(bounds)}`).toBeGreaterThanOrEqual(0);
+  expect(bounds.right, `${label} extends past the right edge at ${width}px: ${JSON.stringify(bounds)}`).toBeLessThanOrEqual(width);
+  expect(bounds.top, `${label} is above the viewport at ${width}px: ${JSON.stringify(bounds)}`).toBeGreaterThanOrEqual(0);
+  expect(bounds.bottom, `${label} is below the viewport at ${width}px: ${JSON.stringify(bounds)}`).toBeLessThanOrEqual(bounds.viewportHeight);
+}
 
 test("loads older hub history in accepted order and retries the same cursor", async ({ page }) => {
   let historyRequests = 0;
