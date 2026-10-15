@@ -2044,4 +2044,26 @@ describe("browser app messaging flow", () => {
     expect(await screen.findByText(otherMessage.packet.body)).toBeTruthy();
     expect(screen.queryByText(currentMessage.packet.body)).toBeNull();
   });
+
+  it("starts with safe in-memory defaults when browser settings cannot be read", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new DOMException("Denied", "SecurityError"); });
+    render(<App />);
+
+    const roomInput = await screen.findByLabelText("Room frequency") as HTMLInputElement;
+    expect(roomInput.value).toBe("");
+    expect((screen.getByLabelText("Hub address") as HTMLInputElement).value).toBe("ws://localhost:8000/ws");
+  });
+
+  it("keeps hub connection available when browser settings cannot be written", async () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new DOMException("Denied", "QuotaExceededError"); });
+    render(<App />);
+    await screen.findByRole("combobox", { name: "Recent rooms on this device" });
+    fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: "Sam" } });
+    const saveButton = screen.getByRole("button", { name: "Save and join room" });
+    await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(saveButton);
+
+    expect(await screen.findByText("Your station settings could not be saved. Re-enter them if you reload this page.")).toBeTruthy();
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+  });
 });
