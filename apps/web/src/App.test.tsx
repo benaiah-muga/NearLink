@@ -483,8 +483,15 @@ afterEach(() => {
 
 describe("hub join handshake", () => {
   async function enableFakeTimersAfterReady(): Promise<void> {
-    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
-    fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+    const connectButton = screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement;
+    if (connectButton.disabled) {
+      fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: "Sam" } });
+      const saveButton = screen.getByRole("button", { name: "Save and join room" }) as HTMLButtonElement;
+      await waitFor(() => expect(saveButton.disabled).toBe(false));
+      fireEvent.click(saveButton);
+    } else {
+      fireEvent.click(connectButton);
+    }
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
     vi.useFakeTimers();
   }
