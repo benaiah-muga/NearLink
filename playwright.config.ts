@@ -22,11 +22,11 @@ export default defineConfig({
         ...devices["Desktop Chrome"],
         launchOptions: localChromiumPath ? { executablePath: localChromiumPath } : undefined,
       },
-      testIgnore: "cross-browser-smoke.spec.ts",
+      testIgnore: ["cross-browser-smoke.spec.ts", "direct-cross-browser.spec.ts"],
     },
     {
       name: "firefox-smoke",
-      testMatch: ["cross-browser-smoke.spec.ts", "real-hub-compat.spec.ts"],
+      testMatch: ["cross-browser-smoke.spec.ts", "real-hub-compat.spec.ts", "direct-cross-browser.spec.ts"],
       use: { ...devices["Desktop Firefox"] },
     },
     {
