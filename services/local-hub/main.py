@@ -6,6 +6,7 @@ participants. Message history is retained locally within configured bounds.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -16,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from time import monotonic, time
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -458,6 +460,179 @@ def database_path() -> str:
 
 
 message_store = MessageStore(database_path())
+
+
+def _open_history_admin_database(path: str | Path, *, writable: bool) -> sqlite3.Connection:
+    """Open an existing supported hub database without creating or migrating it."""
+    configured_path = Path(path).expanduser()
+    try:
+        if configured_path.is_symlink():
+            raise ValueError("database path must not be a symbolic link")
+        file_path = configured_path.resolve(strict=True)
+        if not file_path.is_file():
+            raise ValueError("database path must name an existing regular file")
+    except OSError as error:
+        raise ValueError("database path must name an existing regular file") from error
+
+    mode = "rw" if writable else "ro"
+    uri = f"file:{quote(str(file_path), safe='/')}?mode={mode}"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=2)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 2000")
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != 2:
+            raise ValueError(f"unsupported hub database schema version: {version}")
+        required_columns = {
+            "messages": {
+                "sequence": ("INTEGER", 0, 1),
+                "room": ("TEXT", 1, 0),
+                "message_id": ("TEXT", 1, 0),
+                "packet": ("TEXT", 1, 0),
+                "packet_bytes": ("INTEGER", 1, 0),
+                "stored_at": ("REAL", 1, 0),
+            },
+            "room_state": {
+                "room": ("TEXT", 0, 1),
+                "history_truncated": ("INTEGER", 1, 0),
+                "touched_at": ("REAL", 1, 0),
+            },
+            "store_state": {
+                "id": ("INTEGER", 0, 1),
+                "marker_overflow": ("INTEGER", 1, 0),
+            },
+        }
+        for table, columns in required_columns.items():
+            rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            present = {
+                row["name"]: (row["type"].upper(), row["notnull"], row["pk"])
+                for row in rows
+            }
+            if any(present.get(name) != shape for name, shape in columns.items()):
+                raise ValueError(f"unsupported hub database schema: {table} table has an incompatible shape")
+        indexes = connection.execute("PRAGMA index_list(messages)").fetchall()
+        index_columns: dict[str, list[str | None]] = {}
+        for index in indexes:
+            quoted_name = index["name"].replace('"', '""')
+            index_columns[index["name"]] = [
+                item["name"]
+                for item in connection.execute(f'PRAGMA index_info("{quoted_name}")')
+            ]
+        if not any(
+            row["unique"] and index_columns[row["name"]] == ["room", "message_id"]
+            for row in indexes
+        ):
+            raise ValueError("unsupported hub database schema: message identity index is missing")
+        if not any(
+            row["name"] == "messages_room_sequence"
+            and not row["unique"]
+            and index_columns[row["name"]] == ["room", "sequence"]
+            for row in indexes
+        ):
+            raise ValueError("unsupported hub database schema: room history index is missing")
+        unexpected_objects = connection.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type IN ('table', 'trigger', 'view')
+                 AND name NOT IN (
+                     'messages', 'room_state', 'store_state', 'sqlite_sequence',
+                     'sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4'
+                 )"""
+        ).fetchall()
+        if unexpected_objects:
+            raise ValueError("unsupported hub database schema: unexpected database objects are present")
+        store_state = connection.execute("SELECT id, marker_overflow FROM store_state").fetchall()
+        if len(store_state) != 1 or store_state[0]["id"] != 1 or store_state[0]["marker_overflow"] not in (0, 1):
+            raise ValueError("unsupported hub database schema: store state is invalid")
+        return connection
+    except (sqlite3.Error, ValueError):
+        if connection is not None:
+            connection.close()
+        raise
+
+
+def list_retained_history(path: str | Path) -> list[tuple[str, int, bool]]:
+    """Return retained message counts and truncation state for known rooms."""
+    connection = _open_history_admin_database(path, writable=False)
+    try:
+        marker_overflow = connection.execute(
+            "SELECT marker_overflow FROM store_state WHERE id = 1"
+        ).fetchone()[0]
+        rows = connection.execute(
+            """SELECT state.room, COUNT(messages.sequence) AS message_count,
+                      state.history_truncated
+               FROM room_state AS state
+               LEFT JOIN messages ON messages.room = state.room
+               GROUP BY state.room, state.history_truncated
+               ORDER BY state.room COLLATE BINARY"""
+        ).fetchall()
+        return [
+            (row["room"], row["message_count"], bool(row["history_truncated"] or marker_overflow))
+            for row in rows
+        ]
+    finally:
+        connection.close()
+
+
+def purge_retained_history(path: str | Path, *, room: str | None = None) -> int:
+    """Delete one room or all stored messages while keeping truncation markers."""
+    if room is not None and not valid_room(room):
+        raise ValueError("room must contain 1 to 64 letters, digits, underscores, or hyphens")
+    connection = _open_history_admin_database(path, writable=True)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        now = time()
+        if room is None:
+            message_count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            affected_rooms = connection.execute(
+                "SELECT room FROM room_state UNION SELECT DISTINCT room FROM messages"
+            ).fetchall()
+            connection.execute("DELETE FROM messages")
+            connection.execute("UPDATE room_state SET history_truncated = 1, touched_at = ?", (now,))
+            for row in affected_rooms:
+                MessageStore._touch_room(connection, row["room"], truncated=True)
+            MessageStore._trim_room_markers(connection)
+        else:
+            deleted = connection.execute("DELETE FROM messages WHERE room = ?", (room,))
+            MessageStore._touch_room(connection, room, truncated=True)
+            MessageStore._trim_room_markers(connection)
+            connection.commit()
+            return deleted.rowcount
+        connection.commit()
+        return message_count
+    except sqlite3.Error:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def history_cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Inspect or purge local NearLink hub history")
+    commands = parser.add_subparsers(dest="command", required=True)
+    history = commands.add_parser("history", help="manage retained room history")
+    actions = history.add_subparsers(dest="action", required=True)
+    actions.add_parser("list", help="list retained message counts by room")
+    purge = actions.add_parser("purge", help="purge retained message history")
+    selection = purge.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--room", help="purge one room")
+    selection.add_argument("--all", action="store_true", help="purge all rooms")
+    args = parser.parse_args(argv)
+    path = database_path()
+    try:
+        if args.action == "list":
+            rows = list_retained_history(path)
+            print("room\tmessages\thistoryTruncated")
+            for room_name, count, truncated in rows:
+                print(f"{room_name}\t{count}\t{str(truncated).lower()}")
+        else:
+            removed = purge_retained_history(path, room=args.room if args.room is not None else None)
+            target = f"room {args.room}" if args.room is not None else "all rooms"
+            print(f"Purged {removed} message(s) from {target}.")
+            print("SQLite file remnants may remain; this command does not securely erase data.")
+    except (OSError, sqlite3.Error, ValueError) as error:
+        parser.exit(2, f"nearlink hub history: {error}\n")
+    return 0
 
 
 def packet_error(code: str, message: str, message_id: str | None = None) -> dict[str, Any]:
@@ -1034,3 +1209,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await remove_client(client)
         finally:
             active_connections -= 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(history_cli())

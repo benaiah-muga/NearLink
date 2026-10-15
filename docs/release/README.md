@@ -146,6 +146,30 @@ The output directory must be empty and outside the source checkout.
 - [ ] A rollback or withdrawal action is documented for the distribution
   channel.
 
+## Offline local hub history management
+
+Run these commands from the repository root while the local hub is stopped or
+when its SQLite database is otherwise available for a short write transaction.
+The CLI uses `NEARLINK_HUB_DB_PATH`, or `nearlink-hub.sqlite3` in the current
+directory when the variable is unset. It opens an existing regular file only,
+checks for the supported schema version, and does not initialize or migrate an
+unsupported database.
+
+```sh
+python services/local-hub/main.py history list
+python services/local-hub/main.py history purge --room ROOM_CODE
+python services/local-hub/main.py history purge --all
+```
+
+The list reports retained message counts and each room's `historyTruncated`
+state. Purging a room or all rooms deletes matching message rows in one SQLite
+transaction and preserves a truncation marker. This stops the hub from
+replaying those deleted rows, but does not erase copies already stored in
+browsers, peers, backups, SQLite pages, or sidecar files. SQLite may retain
+recoverable remnants after deletion. These commands do not securely erase
+history. Hub packets are plaintext, so protect the database directory and
+backups as message content.
+
 ## 5. Publish and monitor a controlled beta
 
 - [ ] Give participants the candidate version, artifact checksums, supported

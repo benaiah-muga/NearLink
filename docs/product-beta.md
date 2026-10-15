@@ -40,6 +40,13 @@ confidential, or otherwise sensitive communication.
 - A per-room control to delete that room's saved and queued messages from the
   current browser. The local identity and settings stay saved. The action does
   not delete hub-retained history, which may replay after reconnecting.
+- The hub operator can inspect and purge hub history offline with the local
+  history commands. They use the configured `NEARLINK_HUB_DB_PATH`, or
+  `nearlink-hub.sqlite3` in the current directory. They report retained counts
+  and truncation state. Purging history makes a room report
+  `historyTruncated` and prevents the hub from replaying those deleted rows.
+  It does not remove copies already saved by browser clients or peers, and
+  SQLite file remnants may remain. This is not secure erasure.
 
 The local hub ACK means that the hub accepted a message into its local store. It
 does not mean another participant received or read it. Direct peer acceptance
@@ -265,6 +272,12 @@ specific safe process and the data has been reviewed for sensitive values.
   participants can impersonate a display name.
 - Hub history is bounded and may be deleted by age or storage limits. A hub ACK
   confirms hub acceptance, not peer receipt or reading.
+- Hub message packets are stored as plaintext in the operator's local SQLite
+  database. The offline history commands can count retained messages and delete
+  one room or all hub rows. A purge preserves a truncation marker so clients can
+  distinguish an empty room from history that the hub removed. The marker does
+  not restore deleted messages. Deleted rows may remain in SQLite pages, WAL
+  files, backups, or other copies, so the command is not a secure erase.
 - Browser IndexedDB and local settings are stored on the device. Browser data
   clearing, profile removal, storage eviction, device loss, or local access by
   another person may expose or erase them.

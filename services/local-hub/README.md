@@ -45,6 +45,28 @@ online backup API or stop the hub and copy the database with its `-wal` and
 `-shm` files. Copying only the main database while the hub is running can omit
 committed data.
 
+## Inspect and purge local history
+
+From the repository root, stop the hub before performing maintenance, or use
+the command when the database is available for a short write transaction. These
+offline commands operate on the existing database selected by
+`NEARLINK_HUB_DB_PATH`, or on
+`nearlink-hub.sqlite3` in the current directory when the variable is unset:
+
+```sh
+python services/local-hub/main.py history list
+python services/local-hub/main.py history purge --room ROOM_CODE
+python services/local-hub/main.py history purge --all
+```
+
+The list reports retained message counts and whether history may be incomplete.
+Purging one room or all rooms deletes matching message rows in a transaction
+and keeps a truncation marker so joining clients are not told the history is
+complete. The hub will no longer replay purged rows. Purging does not remove
+copies already stored by browsers or peers. The data is plaintext, and SQLite
+pages, WAL or SHM files, and backups may retain recoverable copies. This is not
+secure erasure. Protect the database and backups as message content.
+
 Connect clients to `ws://127.0.0.1:8000/ws`. Each connection must send a valid
 version 1 `join` packet first. The hub responds with `joined`, which carries a
 `historyTruncated` boolean, replays up to 100 recent room messages in sequence
