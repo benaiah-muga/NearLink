@@ -10,6 +10,7 @@ interface MockPeerTransport {
   sent: string[];
   emit(data: unknown): void;
   setState(state: string): void;
+  sendErrorCode: string | null;
 }
 
 const peerMock = vi.hoisted(() => ({ instances: [] as Array<any> }));
@@ -96,6 +97,9 @@ vi.mock("./lib/storage", async (importOriginal) => {
 });
 
 vi.mock("./lib/webrtc", () => {
+  class MockWebRtcTransportError extends Error {
+    constructor(readonly code: string, message: string) { super(message); }
+  }
   class MockDirectWebRtcTransport {
     static readonly instances = peerMock.instances;
     currentState = "new";
@@ -104,6 +108,7 @@ vi.mock("./lib/webrtc", () => {
     onStateChange: ((state: string) => void) | null = null;
     onError: ((error: Error) => void) | null = null;
     readonly sent: string[] = [];
+    sendErrorCode: string | null = null;
     constructor() {
       if (constructorGate.throwNext) {
         constructorGate.throwNext = false;
@@ -126,12 +131,15 @@ vi.mock("./lib/webrtc", () => {
       this.peerFingerprint = `sha-256 ${"AA:".repeat(31)}AA`;
       this.setState("connected");
     }
-    send(data: string) { this.sent.push(data); }
+    send(data: string) {
+      if (this.sendErrorCode) throw new MockWebRtcTransportError(this.sendErrorCode, "Injected direct send failure.");
+      this.sent.push(data);
+    }
     emit(data: unknown) { this.onMessage?.(JSON.stringify(data)); }
     setState(state: string) { this.currentState = state; this.onStateChange?.(state); }
     close() { this.setState("closed"); }
   }
-  return { DirectWebRtcTransport: MockDirectWebRtcTransport };
+  return { DirectWebRtcTransport: MockDirectWebRtcTransport, WebRtcTransportError: MockWebRtcTransportError };
 });
 
 import App from "./App";
@@ -413,6 +421,37 @@ describe("direct peer app flow", () => {
     await screen.findByText(/It has not been queued for delivery/);
     expect((await loadMessages(ROOM)).some((item) => item.packet.body === storageGate.body)).toBe(false);
     expect(transport.sent.map((entry) => JSON.parse(entry)).filter((packet) => packet.type === "message")).toHaveLength(0);
+  });
+
+  it("keeps a saturated direct send retryable with the same ID through link close", async () => {
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
+    fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
+    await screen.findByLabelText("Your signaling JSON to share");
+    fireEvent.change(screen.getByLabelText("Paste peer offer or answer JSON"), { target: { value: JSON.stringify({ version: 1, type: "answer", sdp: "test-answer" }) } });
+    fireEvent.click(screen.getByRole("button", { name: "Accept answer" }));
+    await screen.findByLabelText("Remote SDP DTLS fingerprint");
+    fireEvent.change(screen.getByLabelText(/Fingerprint compared in person/), { target: { value: FINGERPRINT } });
+    fireEvent.click(screen.getByRole("button", { name: "Compare fingerprints" }));
+    await screen.findByText(/Fingerprint matches this DTLS session/);
+
+    const transport = peerMock.instances[0] as MockPeerTransport;
+    transport.sendErrorCode = "outbound_queue_full";
+    fireEvent.change(screen.getByLabelText("Message transport"), { target: { value: "direct" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Retry after direct backpressure" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await screen.findByText("Direct send queue is full");
+    const saturated = (await loadMessages(ROOM)).find((item) => item.packet.body === "Retry after direct backpressure");
+    expect(saturated).toMatchObject({ direction: "outgoing", transport: "direct", delivery: "failed", failure: "transport_backpressure" });
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+
+    transport.sendErrorCode = null;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(transport.sent.some((raw) => JSON.parse(raw).id === saturated?.packet.id)).toBe(true));
+    await waitFor(async () => expect((await loadMessages(ROOM)).find((item) => item.packet.id === saturated?.packet.id)?.delivery).toBe("queued"));
+    transport.setState("disconnected");
+    await waitFor(async () => expect((await loadMessages(ROOM)).find((item) => item.packet.id === saturated?.packet.id)?.delivery).toBe("queued"));
+    expect((await loadMessages(ROOM)).find((item) => item.packet.id === saturated?.packet.id)?.packet.id).toBe(saturated?.packet.id);
   });
 
   it("reports a WebRTC constructor failure and releases the busy controls", async () => {

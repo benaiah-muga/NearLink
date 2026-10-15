@@ -5,6 +5,7 @@ import {
   WebRtcTransportError,
   parseWebRtcSignal,
   serializeWebRtcSignal,
+  type DirectWebRtcTransportOptions,
   WEBRTC_SIGNAL_VERSION,
 } from "./webrtc";
 
@@ -18,15 +19,32 @@ class FakeChannel extends EventTarget {
   maxRetransmits: number | null = null;
   maxPacketLifeTime: number | null = null;
   readyState: RTCDataChannelState = "connecting";
+  bufferedAmount = 0;
+  maxBufferedAmount = 0;
+  bufferedAmountLowThreshold = 0;
   sent: unknown[] = [];
   closed = false;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onopen: ((event: Event) => void) | null = null;
   onclose: ((event: Event) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
+  onbufferedamountlow: ((event: Event) => void) | null = null;
 
   send(data: string | ArrayBuffer | Blob | ArrayBufferView): void {
     this.sent.push(data);
+    if (typeof data === "string") this.bufferedAmount += new TextEncoder().encode(data).byteLength;
+    else if (data instanceof ArrayBuffer) this.bufferedAmount += data.byteLength;
+    else if (data instanceof Blob) this.bufferedAmount += data.size;
+    else this.bufferedAmount += data.byteLength;
+    this.maxBufferedAmount = Math.max(this.maxBufferedAmount, this.bufferedAmount);
+  }
+
+  drainTo(bytes: number): void {
+    const previous = this.bufferedAmount;
+    this.bufferedAmount = bytes;
+    if (previous > this.bufferedAmountLowThreshold && this.bufferedAmount <= this.bufferedAmountLowThreshold) {
+      this.onbufferedamountlow?.(new Event("bufferedamountlow"));
+    }
   }
 
   close(): void {
@@ -87,7 +105,7 @@ class FakePeerConnection extends EventTarget {
   }
 }
 
-function makeTransport(connection = new FakePeerConnection(), timeout = 100): {
+function makeTransport(connection = new FakePeerConnection(), timeout = 100, options: Omit<DirectWebRtcTransportOptions, "peerConnectionFactory" | "iceGatheringTimeoutMs"> = {}): {
   transport: DirectWebRtcTransport;
   connection: FakePeerConnection;
   passedConfiguration: RTCConfiguration | undefined;
@@ -95,6 +113,7 @@ function makeTransport(connection = new FakePeerConnection(), timeout = 100): {
   let passedConfiguration: RTCConfiguration | undefined;
   const transport = new DirectWebRtcTransport({
     iceGatheringTimeoutMs: timeout,
+    ...options,
     peerConnectionFactory: (configuration) => {
       passedConfiguration = configuration;
       return connection as unknown as RTCPeerConnection;
@@ -291,6 +310,129 @@ describe("direct WebRTC transport", () => {
     expect(channel.sent).toEqual(["payload"]);
     expect(onMessage).toHaveBeenCalledWith("incoming");
     transport.close();
+  });
+
+  it("queues sends in FIFO order above the high watermark and resumes below low", async () => {
+    const { transport, connection } = makeTransport(undefined, 100, {
+      bufferedAmountHighWaterMark: 10,
+      bufferedAmountLowWaterMark: 3,
+    });
+    await transport.createOffer();
+    const channel = connection.dataChannel!;
+    channel.readyState = "open";
+    expect(channel.bufferedAmountLowThreshold).toBe(3);
+    channel.bufferedAmount = 11;
+
+    transport.send("first");
+    transport.send("second");
+    expect(channel.sent).toEqual([]);
+
+    channel.drainTo(3);
+    expect(channel.sent).toEqual(["first"]);
+    channel.drainTo(3);
+    expect(channel.sent).toEqual(["first", "second"]);
+    expect(channel.maxBufferedAmount).toBeLessThanOrEqual(10);
+    transport.close();
+  });
+
+  it("rejects an item that cannot fit below the configured high watermark", async () => {
+    const { transport, connection } = makeTransport(undefined, 100, {
+      bufferedAmountHighWaterMark: 4,
+      bufferedAmountLowWaterMark: 1,
+      maxQueuedBytes: 8,
+      maxQueuedEntries: 2,
+    });
+    await transport.createOffer();
+    const channel = connection.dataChannel!;
+    channel.readyState = "open";
+    expect(() => transport.send("12345")).toThrowError(expect.objectContaining({ code: "outbound_queue_full" }));
+    expect(channel.sent).toEqual([]);
+    transport.close();
+  });
+
+  it("arms a head-relative wakeup when the buffer is below low but the queued item does not fit", async () => {
+    const { transport, connection } = makeTransport(undefined, 100, {
+      bufferedAmountHighWaterMark: 256 * 1024,
+      bufferedAmountLowWaterMark: 64 * 1024,
+      maxQueuedBytes: 512 * 1024,
+      maxQueuedEntries: 4,
+    });
+    await transport.createOffer();
+    const channel = connection.dataChannel!;
+    channel.readyState = "open";
+    channel.bufferedAmount = 50 * 1024;
+    const payload = "x".repeat(220 * 1024);
+
+    transport.send(payload);
+    expect(channel.sent).toEqual([]);
+    expect(channel.bufferedAmountLowThreshold).toBe(36 * 1024);
+    channel.drainTo(40 * 1024);
+    expect(channel.sent).toEqual([]);
+    channel.drainTo(36 * 1024);
+
+    expect(channel.sent).toEqual([payload]);
+    expect(channel.maxBufferedAmount).toBeLessThanOrEqual(256 * 1024);
+    expect(channel.bufferedAmountLowThreshold).toBe(64 * 1024);
+    transport.close();
+  });
+
+  it("rejects queued data when either the entry or byte cap is exceeded", async () => {
+    const countLimited = makeTransport(undefined, 100, {
+      bufferedAmountHighWaterMark: 4,
+      bufferedAmountLowWaterMark: 1,
+      maxQueuedBytes: 8,
+      maxQueuedEntries: 2,
+    });
+    await countLimited.transport.createOffer();
+    const countChannel = countLimited.connection.dataChannel!;
+    countChannel.readyState = "open";
+    countChannel.bufferedAmount = 5;
+    countLimited.transport.send("one");
+    countLimited.transport.send("two");
+    expect(() => countLimited.transport.send("three")).toThrowError(expect.objectContaining({ code: "outbound_queue_full" }));
+    countLimited.transport.close();
+
+    const byteLimited = makeTransport(undefined, 100, {
+      bufferedAmountHighWaterMark: 4,
+      bufferedAmountLowWaterMark: 1,
+      maxQueuedBytes: 4,
+      maxQueuedEntries: 4,
+    });
+    await byteLimited.transport.createOffer();
+    const byteChannel = byteLimited.connection.dataChannel!;
+    byteChannel.readyState = "open";
+    byteChannel.bufferedAmount = 5;
+    byteLimited.transport.send("1234");
+    expect(() => byteLimited.transport.send("x")).toThrowError(expect.objectContaining({ code: "outbound_queue_full" }));
+    byteLimited.transport.close();
+  });
+
+  it("clears queued data and low-water callbacks on channel close and failure", async () => {
+    const closed = makeTransport(undefined, 100, { bufferedAmountHighWaterMark: 16, bufferedAmountLowWaterMark: 4 });
+    await closed.transport.createOffer();
+    const closeChannel = closed.connection.dataChannel!;
+    closeChannel.readyState = "open";
+    closeChannel.bufferedAmount = 17;
+    closed.transport.send("pending");
+    expect(closeChannel.onbufferedamountlow).toBeTypeOf("function");
+    closeChannel.readyState = "closed";
+    closeChannel.onclose?.(new Event("close"));
+    expect(closed.transport.currentState).toBe("disconnected");
+    expect(closed.transport.dataChannel).toBeNull();
+    expect(closeChannel.onbufferedamountlow).toBeNull();
+    expect(closeChannel.sent).toEqual([]);
+
+    const failed = makeTransport(undefined, 100, { bufferedAmountHighWaterMark: 16, bufferedAmountLowWaterMark: 4 });
+    await failed.transport.createOffer();
+    const failedChannel = failed.connection.dataChannel!;
+    failedChannel.readyState = "open";
+    failedChannel.bufferedAmount = 17;
+    failed.transport.send("pending");
+    failedChannel.onerror?.(new Event("error"));
+    expect(failed.transport.currentState).toBe("failed");
+    expect(failed.transport.dataChannel).toBeNull();
+    expect(failedChannel.onbufferedamountlow).toBeNull();
+    expect(failedChannel.sent).toEqual([]);
   });
 
   it("rejects invalid timeout configuration", () => {

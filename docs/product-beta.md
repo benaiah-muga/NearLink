@@ -146,6 +146,17 @@ intended setup.
 7. Close the direct link and confirm that unaccepted outgoing messages remain
    queued on the sending device.
 
+The direct adapter holds at most 64 pending entries and 1 MiB of queued payload,
+and keeps the channel buffer at or below 256 KiB. Its 64 KiB low-water value is
+the idle default. When the FIFO head does not fit in the remaining buffer space,
+the adapter adjusts the low-water event threshold to the amount of buffered data
+at which that payload fits, then restores the default after the queue drains. If
+the adapter queue is full, the message keeps its saved ID and exposes Retry.
+Closing or failing the link drops only adapter memory; messages without a peer
+acceptance remain saved locally. Local enqueue into the adapter does not mark a
+message accepted. Only the peer's ACK after local save changes the sender's
+delivery state.
+
 This is a host-only ICE configuration with no public STUN or TURN service. A
 direct connection may fail across networks, NATs, firewalls, VPNs, or browser
 policies. The fingerprint comparison verifies the current DTLS session only. It

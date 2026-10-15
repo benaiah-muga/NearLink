@@ -8,7 +8,7 @@ export interface StoredMessage {
   direction: "outgoing" | "incoming";
   delivery: DeliveryState;
   transport?: "hub" | "direct";
-  failure?: "message_conflict";
+  failure?: "message_conflict" | "transport_backpressure";
   displayOrder?: number;
 }
 

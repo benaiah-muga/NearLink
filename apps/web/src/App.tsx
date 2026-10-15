@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPageCompletePacket, type SyncPacket } from "@nearlink/protocol";
 import { browserConversationStore as conversationStore, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
-import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
+import { DirectWebRtcTransport, WebRtcTransportError, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
 import { buildDiagnosticsSummary, formatDiagnosticsSummary } from "./lib/diagnostics";
 import { initializeWasmProtocol, MAX_PROTOCOL_ENVELOPE_BYTES, validateJsonWithWasm, validateWithWasm } from "./lib/wasmProtocol";
@@ -1674,8 +1674,18 @@ function App() {
       directInFlightRef.current.add(key);
       transport.send(JSON.stringify(item.packet));
       return true;
-    } catch {
+    } catch (error) {
       directInFlightRef.current.delete(key);
+      if (error instanceof WebRtcTransportError && error.code === "outbound_queue_full") {
+        setMessages((current) => current.map((entry) => entry.packet.room === item.packet.room && entry.packet.id === item.packet.id
+          ? { ...entry, delivery: "failed", failure: "transport_backpressure" }
+          : entry));
+        void conversationStore.updateDelivery(item.packet.room, item.packet.id, "failed", "transport_backpressure").catch(() => {
+          if (activeRoomRef.current === item.packet.room) setNotice("The direct link is busy. This saved message remains queued and can be retried when the link drains.");
+        });
+        setNotice("The direct send queue is full. This saved message can be retried when the link drains.");
+        return false;
+      }
       setNotice("The message remains queued on this device because the direct link is unavailable.");
       return false;
     }
@@ -2072,7 +2082,7 @@ function App() {
                     <div className="message-bubble">{packet.body}</div>
                     {direction === "outgoing" && <div className={`delivery-state ${delivery}`}>
                       <span className="delivery-glyph">{delivery === "sent" ? "✓" : delivery === "failed" ? "!" : "◷"}</span>
-                      {delivery === "sent" ? (transport === "direct" ? "Accepted by peer device" : "Accepted by hub") : delivery === "failed" ? failure === "message_conflict" || conflictedHubMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "This ID conflicts with saved content. Compose a new message to send with a new ID." : <>Not accepted <button type="button" className="retry-button" disabled={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} aria-busy={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} onClick={() => void retryMessage({ packet, direction, delivery, transport })}>{retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "Retrying…" : "Retry"}</button></> : "Queued on this device"}
+                      {delivery === "sent" ? (transport === "direct" ? "Accepted by peer device" : "Accepted by hub") : delivery === "failed" ? failure === "message_conflict" || conflictedHubMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "This ID conflicts with saved content. Compose a new message to send with a new ID." : <>{failure === "transport_backpressure" ? "Direct send queue is full" : "Not accepted"} <button type="button" className="retry-button" disabled={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} aria-busy={retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`)} onClick={() => void retryMessage({ packet, direction, delivery, transport, failure })}>{retryingMessageKeys.has(`${packet.room}\u0000${packet.id}`) ? "Retrying…" : "Retry"}</button></> : "Queued on this device"}
                     </div>}
                   </div>
                 </article>

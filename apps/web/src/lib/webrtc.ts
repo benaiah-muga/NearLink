@@ -8,6 +8,10 @@
 export const WEBRTC_SIGNAL_VERSION = 1 as const;
 export const MAX_SIGNALING_BYTES = 256 * 1024;
 export const DEFAULT_ICE_GATHERING_TIMEOUT_MS = 15_000;
+export const DEFAULT_DATA_CHANNEL_BUFFERED_AMOUNT_HIGH_WATER_MARK = 256 * 1024;
+export const DEFAULT_DATA_CHANNEL_BUFFERED_AMOUNT_LOW_WATER_MARK = 64 * 1024;
+export const DEFAULT_DIRECT_QUEUE_MAX_BYTES = 1024 * 1024;
+export const DEFAULT_DIRECT_QUEUE_MAX_ENTRIES = 64;
 const MAX_TIMEOUT_MS = 60_000;
 
 export type SignalType = "offer" | "answer";
@@ -33,7 +37,8 @@ export type TransportErrorCode =
   | "closed"
   | "ice_timeout"
   | "connection_failed"
-  | "data_channel_unavailable";
+  | "data_channel_unavailable"
+  | "outbound_queue_full";
 
 export class WebRtcTransportError extends Error {
   readonly code: TransportErrorCode;
@@ -49,6 +54,15 @@ export interface DirectWebRtcTransportOptions {
   /** A test seam. Production uses the browser's RTCPeerConnection. */
   peerConnectionFactory?: (configuration: RTCConfiguration) => RTCPeerConnection;
   iceGatheringTimeoutMs?: number;
+  bufferedAmountHighWaterMark?: number;
+  bufferedAmountLowWaterMark?: number;
+  maxQueuedBytes?: number;
+  maxQueuedEntries?: number;
+}
+
+interface PendingData {
+  data: string | ArrayBuffer | Blob | ArrayBufferView<ArrayBuffer>;
+  bytes: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -115,6 +129,10 @@ export function serializeWebRtcSignal(signal: WebRtcSignal): string {
 export class DirectWebRtcTransport {
   readonly peerConnection: RTCPeerConnection;
   readonly iceGatheringTimeoutMs: number;
+  readonly bufferedAmountHighWaterMark: number;
+  readonly bufferedAmountLowWaterMark: number;
+  readonly maxQueuedBytes: number;
+  readonly maxQueuedEntries: number;
   onMessage: ((data: unknown) => void) | null = null;
   onStateChange: ((state: TransportState) => void) | null = null;
   onError: ((error: WebRtcTransportError) => void) | null = null;
@@ -125,6 +143,8 @@ export class DirectWebRtcTransport {
   private state: TransportState = "new";
   private _peerFingerprint: string | null = null;
   private cancelIceGathering: ((error: WebRtcTransportError) => void) | null = null;
+  private pendingData: PendingData[] = [];
+  private pendingDataBytes = 0;
 
   constructor(options: DirectWebRtcTransportOptions = {}) {
     const timeout = options.iceGatheringTimeoutMs ?? DEFAULT_ICE_GATHERING_TIMEOUT_MS;
@@ -132,6 +152,20 @@ export class DirectWebRtcTransport {
       throw new RangeError(`ICE gathering timeout must be between 1 and ${MAX_TIMEOUT_MS} ms.`);
     }
     this.iceGatheringTimeoutMs = timeout;
+    const highWaterMark = options.bufferedAmountHighWaterMark ?? DEFAULT_DATA_CHANNEL_BUFFERED_AMOUNT_HIGH_WATER_MARK;
+    const lowWaterMark = options.bufferedAmountLowWaterMark ?? DEFAULT_DATA_CHANNEL_BUFFERED_AMOUNT_LOW_WATER_MARK;
+    const maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_DIRECT_QUEUE_MAX_BYTES;
+    const maxQueuedEntries = options.maxQueuedEntries ?? DEFAULT_DIRECT_QUEUE_MAX_ENTRIES;
+    if (!Number.isSafeInteger(highWaterMark) || highWaterMark <= 0
+      || !Number.isSafeInteger(lowWaterMark) || lowWaterMark < 0 || lowWaterMark >= highWaterMark
+      || !Number.isSafeInteger(maxQueuedBytes) || maxQueuedBytes <= 0
+      || !Number.isSafeInteger(maxQueuedEntries) || maxQueuedEntries <= 0) {
+      throw new RangeError("WebRTC queue limits must be positive integers and the low watermark must be below the high watermark.");
+    }
+    this.bufferedAmountHighWaterMark = highWaterMark;
+    this.bufferedAmountLowWaterMark = lowWaterMark;
+    this.maxQueuedBytes = maxQueuedBytes;
+    this.maxQueuedEntries = maxQueuedEntries;
 
     // An empty ICE server list prevents implicit public STUN/TURN dependency.
     const configuration: RTCConfiguration = { iceServers: [], iceTransportPolicy: "all" };
@@ -223,10 +257,20 @@ export class DirectWebRtcTransport {
     if (!this.channel || this.channel.readyState !== "open") {
       throw new WebRtcTransportError("data_channel_unavailable", "The direct data channel is not open.");
     }
-    if (typeof data === "string") this.channel.send(data);
-    else if (data instanceof ArrayBuffer) this.channel.send(data);
-    else if (data instanceof Blob) this.channel.send(data);
-    else this.channel.send(data);
+    const bytes = this.dataByteLength(data);
+    if (bytes > this.bufferedAmountHighWaterMark) {
+      throw new WebRtcTransportError("outbound_queue_full", "The data exceeds the direct channel buffer limit.");
+    }
+    if (this.pendingData.length === 0 && this.channel.bufferedAmount + bytes <= this.bufferedAmountHighWaterMark) {
+      this.sendToChannel(data);
+      return;
+    }
+    if (this.pendingData.length >= this.maxQueuedEntries || bytes > this.maxQueuedBytes - this.pendingDataBytes) {
+      throw new WebRtcTransportError("outbound_queue_full", "The direct send queue is full. The saved message can be retried after the link drains.");
+    }
+    this.pendingData.push({ data, bytes });
+    this.pendingDataBytes += bytes;
+    this.drainPendingData();
   }
 
   close(): void {
@@ -257,22 +301,82 @@ export class DirectWebRtcTransport {
       return;
     }
     this.channel = channel;
+    channel.bufferedAmountLowThreshold = this.bufferedAmountLowWaterMark;
     channel.onmessage = (event) => this.onMessage?.(event.data);
     channel.onopen = () => this.setState("connected");
     channel.onclose = () => {
+      if (this.channel !== channel) return;
+      this.clearPendingData();
+      this.detachAndCloseChannel();
       if (!this.closed) this.setState("disconnected");
     };
+    channel.onbufferedamountlow = () => this.drainPendingData();
     channel.onerror = () => this.fail(new WebRtcTransportError("connection_failed", "The direct data channel reported an error."));
+  }
+
+  private dataByteLength(data: string | ArrayBuffer | Blob | ArrayBufferView<ArrayBuffer>): number {
+    if (typeof data === "string") return utf8Length(data);
+    if (data instanceof ArrayBuffer) return data.byteLength;
+    if (data instanceof Blob) return data.size;
+    return data.byteLength;
+  }
+
+  private sendToChannel(data: PendingData["data"]): void {
+    const channel = this.channel;
+    if (!channel || channel.readyState !== "open") {
+      throw new WebRtcTransportError("data_channel_unavailable", "The direct data channel is not open.");
+    }
+    try {
+      if (typeof data === "string") channel.send(data);
+      else if (data instanceof ArrayBuffer) channel.send(data);
+      else if (data instanceof Blob) channel.send(data);
+      else channel.send(data);
+    } catch {
+      const error = new WebRtcTransportError("connection_failed", "The direct data channel could not send data.");
+      this.fail(error);
+      throw error;
+    }
+  }
+
+  private drainPendingData(): void {
+    const channel = this.channel;
+    if (!channel || channel.readyState !== "open" || this.closed || this.state === "failed") return;
+    while (this.pendingData.length > 0) {
+      const next = this.pendingData[0];
+      if (channel.bufferedAmount + next.bytes > this.bufferedAmountHighWaterMark) {
+        // A fixed low threshold can already be crossed while this head still
+        // does not fit. Set the event threshold to the exact amount needed for
+        // this FIFO head so the browser will wake us as the buffer drains.
+        channel.bufferedAmountLowThreshold = this.bufferedAmountHighWaterMark - next.bytes;
+        return;
+      }
+      try {
+        this.sendToChannel(next.data);
+      } catch {
+        return;
+      }
+      this.pendingData.shift();
+      this.pendingDataBytes -= next.bytes;
+    }
+    channel.bufferedAmountLowThreshold = this.bufferedAmountLowWaterMark;
+  }
+
+  private clearPendingData(): void {
+    this.pendingData = [];
+    this.pendingDataBytes = 0;
   }
 
   private detachAndCloseChannel(): void {
     const channel = this.channel;
     this.channel = null;
+    this.clearPendingData();
     if (!channel) return;
     channel.onmessage = null;
     channel.onopen = null;
     channel.onclose = null;
+    channel.onbufferedamountlow = null;
     channel.onerror = null;
+    channel.bufferedAmountLowThreshold = 0;
     try {
       channel.close();
     } catch {

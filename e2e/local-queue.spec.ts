@@ -290,6 +290,7 @@ test("loads older hub history in accepted order and retries the same cursor", as
 });
 
 test("reconciles a persisted message over a confirmed direct Chromium session", async ({ browser }) => {
+  test.setTimeout(60_000);
   const left = await browser.newPage();
   const right = await browser.newPage();
   const room = "chromium-direct-sync";
@@ -371,6 +372,33 @@ test("reconciles a persisted message over a confirmed direct Chromium session", 
     ]);
     await expect(right.getByRole("log", { name: `Messages in ${room}` }).getByText(body)).toBeVisible({ timeout: 30000 });
     await expect(right.getByRole("status").filter({ hasText: "Requested message pages were received and verified in local storage." })).toBeVisible();
+
+    const burstBodies = Array.from({ length: 70 }, (_, index) => `Direct burst ${index + 1} ${"x".repeat(3_800)}`);
+    const readBurstRows = () => left.evaluate(async ({ roomName, prefix }) => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("nearlink-local");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const rows = await new Promise<Array<{ packet: { room: string; body: string; id: string }; direction: string; delivery: string }>>((resolve, reject) => {
+        const request = database.transaction("messages", "readonly").objectStore("messages").getAll();
+        request.onsuccess = () => resolve(request.result as Array<{ packet: { room: string; body: string; id: string }; direction: string; delivery: string }>);
+        request.onerror = () => reject(request.error);
+      });
+      database.close();
+      return rows.filter((row) => row.packet.room === roomName && row.direction === "outgoing" && row.packet.body.startsWith(prefix));
+    }, { roomName: room, prefix: "Direct burst " });
+    for (let index = 0; index < burstBodies.length; index += 1) {
+      const burstBody = burstBodies[index];
+      await left.getByRole("textbox", { name: "Write a message" }).fill(burstBody);
+      await left.getByRole("button", { name: "Send message" }).click();
+      await expect(left.getByRole("textbox", { name: "Write a message" })).toHaveValue("");
+    }
+    await left.getByRole("button", { name: "Close direct link" }).click();
+    await expect(left.locator(".direct-state")).toContainText("Direct channel: closed");
+    const burstRows = await readBurstRows();
+    expect(new Set(burstRows.map((row) => row.packet.id)).size).toBe(burstBodies.length);
+    expect(burstRows.every((row) => row.delivery === "queued" || row.delivery === "sent")).toBe(true);
   } finally {
     await Promise.all([left.close(), right.close()]);
   }
