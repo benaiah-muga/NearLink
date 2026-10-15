@@ -2,10 +2,10 @@
 
 Status: implementation candidate, not approved for a security claim
 
-Research snapshot: 2026-10-14. Repository support statements below were checked
+Research snapshot: 2026-10-15. Repository support statements below were checked
 against `mls-rs` commit `d4c5b19f4bbf8a931face27fc9e30f2db33ce83e` and OpenMLS
-commit `be2368a21ec5e0380abd568821addc57b79013ea`. No MLS dependency or version
-has been selected.
+release tag `openmls-v0.9.0` (commit `3a3e35de3feeca8f6605143c464d5452ae584d43`).
+No MLS dependency or version has been selected.
 
 ## Upstream and toolchain revalidation
 
@@ -20,29 +20,56 @@ current main workspace also declares package version `0.9.0`.
 
 The current `mls-rs` README still lists WebCrypto as experimental for cipher
 suites 2, 5, and 7, with X.509 unsupported. It also says the library has not
-received a full third-party security audit. The current OpenMLS README still
-classifies `wasm32-unknown-unknown` as unsupported, even though CI builds it.
-The current OpenMLS workspace declares Rust 1.94.0 as its minimum version.
-This project environment has Rust 1.84.1 and only the
-`x86_64-unknown-linux-gnu` target installed. These local facts rule out a
-meaningful local OpenMLS build check and do not establish browser or mobile
-compatibility for either candidate.
+received a full third-party security audit. The OpenMLS v0.9.0 README
+classifies `wasm32-unknown-unknown` as unsupported, although CI builds that
+target. Its `openmls-wasm` package is explicitly experimental and contains
+unfinished paths. The v0.9.0 workspace manifest sets Rust 1.91.0 as its
+minimum supported version. This repository pins Rust 1.84.1, so a compatibility
+spike must use an explicit newer toolchain rather than change the product
+toolchain. The repository-pinned Rust 1.84.1 toolchain has
+`x86_64-unknown-linux-gnu` and `wasm32-unknown-unknown` installed. The spike's
+Rust 1.91.0 toolchain now has both targets installed. Target installation does
+not establish OpenMLS support or browser compatibility.
 
-Decision: permit only a narrow, isolated, non-production compatibility spike
-using pinned `mls-rs` `0.56.0` as a candidate. The spike may check compilation
-and basic browser-to-native interoperability for one cipher suite, but must
-not add MLS to product flows, promise security, or be treated as a selection.
-Its WebCrypto experimental status and the library's unaudited status remain
-selection blockers. If the exact supported targets, provider, and same-suite
-interoperability gate cannot be demonstrated, defer integration and return to
-candidate evaluation. OpenMLS is not a viable immediate candidate for this
-project's current environment, given its documented support and the available
-toolchain.
+OpenMLS also uses a synchronous storage provider API. NearLink's browser
+storage is asynchronous IndexedDB, so a browser integration would need a
+carefully reviewed adapter that preserves atomic MLS state transitions. That
+integration problem is not answered by a successful compile.
+
+Decision: permit only a narrow, isolated, non-production OpenMLS v0.9.0
+compatibility spike using Rust 1.91.0. It may check native MLS operations,
+state reload, and whether the experimental WASM package can compile. At this
+snapshot, the native group flow passed 1 test, and the WASM integration-test
+target compiled after enabling the JavaScript entropy backend for the legacy
+`getrandom` dependency. These checks do not execute tests in a browser or
+establish supported browser behavior, browser-to-native interoperability,
+production readiness, or a security claim. Do not add MLS to product flows or
+treat the spike as a library selection. OpenMLS's documented WASM support
+limits, experimental package, and storage mismatch remain selection blockers.
+The `mls-rs` WebCrypto experimental status and lack of a full third-party
+security audit also remain blockers. Defer integration until one candidate
+passes the exact target, provider, interoperability, storage, and independent
+review gates below.
+
+At this snapshot, the isolated spike manifest pins OpenMLS 0.9.0,
+`openmls_rust_crypto` 0.6.0, `openmls_basic_credential` 0.6.0, and `tls_codec`
+0.5.0, with Rust 1.91 as its minimum. Its native test source exercises a
+two-member group using
+`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, including group creation,
+KeyPackage addition, Welcome processing, application-message encryption and
+decryption, member removal, and reload within the same in-memory provider. It
+does not test a process restart or durable storage. This records the scope
+present in the spike source. The native test passed, but reload remains within
+the same in-memory provider rather than a process restart or durable store. The
+WASM result covers compilation only. The reviewed spike files do not contain a
+browser interoperability test, browser execution, or an IndexedDB storage
+adapter.
 
 Evidence links: [mls-rs repository and provider/security status](https://github.com/awslabs/mls-rs/tree/d4c5b19f4bbf8a931face27fc9e30f2db33ce83e),
 [mls-rs 0.56.0 tag](https://github.com/awslabs/mls-rs/tree/0.56.0),
-[OpenMLS current README](https://github.com/openmls/openmls/blob/be2368a21ec5e0380abd568821addc57b79013ea/README.md),
-[OpenMLS current workspace manifest](https://github.com/openmls/openmls/blob/be2368a21ec5e0380abd568821addc57b79013ea/Cargo.toml),
+[OpenMLS v0.9.0 README](https://github.com/openmls/openmls/blob/openmls-v0.9.0/README.md),
+[OpenMLS v0.9.0 workspace manifest](https://github.com/openmls/openmls/blob/openmls-v0.9.0/Cargo.toml),
+[OpenMLS v0.9.0 WASM package](https://github.com/openmls/openmls/tree/openmls-v0.9.0/openmls-wasm),
 and [OpenMLS 0.9.0 release](https://github.com/openmls/openmls/releases/tag/openmls-v0.9.0).
 
 ## Protocol direction
@@ -78,11 +105,13 @@ experimental in the upstream
 Treat browser suitability as unverified until the exact version, provider,
 target browsers, and cipher suite pass the spike.
 
-OpenMLS is an alternate candidate. Its upstream README currently lists
-`wasm32-unknown-unknown` as built in CI but unsupported, and its WASM package is
-an experiment. Recheck that status before relying on it. See
-[OpenMLS](https://github.com/openmls/openmls) and its
-[WASM package](https://github.com/openmls/openmls/tree/main/openmls-wasm).
+OpenMLS v0.9.0 is also under evaluation, but its WASM target is documented as
+unsupported and its WASM package is experimental. The release requires Rust
+1.91.0, above this repository's pinned Rust 1.84.1. A spike may establish
+limited compatibility evidence; it cannot waive these support limits. See the
+[v0.9.0 README](https://github.com/openmls/openmls/blob/openmls-v0.9.0/README.md),
+[manifest](https://github.com/openmls/openmls/blob/openmls-v0.9.0/Cargo.toml),
+and [WASM package](https://github.com/openmls/openmls/tree/openmls-v0.9.0/openmls-wasm).
 
 The following scorecard is a hard-gate checklist, not an averaged score. Each
 candidate must have evidence for every row at an exact release version and
