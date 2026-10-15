@@ -1,0 +1,51 @@
+name: NearLink review artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Candidate version recorded in archive names and manifest
+        required: true
+        default: 0.1.0
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package-review-artifact:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      NEARLINK_RELEASE_VERSION: ${{ inputs.version }}
+      NEARLINK_ARTIFACT_DIR: ${{ runner.temp }}/nearlink-review-artifact
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require the selected source commit and a clean checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.18.0
+          cache: npm
+      - name: Install pinned Rust and WebAssembly tooling
+        run: |
+          rustup toolchain install 1.84.1 --profile minimal --target wasm32-unknown-unknown
+          cargo +1.84.1 install wasm-bindgen-cli --version 0.2.103 --locked
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+      - name: Build, validate, normalize, and compare candidate archives
+        run: node scripts/build-release-candidate.mjs
+      - name: Upload review artifact only
+        uses: actions/upload-artifact@v4
+        with:
+          name: nearlink-review-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nearlink-review-artifact/*
+          if-no-files-found: error
+          retention-days: 14

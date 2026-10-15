@@ -88,6 +88,45 @@ The normalized archive process aims to make packaging repeatable, but it does
 not prove that application builds are bit-for-bit reproducible across machines.
 Do not claim reproducible binaries without comparing independent builds.
 
+### Manually build a review artifact
+
+The **NearLink review artifact** workflow can be run manually from GitHub
+Actions with a proposed semantic version. It checks out the selected
+`github.sha`, requires a clean checkout, installs Node 24.18.0,
+repository-pinned Rust 1.84.1, and wasm-bindgen 0.2.103, then installs JavaScript dependencies
+from `package-lock.json`. The packaging script builds the web client from clean
+Cargo and web output directories, validates the PWA shell and archive paths,
+normalizes a web archive, and repeats the clean web build from the same source
+commit. The two web archive SHA-256 values must match before the source archive
+and `SHA256SUMS.json` are finalized.
+
+The workflow uploads the web archive, source archive, and JSON checksum manifest
+as a reviewable Actions artifact retained for 14 days. It does not create a tag,
+GitHub Release, deployment, or public distribution. The manifest records the
+source commit, proposed version, source timestamp, runner and tool versions,
+artifact byte sizes, archive checksums, and the repeat-build result. The repeat
+build compares two clean builds on one workflow runner. It is not evidence of
+cross-machine reproducibility, a signature, a security review, a release
+approval, or a passed device/browser gate. Follow the acceptance checklist
+above and keep any incomplete device, security, or accessibility evidence
+marked pending.
+
+The artifact path checks screen file and directory names for common secret and
+local-state patterns. They are not a comprehensive scan of file contents, so
+reviewers must still inspect the source and generated bundle for accidental
+secrets before approving distribution.
+
+The workflow pins Node 24.18.0, Rust 1.84.1, and wasm-bindgen 0.2.103. It
+records the npm version and Ubuntu runner platform in the manifest, but does
+not pin their patch or image-build versions. Python is not used by this
+artifact pipeline.
+
+For local script behavior tests, run `npm run test:release-artifact`. To run
+the full artifact pipeline locally, use a clean checkout with Node 24.18.0, Rust
+1.84.1, wasm-bindgen 0.2.103, GNU tar, and gzip, then run
+`NEARLINK_RELEASE_VERSION=0.1.0 NEARLINK_ARTIFACT_DIR=/tmp/nearlink-review-artifact npm run release:candidate-artifact`.
+The output directory must be empty and outside the source checkout.
+
 ## 4. Run release acceptance checks
 
 - [ ] Foundation verification passes at the release commit.
