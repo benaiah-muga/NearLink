@@ -8,6 +8,71 @@ against `mls-rs` commit `d4c5b19f4bbf8a931face27fc9e30f2db33ce83e` and OpenMLS
 release tag `openmls-v0.9.0` (commit `3a3e35de3feeca8f6605143c464d5452ae584d43`).
 No MLS dependency or version has been selected.
 
+## NL-45 feasibility decision, 2026-10-15
+
+No evaluated candidate clears the current hard selection gates. This is a
+decision to defer library selection and product integration, not a rejection of
+MLS or a change to the candidate-neutral deployment profile.
+
+The highest `mls-rs` Git tag observed on 2026-10-15 remains `0.56.0` at
+`8f1b43f447a792ff9307f1c2c7f54da63914870e`. The default branch had moved to
+`44a4097d0b852e48ad7e822e63cb22e0ac36f232`, committed on 2026-10-15. The
+candidate assessment is pinned to the tagged `0.56.0` source; the moving main
+branch is evidence of ongoing maintenance, not a release candidate. The 0.56.0
+README and current main README both continue to label the Web Crypto provider
+experimental for cipher suites 2, 5, and 7, and state that the library has not
+received a full third-party security audit. The README advertises WASM builds
+and configurable storage traits, but does not establish support for NearLink's
+named browsers, a production browser crypto provider, or atomic IndexedDB
+state transitions. Its storage examples are in-memory and SQLite. The exact
+0.56.0 dependency license inventory and compatibility review have not been
+completed for NearLink.
+
+OpenMLS v0.9.0 remains unsuitable for selection against the current profile:
+the exact release README calls `wasm32-unknown-unknown` unsupported even though
+CI builds it, and the workspace minimum Rust version is 1.91.0 versus the
+product's pinned 1.84.1. The separate spike toolchain demonstrates that a
+compile can be attempted, but does not change the upstream support classification
+or prove browser execution. Separately, upstream issue #1983 reports a panic in
+`external_commit_builder` on this target for revisions after PR #1972, after a
+call to `SystemTime::now()`. The issue does not establish whether the affected
+code is present in the pinned v0.9.0 tag. The profile does not permit external
+commits, so the reported path is not evidence of a defect in the proposed
+admission flow; it does reinforce that a WASM compile alone cannot establish
+usable browser behavior. OpenMLS's storage provider methods are synchronous,
+while NearLink's browser persistence uses asynchronous IndexedDB. An adapter
+must prove crash safe, atomic group state changes before this mismatch can be
+accepted.
+
+The isolated OpenMLS lockfile audit snapshot from 2026-10-15 includes
+`RUSTSEC-2026-0330` and `RUSTSEC-2026-0331` for `libcrux-kem` 0.0.9. The
+Rust 1.91 `cargo tree --target all -i libcrux-kem@0.0.9` check found no active
+path for the selected RustCrypto provider, but the package remains in the full
+lockfile and must be resolved or independently dispositioned before selection.
+The same active graph includes the informational unmaintained
+`proc-macro-error2` warning. Cargo metadata records declared license expressions
+for the 198 resolved spike packages; this is only an inventory, not a license
+compatibility decision. The spike's workflow does not rerun RustSec, so the
+audit is a dated snapshot and not continuous coverage.
+
+Assessment: `mls-rs` is the more plausible next research candidate because its
+README advertises WASM builds and configurable storage, but its experimental
+Web Crypto provider, missing NearLink browser evidence, unproven IndexedDB
+atomicity, incomplete dependency and license review, and lack of a full
+third-party audit fail the hard gates. OpenMLS has documented target and MSRV
+gaps in addition to the storage and dependency findings. Neither candidate
+should be used in product flows, and no alternate candidate among those
+reviewed here clears the same gates. Do not weaken the criteria or infer
+readiness from native tests, compilation, conformance statements, or
+moving-branch activity.
+
+Revalidation sources: [OpenMLS v0.9.0 supported target table](https://github.com/openmls/openmls/blob/openmls-v0.9.0/README.md),
+[OpenMLS v0.9.0 workspace manifest](https://github.com/openmls/openmls/blob/openmls-v0.9.0/Cargo.toml),
+[OpenMLS issue #1983](https://github.com/openmls/openmls/issues/1983),
+[mls-rs 0.56.0 README](https://github.com/awslabs/mls-rs/blob/0.56.0/mls-rs/README.md),
+[mls-rs current main README at 44a4097](https://github.com/awslabs/mls-rs/blob/44a4097d0b852e48ad7e822e63cb22e0ac36f232/mls-rs/README.md),
+and [mls-rs 0.56.0 tag commit](https://github.com/awslabs/mls-rs/tree/8f1b43f447a792ff9307f1c2c7f54da63914870e).
+
 ## Upstream and toolchain revalidation
 
 Rechecked on 2026-10-14 against the official upstream repositories and their
