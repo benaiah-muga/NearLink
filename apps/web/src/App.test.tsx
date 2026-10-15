@@ -88,8 +88,7 @@ vi.mock("./lib/wasmProtocol", async () => {
 
 vi.mock("./lib/storage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/storage")>();
-  return {
-    ...actual,
+  const overrides = {
     loadIdentity: () => messageReadGate.identityPending ?? actual.loadIdentity(),
     reconcileHubReplayOrder: async (...args: Parameters<typeof actual.reconcileHubReplayOrder>) => {
       if (args[1].includes(messageReadGate.reconcilePendingId ?? "") && messageReadGate.reconcilePending) {
@@ -139,6 +138,14 @@ vi.mock("./lib/storage", async (importOriginal) => {
         if (messageReadGate.deliveryUpdateReject) throw new Error("Injected status write failure.");
       }
       return actual.updateDelivery(...args);
+    },
+  };
+  return {
+    ...actual,
+    ...overrides,
+    browserConversationStore: {
+      ...actual.browserConversationStore,
+      ...overrides,
     },
   };
 });

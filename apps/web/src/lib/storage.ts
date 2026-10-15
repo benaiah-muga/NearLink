@@ -1,4 +1,5 @@
 import type { MessagePacket } from "@nearlink/protocol";
+import type { ConversationStore } from "./conversationStore";
 
 export type DeliveryState = "queued" | "sent" | "failed";
 
@@ -637,3 +638,20 @@ export async function updateDelivery(room: string, id: string, delivery: Deliver
     },
   );
 }
+
+/** IndexedDB-backed implementation of the application storage port. */
+export const browserConversationStore: ConversationStore = {
+  loadIdentity,
+  saveIdentity,
+  loadMessages,
+  saveMessage,
+  updateDelivery,
+  beginRoomDeletion,
+  cancelRoomDeletion,
+  deleteRoomMessages,
+  isRoomMessagesDeleted,
+  resumeRoomMessages,
+  reconcileHubReplayOrder,
+  saveHubHistoryPage,
+  requestStoragePersistence,
+};

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPacket } from "@nearlink/protocol";
-import { beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, requestStoragePersistence, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
+import { browserConversationStore as conversationStore, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
 import { buildDiagnosticsSummary, formatDiagnosticsSummary } from "./lib/diagnostics";
@@ -274,7 +274,7 @@ function App() {
         if (!validateWithWasm("client", packet)) throw new Error("The synchronization packet failed protocol checks.");
         send(packet);
       },
-      loadAccepted: () => loadMessages(connectionRoom),
+      loadAccepted: () => conversationStore.loadMessages(connectionRoom),
       validateMessage: (packet) => validateWithWasm("message", packet),
       rebroadcastOnPeerInventory: true,
       messageIntervalMs: transport === "hub" ? 700 : 0,
@@ -353,11 +353,11 @@ function App() {
 
   async function resumeRoomForUserAction(selectedRoom: string): Promise<void> {
     const generation = deletionGenerationRef.current;
-    await resumeRoomMessages(selectedRoom);
+    await conversationStore.resumeRoomMessages(selectedRoom);
     if (deletionInProgressRef.current || deletingRoom || generation !== deletionGenerationRef.current) {
       if (deletionEventsRef.current.get(selectedRoom) === "deleted") {
-        await beginRoomDeletion(selectedRoom);
-        await deleteRoomMessages(selectedRoom);
+        await conversationStore.beginRoomDeletion(selectedRoom);
+        await conversationStore.deleteRoomMessages(selectedRoom);
       }
       throw new Error("A room deletion took priority over resuming this room.");
     }
@@ -367,7 +367,7 @@ function App() {
     const replayOrder = hubReplayOrderRef.current;
     if (!replayOrder || replayOrder.socket !== socket || replayOrder.room !== selectedRoom) return true;
     if (!replayOrder.ids.includes(messageId)) replayOrder.ids.push(messageId);
-    return reconcileHubReplayOrder(selectedRoom, replayOrder.ids);
+    return conversationStore.reconcileHubReplayOrder(selectedRoom, replayOrder.ids);
   }
 
   useEffect(() => {
@@ -442,7 +442,7 @@ function App() {
         deletionGenerationRef.current += 1;
         deletionEventsRef.current.set(cancelledRoom, "cancelled");
         const cancelledGeneration = deletionGenerationRef.current;
-        void Promise.all([loadMessages(cancelledRoom), isRoomMessagesDeleted(cancelledRoom)]).then(([stored, deleted]) => {
+        void Promise.all([conversationStore.loadMessages(cancelledRoom), conversationStore.isRoomMessagesDeleted(cancelledRoom)]).then(([stored, deleted]) => {
           if (currentRoomRef.current !== cancelledRoom || deletionGenerationRef.current !== cancelledGeneration || deletionEventsRef.current.get(cancelledRoom) !== "cancelled") return;
           setMessages(stored);
           messageKeysRef.current = new Set(stored.map((item) => `${item.packet.room}\u0000${item.packet.id}`));
@@ -466,13 +466,13 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    loadIdentity().then((saved) => {
+    conversationStore.loadIdentity().then((saved) => {
       if (!active) return;
       const next = saved ?? { sender: makeId(), senderName: "" };
       setIdentity(next);
       if (!callSignEditedRef.current) setDisplayName(next.senderName);
       setProfileSaved(Boolean(saved?.senderName.trim()));
-      if (!saved) void saveIdentity(next).catch(() => setNotice("Local identity could not be saved on this device."));
+      if (!saved) void conversationStore.saveIdentity(next).catch(() => setNotice("Local identity could not be saved on this device."));
       setStorageReady(true);
     }).catch(() => {
       if (active) {
@@ -487,7 +487,7 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    void requestStoragePersistence().then((result) => {
+    void conversationStore.requestStoragePersistence().then((result) => {
       if (active) setStoragePersistence(result);
     });
     return () => { active = false; };
@@ -526,7 +526,7 @@ function App() {
     let active = true;
     if (room.trim()) {
       const selectedRoom = room.trim();
-      Promise.all([loadMessages(selectedRoom), isRoomMessagesDeleted(selectedRoom)]).then(([stored, deleted]) => { if (active) { setMessages(stored); messageKeysRef.current = new Set(stored.map((item) => `${selectedRoom}\u0000${item.packet.id}`)); for (const item of stored) if (item.failure === "message_conflict") conflictedHubMessageKeysRef.current.add(`${selectedRoom}\u0000${item.packet.id}`); setRoomDeletedLocally(deleted); setLoadedRoom(selectedRoom); setConversationReady(true); } }).catch(() => { if (active) { setMessages([]); messageKeysRef.current.clear(); setLoadedRoom(selectedRoom); setNotice("Could not read this conversation from local storage."); setConversationReady(true); } });
+      Promise.all([conversationStore.loadMessages(selectedRoom), conversationStore.isRoomMessagesDeleted(selectedRoom)]).then(([stored, deleted]) => { if (active) { setMessages(stored); messageKeysRef.current = new Set(stored.map((item) => `${selectedRoom}\u0000${item.packet.id}`)); for (const item of stored) if (item.failure === "message_conflict") conflictedHubMessageKeysRef.current.add(`${selectedRoom}\u0000${item.packet.id}`); setRoomDeletedLocally(deleted); setLoadedRoom(selectedRoom); setConversationReady(true); } }).catch(() => { if (active) { setMessages([]); messageKeysRef.current.clear(); setLoadedRoom(selectedRoom); setNotice("Could not read this conversation from local storage."); setConversationReady(true); } });
     } else {
       setMessages([]);
       messageKeysRef.current.clear();
@@ -668,7 +668,7 @@ function App() {
           const pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === room.trim() && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
           if (!pending) return;
           let saved = true;
-          try { await updateDelivery(pending.packet.room, packet.id, "sent"); }
+          try { await conversationStore.updateDelivery(pending.packet.room, packet.id, "sent"); }
           catch { saved = false; }
           if (socketRef.current !== socket) return;
           setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === pending.packet.room ? { ...item, delivery: "sent" } : item));
@@ -738,7 +738,7 @@ function App() {
                 setConflictedHubMessageKeys((current) => new Set(current).add(rejectedKey));
               }
               let saved = true;
-              try { await updateDelivery(rejected.packet.room, packet.id, "failed", packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub" ? "message_conflict" : undefined); }
+              try { await conversationStore.updateDelivery(rejected.packet.room, packet.id, "failed", packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub" ? "message_conflict" : undefined); }
               catch { saved = false; }
               setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === rejected.packet.room
                 ? { ...item, delivery: "failed", ...(packet.code === "message_conflict" && (rejected.transport ?? "hub") === "hub" ? { failure: "message_conflict" as const } : {}) }
@@ -760,7 +760,7 @@ function App() {
               failHistoryRequest(pending, "A streamed history message could not be saved. Retry this page; its cursor has not advanced.");
               return;
             }
-            const persisted = await loadMessages(pending.room);
+            const persisted = await conversationStore.loadMessages(pending.room);
             const pageMessages: StoredMessage[] = [];
             for (const id of completion.messageIds) {
               const packetForId = pending.packets.get(id);
@@ -788,12 +788,12 @@ function App() {
               return;
             }
             try {
-              const saved = await saveHubHistoryPage(pageMessages, pending.cursor, pending.requestStartOrder);
+              const saved = await conversationStore.saveHubHistoryPage(pageMessages, pending.cursor, pending.requestStartOrder);
               if (!saved) {
                 failHistoryRequest(pending, "This room was cleared on this device. Resume it before loading hub history again.");
                 return;
               }
-              const verified = await loadMessages(pending.room);
+              const verified = await conversationStore.loadMessages(pending.room);
               if (!completion.messageIds.every((id) => {
                 const expected = pageMessages.find((item) => item.packet.id === id)?.packet;
                 const actual = verified.find((item) => item.packet.id === id)?.packet;
@@ -832,7 +832,7 @@ function App() {
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
             const pending = historyRequestRef.current;
             if (pending?.socket === socket && pending.room === connectionRoom) pending.packets.set(packet.id, packet);
-            const persisted = await loadMessages(connectionRoom).catch(() => null);
+            const persisted = await conversationStore.loadMessages(connectionRoom).catch(() => null);
             if (!persisted || socketRef.current !== socket || currentRoomRef.current !== connectionRoom) {
               if (!persisted && currentRoomRef.current === connectionRoom) {
                 hubSyncRef.current?.rejectMessage(packet, "A requested sync message could not be read from storage. Reconnect to restart synchronization.");
@@ -850,7 +850,7 @@ function App() {
               }
               if (existing.transport !== "hub" || existing.delivery !== "sent") {
                 try {
-                  const saved = await saveMessage({ ...existing, transport: "hub", delivery: "sent" });
+                  const saved = await conversationStore.saveMessage({ ...existing, transport: "hub", delivery: "sent" });
                   if (!saved) throw new Error("Room deletion blocked this replay.");
                 } catch {
               hubSyncRef.current?.rejectMessage(packet, "A requested sync message could not be saved. Reconnect to restart synchronization.");
@@ -871,14 +871,14 @@ function App() {
               hubSyncRef.current?.observeAcceptedMessage(packet);
               messageKeysRef.current.add(messageKey);
               if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
-              const refreshed = await loadMessages(connectionRoom);
+              const refreshed = await conversationStore.loadMessages(connectionRoom);
               if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
               setMessages(refreshed);
               return;
             }
             const item: StoredMessage = { packet, direction: packet.sender === identity.sender ? "outgoing" : "incoming", delivery: "sent", transport: "hub" };
             try {
-              const saved = await saveMessage(item);
+              const saved = await conversationStore.saveMessage(item);
               if (!saved) {
                 if (currentRoomRef.current === connectionRoom) setNotice("This room was cleared on this device. Reconnect to resume the room; hub-retained history may replay.");
                 return;
@@ -906,7 +906,7 @@ function App() {
             hubSyncRef.current?.observeAcceptedMessage(packet);
             messageKeysRef.current.add(messageKey);
             if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
-            const refreshed = await loadMessages(connectionRoom);
+            const refreshed = await conversationStore.loadMessages(connectionRoom);
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
             setMessages(refreshed);
           });
@@ -989,7 +989,7 @@ function App() {
     const nextIdentity = { ...identity, senderName: normalizedName };
     setIdentity(nextIdentity);
     let identitySaved = true;
-    try { await saveIdentity(nextIdentity); }
+    try { await conversationStore.saveIdentity(nextIdentity); }
     catch { identitySaved = false; }
     if (deletionInProgressRef.current || deletingRoom) return;
     setProfileSaved(identitySaved && Boolean(nextIdentity.senderName.trim()));
@@ -1060,13 +1060,13 @@ function App() {
     if (validateWithWasm("server", packet) && packet.type === "ack") {
       const key = `${connectionRoom}\u0000${packet.id}`;
       if (!directInFlightRef.current.has(key)) return;
-      const persisted = await loadMessages(connectionRoom).catch(() => null);
+      const persisted = await conversationStore.loadMessages(connectionRoom).catch(() => null);
       if (!persisted || directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || !directInFlightRef.current.has(key)) return;
       const pending = persisted.find((item) => item.packet.id === packet.id && item.direction === "outgoing" && item.transport === "direct");
       if (!pending) return;
       directInFlightRef.current.delete(key);
       try {
-        await updateDelivery(connectionRoom, packet.id, "sent");
+        await conversationStore.updateDelivery(connectionRoom, packet.id, "sent");
         if (directRef.current !== transport || currentRoomRef.current !== connectionRoom) return;
         setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === connectionRoom ? { ...item, delivery: "sent", transport: "direct" } : item));
       } catch {
@@ -1088,7 +1088,7 @@ function App() {
     const previous = directInboundOperationsRef.current.get(messageKey) ?? Promise.resolve();
     const operation = previous.catch(() => undefined).then(async () => {
       if (directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
-      const existing = await loadMessages(connectionRoom).catch(() => null);
+      const existing = await conversationStore.loadMessages(connectionRoom).catch(() => null);
       if (!existing || directRef.current !== transport || currentRoomRef.current !== connectionRoom) {
         if (!existing && currentRoomRef.current === connectionRoom) {
           directSyncRef.current?.rejectMessage(packet, "A requested sync message could not be checked in storage. Reconnect to restart synchronization.");
@@ -1114,7 +1114,7 @@ function App() {
       }
       const item: StoredMessage = { packet, direction: "incoming", delivery: "sent", transport: "direct" };
       try {
-        const saved = await saveMessage(item);
+        const saved = await conversationStore.saveMessage(item);
         if (!saved) {
           if (currentRoomRef.current === connectionRoom) setNotice("This room was cleared on this device. Reconnect to resume the room; hub-retained history may replay.");
           return;
@@ -1254,7 +1254,7 @@ function App() {
     const transport = directRef.current;
     const flushRoom = currentRoomRef.current;
     if (!transport || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
-    const savedMessages = await loadMessages(flushRoom).catch(() => null);
+    const savedMessages = await conversationStore.loadMessages(flushRoom).catch(() => null);
     if (!savedMessages || directRef.current !== transport || currentRoomRef.current !== flushRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
     for (const item of savedMessages) {
       if (item.direction === "outgoing" && item.delivery === "queued" && item.transport === "direct") sendDirectMessage(item);
@@ -1271,7 +1271,7 @@ function App() {
     retryingMessageKeysRef.current.add(messageKey);
     setRetryingMessageKeys(new Set(retryingMessageKeysRef.current));
     try {
-      await updateDelivery(message.packet.room, message.packet.id, "queued", null);
+      await conversationStore.updateDelivery(message.packet.room, message.packet.id, "queued", null);
     } catch {
       setNotice("Could not queue this message for retry on this device.");
       return;
@@ -1332,7 +1332,7 @@ function App() {
       messageKeysRef.current.add(`${packet.room}\u0000${packet.id}`);
       setMessages((current) => [...current, item]);
       try {
-        const saved = await saveMessage(item);
+        const saved = await conversationStore.saveMessage(item);
         if (!saved) {
           messageKeysRef.current.delete(`${packet.room}\u0000${packet.id}`);
           setMessages((current) => current.filter((entry) => entry.packet.id !== packet.id || entry.packet.room !== packet.room));
@@ -1378,7 +1378,7 @@ function App() {
     publishRoomDeletion("deleting", selectedRoom);
     let deletionMarkerStarted = false;
     try {
-      await beginRoomDeletion(selectedRoom);
+      await conversationStore.beginRoomDeletion(selectedRoom);
       deletionMarkerStarted = true;
       const roomOperations = [
         ...hubInboundOperationsRef.current.values(),
@@ -1386,7 +1386,7 @@ function App() {
       ];
       const pendingSend = pendingSendOperationRef.current;
       await Promise.all([...roomOperations, ...(pendingSend ? [pendingSend] : [])].map((operation) => operation.catch(() => undefined)));
-      await deleteRoomMessages(selectedRoom);
+      await conversationStore.deleteRoomMessages(selectedRoom);
       if (currentRoomRef.current === selectedRoom) {
         setMessages([]);
         messageKeysRef.current.clear();
@@ -1401,7 +1401,7 @@ function App() {
     } catch {
       let markerCleanupFailed = false;
       if (deletionMarkerStarted) {
-        try { await cancelRoomDeletion(selectedRoom); }
+        try { await conversationStore.cancelRoomDeletion(selectedRoom); }
         catch { markerCleanupFailed = true; }
       }
       if (markerCleanupFailed) {

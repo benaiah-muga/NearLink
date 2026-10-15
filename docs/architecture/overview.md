@@ -4,11 +4,11 @@ NearLink currently uses a browser client and an optional local coordination hub.
 
 ## Initial boundaries
 
-- React components currently call browser storage helpers from the application layer. A service boundary remains a desired refactor, not a completed boundary.
+- The application layer consumes the `ConversationStore` port for identity, conversation history, delivery state, deletion, hub replay, and browser persistence requests. The current `browserConversationStore` adapter delegates to IndexedDB-backed storage helpers. A native storage adapter has not been implemented.
 - The protocol envelope is transport-independent.
 - WebSocket and WebRTC adapters own connection lifecycle, not conversation state.
 - The local hub does not own client identity secrets. It does receive and store plaintext hub messages.
-- Browser persistence is replaceable behind a storage interface.
+- Browser persistence is replaceable behind the `ConversationStore` interface.
 
 ## Current limitations
 

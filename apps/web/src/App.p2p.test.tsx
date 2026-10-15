@@ -76,14 +76,21 @@ vi.mock("./lib/wasmProtocol", async () => {
 
 vi.mock("./lib/storage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/storage")>();
-  return {
-    ...actual,
+  const overrides = {
     saveMessage: async (message: Parameters<typeof actual.saveMessage>[0]) => {
       if (message.packet.id === storageGate.packetId || message.packet.body === storageGate.body) {
         await new Promise<void>((resolve) => { storageGate.finish = resolve; });
         if (storageGate.reject) throw new Error("Test storage write rejected.");
       }
       return actual.saveMessage(message);
+    },
+  };
+  return {
+    ...actual,
+    ...overrides,
+    browserConversationStore: {
+      ...actual.browserConversationStore,
+      ...overrides,
     },
   };
 });
