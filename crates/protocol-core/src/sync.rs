@@ -1931,4 +1931,292 @@ mod tests {
             .unwrap();
         assert_eq!(once, repeated);
     }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn generated_sync_invariants_NEARLINK_SYNC_PROPERTIES_OK() {
+        let chunk_sizes = [1usize, 17, 3, MAX_SYNC_SELECTION_CHUNK_IDS, 29, 0, 257];
+        for case in 0..24usize {
+            let peer_count = (case * 13) % 81;
+            let peer_ids = (0..peer_count)
+                .map(|index| format!("peer-{index:04}"))
+                .collect::<Vec<_>>();
+            let mut local_ids = (0..(case * 19 % 173))
+                .map(|index| {
+                    if index % 3 == 0 && peer_count > 0 {
+                        peer_ids[(index * 7 + case) % peer_count].clone()
+                    } else {
+                        format!("local-{case:02}-{index:04}")
+                    }
+                })
+                .collect::<Vec<_>>();
+            if peer_count > 0 {
+                local_ids.extend([peer_ids[0].clone(), peer_ids[0].clone()]);
+                local_ids.extend(peer_ids.iter().step_by(5).cloned());
+            }
+            if case == 23 {
+                local_ids.extend(std::iter::repeat("peer-0000".to_owned()).take(4_500));
+            }
+
+            let local_set = local_ids.iter().cloned().collect::<BTreeSet<_>>();
+            let expected_missing = peer_ids
+                .iter()
+                .filter(|id| !local_set.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut selector = MissingIdSelector::new(&peer_ids).unwrap();
+            let mut offset = 0usize;
+            let mut chunk_index = case % chunk_sizes.len();
+            while offset < local_ids.len() {
+                let requested_size = chunk_sizes[chunk_index % chunk_sizes.len()];
+                chunk_index += 1;
+                let size = if requested_size == 0 {
+                    1
+                } else {
+                    requested_size
+                };
+                let end = (offset + size.min(MAX_SYNC_SELECTION_CHUNK_IDS)).min(local_ids.len());
+                selector.observe_local_ids(&local_ids[offset..end]).unwrap();
+                offset = end;
+            }
+            assert_eq!(
+                selector.finish().unwrap(),
+                expected_missing,
+                "selector case {case}"
+            );
+        }
+
+        let boundary_peer = vec!["boundary-a".to_owned(), "boundary-b".to_owned()];
+        let over_limit_local = vec!["boundary-b".to_owned(); MAX_SYNC_SELECTION_CHUNK_IDS + 1];
+        let mut boundary_selector = MissingIdSelector::new(&boundary_peer).unwrap();
+        assert_eq!(
+            boundary_selector.observe_local_ids(&over_limit_local),
+            Err(SyncError::InvalidPageLimit)
+        );
+        assert_eq!(boundary_selector.finish().unwrap(), boundary_peer);
+
+        for case in 0..18usize {
+            let message_count = case * 9;
+            let ids = (0..message_count)
+                .map(|index| format!("msg-{index:04}"))
+                .collect::<Vec<_>>();
+            let known_ids = ids
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| (index + case) % 4 == 0)
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>();
+            let known = known_ids.iter().cloned().collect::<BTreeSet<_>>();
+            let expected = ids
+                .iter()
+                .filter(|id| !known.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let page_size = case % 11 + 1;
+            let mut index = MessageIndex::new("room1").unwrap();
+            for index_id in (0..message_count).rev() {
+                let id = &ids[index_id];
+                let value = packet(
+                    id,
+                    &format!("body-{case}-{index_id}"),
+                    "2026-10-14T12:00:00Z",
+                );
+                assert_eq!(index.insert(value.clone()), Ok(InsertOutcome::Inserted));
+                assert_eq!(index.insert(value), Ok(InsertOutcome::Duplicate));
+            }
+
+            let mut actual = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = index
+                    .page_missing_from(&known_ids, cursor.as_deref(), page_size)
+                    .unwrap();
+                let page_ids = page
+                    .messages
+                    .iter()
+                    .map(|value| value["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                let oracle_offset = actual.len();
+                let oracle_end = (oracle_offset + page_size).min(expected.len());
+                assert_eq!(
+                    page_ids,
+                    expected[oracle_offset..oracle_end],
+                    "page case {case}"
+                );
+                actual.extend(page_ids);
+                assert_eq!(page.next_cursor, actual.last().cloned());
+                assert_eq!(page.has_more, actual.len() < expected.len());
+                if !page.has_more {
+                    break;
+                }
+                cursor = page.next_cursor;
+            }
+            assert_eq!(actual, expected, "continuation case {case}");
+        }
+
+        for case in 0..20usize {
+            let mut index = MessageIndex::new("room1").unwrap();
+            let count = 1 + (case % 15);
+            let mut expected = Vec::new();
+            for item in 0..count {
+                let id = format!("conflict-{case:02}-{item:03}");
+                let original = packet(&id, &format!("original-{item}"), "2026-10-14T12:00:00Z");
+                assert_eq!(index.insert(original.clone()), Ok(InsertOutcome::Inserted));
+                assert_eq!(index.insert(original.clone()), Ok(InsertOutcome::Duplicate));
+                expected.push(original);
+            }
+            let before = index
+                .page_missing_from(&[], None, MAX_PAGE_MESSAGES)
+                .unwrap();
+            let conflict_id = format!("conflict-{case:02}-{:03}", count / 2);
+            assert_eq!(
+                index.insert(packet(
+                    &conflict_id,
+                    "different packet",
+                    "2026-10-14T12:00:00Z"
+                )),
+                Err(SyncError::MessageConflict)
+            );
+            let after = index
+                .page_missing_from(&[], None, MAX_PAGE_MESSAGES)
+                .unwrap();
+            assert_eq!(after.messages, expected, "conflict case {case}");
+            assert_eq!(after, before, "conflict observable page case {case}");
+        }
+
+        for case in 0..16usize {
+            let inventory_ids = (0..(case * 7 % 49))
+                .map(|index| format!("inventory-{index:04}"))
+                .collect::<Vec<_>>();
+            let partition = case % 5 + 1;
+            let mut receiver = SyncInventoryReceiver::new();
+            let mut cursor = None;
+            for (chunk_index, chunk) in inventory_ids.chunks(partition).enumerate() {
+                let chunk_refs = chunk.iter().map(String::as_str).collect::<Vec<_>>();
+                let has_more = (chunk_index + 1) * partition < inventory_ids.len();
+                let page = inventory_page(
+                    &format!("sync-{case}"),
+                    cursor.as_deref(),
+                    &chunk_refs,
+                    has_more,
+                    !has_more && case % 2 == 0,
+                );
+                assert_eq!(
+                    receiver.accept_page(page.clone()),
+                    Ok(InventoryPageOutcome::Accepted)
+                );
+                assert_eq!(
+                    receiver.accept_page(page),
+                    Ok(InventoryPageOutcome::Duplicate)
+                );
+                cursor = chunk.last().cloned();
+            }
+            if inventory_ids.is_empty() {
+                let empty_page = inventory_page(&format!("sync-{case}"), None, &[], false, false);
+                assert_eq!(
+                    receiver.accept_page(empty_page.clone()),
+                    Ok(InventoryPageOutcome::Accepted)
+                );
+                assert_eq!(
+                    receiver.accept_page(empty_page),
+                    Ok(InventoryPageOutcome::Duplicate)
+                );
+            }
+            assert_eq!(
+                receiver.ids(),
+                inventory_ids,
+                "inventory replay case {case}"
+            );
+            assert!(receiver.is_complete());
+
+            let expected_missing = inventory_ids
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| (index + case) % 3 != 0)
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>();
+            receiver.set_missing_ids(expected_missing.clone()).unwrap();
+            receiver.set_missing_ids(expected_missing.clone()).unwrap();
+            assert_eq!(
+                receiver.set_missing_ids(inventory_ids.clone()),
+                if inventory_ids == expected_missing {
+                    Ok(())
+                } else {
+                    Err(SyncError::SyncRequestConflict)
+                }
+            );
+            let mut batched = Vec::new();
+            while receiver.has_missing_ids_remaining() {
+                let (batch, has_more) = receiver.next_missing_batch().unwrap();
+                assert_eq!(
+                    has_more,
+                    batched.len() + batch.len() < expected_missing.len()
+                );
+                batched.extend(batch);
+            }
+            assert_eq!(batched, expected_missing, "request replay case {case}");
+        }
+
+        for case in 0..20usize {
+            let requested = (0..(case % 7 + 1))
+                .map(|index| format!("requested-{index:03}"))
+                .collect::<Vec<_>>();
+            let requested_refs = requested.iter().map(String::as_str).collect::<Vec<_>>();
+            let request = sync_request(&format!("request-{case}"), &requested_refs);
+            let mut book = SyncRequestBook::new();
+            assert_eq!(
+                book.register_request(request.clone()),
+                Ok(SyncRequestOutcome::Accepted)
+            );
+            assert_eq!(
+                book.register_request(request),
+                Ok(SyncRequestOutcome::Duplicate)
+            );
+            assert_eq!(
+                book.register_request(sync_request(
+                    &format!("request-{case}"),
+                    &["different-message"],
+                )),
+                Err(SyncError::SyncRequestConflict)
+            );
+            assert_eq!(
+                book.requested_ids(&format!("request-{case}")).unwrap(),
+                requested
+            );
+            let mut observed = BTreeSet::new();
+            for (index, id) in requested.iter().enumerate() {
+                if (index + case) % 2 == 0 {
+                    let mut value =
+                        packet(id, &format!("body-{case}-{index}"), "2026-10-14T12:00:00Z");
+                    value["sender"] = Value::String("device-b".to_owned());
+                    assert_eq!(
+                        book.observe_message(value.clone()),
+                        Ok(SyncMessageOutcome::Matched)
+                    );
+                    assert_eq!(book.observe_message(value), Ok(SyncMessageOutcome::Matched));
+                    observed.insert(id.clone());
+                }
+            }
+            assert_eq!(
+                book.observed_ids(&format!("request-{case}")).unwrap(),
+                observed.iter().cloned().collect::<Vec<_>>()
+            );
+            let completed = observed.iter().cloned().collect::<Vec<_>>();
+            let completed_refs = completed.iter().map(String::as_str).collect::<Vec<_>>();
+            let completion = sync_completion(&format!("request-{case}"), &completed_refs);
+            assert_eq!(
+                book.accept_completion(completion.clone()),
+                Ok(SyncRequestOutcome::Accepted)
+            );
+            assert_eq!(
+                book.accept_completion(completion),
+                Ok(SyncRequestOutcome::Duplicate)
+            );
+            assert!(book.is_completed(&format!("request-{case}")));
+            assert_eq!(
+                book.completion_ids(&format!("request-{case}")),
+                Some(completed)
+            );
+        }
+    }
 }
