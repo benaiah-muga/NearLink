@@ -312,7 +312,8 @@ function App() {
         if (!validateWithWasm("client", packet)) throw new Error("The synchronization packet failed protocol checks.");
         send(packet);
       },
-      loadAccepted: () => conversationStore.loadMessages(connectionRoom),
+      loadAcceptedMessageIds: () => conversationStore.loadAcceptedMessageIds(connectionRoom, (packet) => validateWithWasm("message", packet)),
+      loadRequestedMessages: (ids) => conversationStore.loadRequestedMessages(connectionRoom, ids, (packet) => validateWithWasm("message", packet)),
       validateMessage: (packet) => validateWithWasm("message", packet),
       rebroadcastOnPeerInventory: true,
       messageIntervalMs: transport === "hub" ? 700 : 0,

@@ -137,6 +137,18 @@ vi.mock("./lib/storage", async (importOriginal) => {
       }
       return actual.loadMessages(room);
     },
+    loadRequestedMessages: (room: string, ids: string[], validate: (packet: MessagePacket) => boolean) => {
+      messageReadGate.requestedRooms.push(room);
+      if (messageReadGate.failNextMessageLoads > 0) {
+        messageReadGate.failNextMessageLoads -= 1;
+        return Promise.reject(new Error("Injected message read failure."));
+      }
+      const roomReadCount = messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === room).length;
+      if (room === messageReadGate.room && messageReadGate.pending && (messageReadGate.readGateAfter === null || roomReadCount >= messageReadGate.readGateAfter)) {
+        return messageReadGate.pending.then((rows) => (rows as StoredMessage[]).filter((row) => ids.includes(row.packet.id) && validate(row.packet)));
+      }
+      return actual.loadRequestedMessages(room, ids, validate);
+    },
     saveMessage: async (message: Parameters<typeof actual.saveMessage>[0]) => {
       const id = message.packet.id;
       messageReadGate.saveAttempts.set(id, (messageReadGate.saveAttempts.get(id) ?? 0) + 1);

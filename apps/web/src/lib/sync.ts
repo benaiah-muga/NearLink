@@ -23,6 +23,7 @@ import {
 } from "./wasmProtocol";
 import { SecureRandomUnavailableError } from "./secureId";
 import type { StoredMessage } from "./storage";
+import type { AcceptedMessageIdSnapshot } from "./conversationStore";
 
 export type SyncState = "idle" | "syncing" | "partial" | "complete" | "error";
 
@@ -31,7 +32,8 @@ export interface SyncCoordinatorOptions {
   sender: string;
   makeId: () => string;
   send: (packet: SyncPacket | MessagePacket) => void;
-  loadAccepted: () => Promise<StoredMessage[]>;
+  loadAcceptedMessageIds: () => Promise<AcceptedMessageIdSnapshot>;
+  loadRequestedMessages: (ids: string[]) => Promise<StoredMessage[]>;
   validateMessage: (packet: MessagePacket) => boolean;
   rebroadcastOnPeerInventory?: boolean;
   messageIntervalMs?: number;
@@ -115,15 +117,10 @@ export class SyncCoordinator {
     this.options.onState?.("syncing", "Exchanging bounded local message inventories.");
     try {
       if (!isWasmSyncStateReady()) throw new Error("WASM synchronization state is unavailable.");
-      const stored = await this.options.loadAccepted();
+      const snapshot = await this.options.loadAcceptedMessageIds();
       if (!this.isRunActive(startEpoch)) return;
-      const accepted = stored.filter((item) => item.packet.room === this.options.room
-        && item.delivery === "sent"
-        && item.failure === undefined
-        && this.options.validateMessage(item.packet));
-      const allIds = [...new Set(accepted.map((item) => item.packet.id))].sort();
-      const limitReached = allIds.length > MAX_SYNC_INVENTORY_IDS;
-      const ids = allIds.slice(0, MAX_SYNC_INVENTORY_IDS);
+      const ids = [...new Set(snapshot.ids)].sort().slice(0, MAX_SYNC_INVENTORY_IDS);
+      const limitReached = snapshot.truncated || snapshot.ids.length > MAX_SYNC_INVENTORY_IDS;
       this.localLimitReached = limitReached;
       this.localIds = new Set(ids);
       this.localSyncId = this.options.makeId();
@@ -391,11 +388,11 @@ export class SyncCoordinator {
 
   private async requestMissing(session: InventorySession): Promise<void> {
     const requestEpoch = this.epoch;
-    let current: StoredMessage[];
+    let current: AcceptedMessageIdSnapshot;
     try {
       await this.localSnapshotReady;
       if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
-      current = await this.options.loadAccepted();
+      current = await this.options.loadAcceptedMessageIds();
     } catch {
       if (this.isRunActive(requestEpoch) && this.isSessionActive(session)) this.fail("The local storage check failed. Reconnect to restart synchronization from fresh inventories.");
       return;
@@ -405,10 +402,9 @@ export class SyncCoordinator {
     try {
       selector = createWasmMissingIdSelector(session.ids);
       let localChunk: string[] = [];
-      for (const item of current) {
-        if (item.packet.room !== this.options.room || item.delivery !== "sent" || item.failure !== undefined
-          || !this.options.validateMessage(item.packet)) continue;
-        localChunk.push(item.packet.id);
+      if (current.truncated) this.partial = true;
+      for (const id of current.ids) {
+        localChunk.push(id);
         if (localChunk.length === MAX_SYNC_SELECTION_CHUNK_IDS) {
           selector.observeLocalIds(localChunk);
           localChunk = [];
@@ -499,10 +495,9 @@ export class SyncCoordinator {
     const prior = this.handledRequests.get(handledRequestKey(request.sender, request.syncId, request.requestId));
     if (prior && !sameJson(prior, request)) return this.fail("A request ID was reused with different contents. Reconnect to start over.");
     try {
-      const current = await this.options.loadAccepted();
+      const current = await this.options.loadRequestedMessages(request.messageIds);
       if (!this.isResponseActive(request, responseEpoch)) return;
-      const available = new Map(current.filter((item) => item.packet.room === this.options.room
-        && item.delivery === "sent" && item.failure === undefined && request.messageIds.includes(item.packet.id)
+      const available = new Map(current.filter((item) => request.messageIds.includes(item.packet.id)
         && this.localIds.has(item.packet.id)
         && this.options.validateMessage(item.packet)).map((item) => [item.packet.id, item.packet]));
       const emitted: string[] = [];
@@ -597,9 +592,9 @@ export class SyncCoordinator {
     }
     const incompletePage = completedIds.length < request.ids.length || observedIds.length < completedIds.length;
     try {
-      const stored = await this.options.loadAccepted();
+      const stored = await this.options.loadRequestedMessages(observedIds);
       if (!this.isRunActive(completeEpoch) || this.requests.get(packet.requestId) !== request) return;
-      const byId = new Map(stored.filter((item) => item.packet.room === this.options.room && item.delivery === "sent" && item.failure === undefined).map((item) => [item.packet.id, item.packet]));
+      const byId = new Map(stored.map((item) => [item.packet.id, item.packet]));
       for (const id of observedIds) {
         const expected = request.received.get(id);
         const actual = byId.get(id);

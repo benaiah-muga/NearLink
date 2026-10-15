@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
-import { acceptInboundMessage, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessages, loadRequestedMessages, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const classifierGate = vi.hoisted(() => ({ failNext: false }));
 
@@ -58,6 +58,73 @@ afterEach(async () => {
 });
 
 describe("local IndexedDB storage", () => {
+  it("caps snapshots at exactly 4,096 accepted IDs and reports the 4,097th as truncated", () => {
+    const collector = new AcceptedMessageIdCollector();
+    for (let index = 0; index < MAX_SYNC_STORAGE_IDS; index += 1) {
+      expect(collector.record(message(`id-${String(index).padStart(4, "0")}`, "2026-10-14T09:00:00.000Z", "sent"), "alpha", () => true)).toBe(true);
+    }
+    expect(collector.ids).toHaveLength(4096);
+    expect(collector.ids[0]).toBe("id-0000");
+    expect(collector.ids.at(-1)).toBe("id-4095");
+    expect(collector.truncated).toBe(false);
+    expect(collector.record(message("id-4096", "2026-10-14T09:00:00.000Z", "sent"), "alpha", () => true)).toBe(false);
+    expect(collector.ids).toHaveLength(4096);
+    expect(collector.truncated).toBe(true);
+  });
+
+  it("bounds scanned rows and signals incomplete scans even when every row is rejected", () => {
+    const collector = new AcceptedMessageIdCollector();
+    const queued = message("queued", "2026-10-14T09:00:00.000Z");
+    for (let index = 0; index < MAX_SYNC_STORAGE_ROWS_SCANNED; index += 1) {
+      expect(collector.record(queued, "alpha", () => true)).toBe(true);
+    }
+    expect(collector.scanned).toBe(MAX_SYNC_STORAGE_ROWS_SCANNED);
+    expect(collector.truncated).toBe(false);
+    expect(collector.record(queued, "alpha", () => true)).toBe(false);
+    expect(collector.scanned).toBe(MAX_SYNC_STORAGE_ROWS_SCANNED);
+    expect(collector.truncated).toBe(true);
+    expect(collector.ids).toEqual([]);
+  });
+
+  it("uses a primary-key cursor for deterministic accepted-only room IDs", async () => {
+    await saveMessage(message("zulu", "2026-10-14T09:00:00.000Z", "sent"));
+    await saveMessage(message("alpha", "2026-10-14T09:00:00.000Z", "sent"));
+    await saveMessage(message("queued", "2026-10-14T09:00:00.000Z"));
+    await saveMessage({ ...message("other-room", "2026-10-14T09:00:00.000Z", "sent"), packet: packet("other-room", "2026-10-14T09:00:00.000Z", "beta") });
+    await expect(loadAcceptedMessageIds("alpha", () => true)).resolves.toEqual({ ids: ["alpha", "zulu"], truncated: false });
+  });
+
+  it("reads only up to 100 requested accepted valid rows in request order", async () => {
+    const rows = Array.from({ length: 100 }, (_, index) => message(`id-${String(index).padStart(3, "0")}`, "2026-10-14T09:00:00.000Z", "sent"));
+    for (const row of rows) await saveMessage(row);
+    await saveMessage(message("queued", "2026-10-14T09:00:00.000Z"));
+    const acceptedIds = rows.slice(0, 99).map((row) => row.packet.id).reverse();
+    const ids = acceptedIds.concat("queued");
+    const found = await loadRequestedMessages("alpha", ids, (candidate) => candidate.id !== "id-000");
+    expect(found.map((row) => row.packet.id)).toEqual(acceptedIds.filter((id) => id !== "id-000"));
+    await expect(loadRequestedMessages("alpha", [...ids, "one-too-many"], () => true)).rejects.toThrow("at most 100");
+  });
+
+  it("fails the bounded snapshot if the injected validator throws", async () => {
+    await saveMessage(message("validator-failure", "2026-10-14T09:00:00.000Z", "sent"));
+    await expect(loadAcceptedMessageIds("alpha", () => { throw new Error("validator unavailable"); })).rejects.toThrow("validator unavailable");
+  });
+
+  it("keeps a snapshot consistent with concurrent inbound writes and room deletion", async () => {
+    const incoming: StoredMessage = { packet: packet("snapshot-race", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent", transport: "direct" };
+    const [writeSnapshot] = await Promise.all([
+      loadAcceptedMessageIds("alpha", () => true),
+      saveMessage(incoming),
+    ]);
+    expect([[], ["snapshot-race"]]).toContainEqual(writeSnapshot.ids);
+    const [deleteSnapshot] = await Promise.all([
+      loadAcceptedMessageIds("alpha", () => true),
+      beginRoomDeletion("alpha").then(() => deleteRoomMessages("alpha")),
+    ]);
+    expect([[], ["snapshot-race"]]).toContainEqual(deleteSnapshot.ids);
+    expect(await loadAcceptedMessageIds("alpha", () => true)).toEqual({ ids: [], truncated: false });
+  });
+
   it("persists and reloads an identity and ordered messages", async () => {
     await saveIdentity({ sender: "device-1", senderName: "Ada" });
     await saveMessage(message("later", "2026-10-14T10:00:00.000Z"));

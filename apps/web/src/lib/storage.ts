@@ -1,5 +1,6 @@
 import type { MessagePacket } from "@nearlink/protocol";
-import type { ConversationStore } from "./conversationStore";
+import { isProtocolIdentifier } from "@nearlink/protocol";
+import type { AcceptedMessageIdSnapshot, ConversationStore } from "./conversationStore";
 import { classifyInboundAcceptance, initializeWasmProtocol } from "./wasmProtocol";
 
 export type DeliveryState = "queued" | "sent" | "failed";
@@ -52,6 +53,32 @@ const ROOM_DELETION_STORE = "roomDeletions";
 const ROOM_CREATED_INDEX = "roomCreatedAt";
 const ROOM_DELIVERY_CREATED_INDEX = "roomDeliveryCreatedAt";
 const ROOM_DISPLAY_ORDER_INDEX = "roomDisplayOrder";
+export const MAX_SYNC_STORAGE_IDS = 4096;
+export const MAX_SYNC_STORAGE_ROWS_SCANNED = 16384;
+export const MAX_SYNC_REQUESTED_STORAGE_IDS = 100;
+
+/** Stateful cap logic shared by the IndexedDB cursor and deterministic boundary tests. */
+export class AcceptedMessageIdCollector {
+  readonly ids: string[] = [];
+  scanned = 0;
+  truncated = false;
+
+  record(row: StoredMessage, room: string, validate: (packet: MessagePacket) => boolean): boolean {
+    if (this.scanned >= MAX_SYNC_STORAGE_ROWS_SCANNED) {
+      this.truncated = true;
+      return false;
+    }
+    this.scanned += 1;
+    if (row?.packet?.room !== room || row.delivery !== "sent" || row.failure !== undefined
+      || !isProtocolIdentifier(row.packet.id) || !validate(row.packet)) return true;
+    if (this.ids.length >= MAX_SYNC_STORAGE_IDS) {
+      this.truncated = true;
+      return false;
+    }
+    this.ids.push(row.packet.id);
+    return true;
+  }
+}
 const IDENTITY_KEY_PATH = "key";
 const MESSAGE_KEY_PATH = ["packet.room", "packet.id"];
 const ROOM_CREATED_KEY_PATH = ["packet.room", "packet.createdAt"];
@@ -279,6 +306,116 @@ export async function loadMessages(room: string): Promise<StoredMessage[]> {
         }
         complete(messages.sort(compareDisplayOrder));
       }, setFailure);
+    },
+  );
+}
+
+/** Read a deterministic, bounded accepted-ID snapshot without materializing message rows. */
+export async function loadAcceptedMessageIds(
+  room: string,
+  validate: (packet: MessagePacket) => boolean,
+): Promise<AcceptedMessageIdSnapshot> {
+  return withTransaction<AcceptedMessageIdSnapshot>(
+    "Could not read the bounded synchronization inventory",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readonly",
+    (_store, complete, setFailure, transaction) => {
+      const messageStore = transaction.objectStore(MESSAGE_STORE);
+      const deletionStore = transaction.objectStore(ROOM_DELETION_STORE);
+      const collector = new AcceptedMessageIdCollector();
+      let cursorDone = false;
+      let deletionDone = false;
+      const finishIfReady = () => {
+        if (cursorDone && deletionDone) complete({ ids: collector.ids, truncated: collector.truncated });
+      };
+      const deletionRequest = deletionStore.get(room);
+      deletionRequest.onsuccess = () => {
+        deletionDone = true;
+        if (deletionRequest.result) {
+          collector.ids.length = 0;
+          cursorDone = true;
+          finishIfReady();
+          return;
+        }
+        finishIfReady();
+      };
+      deletionRequest.onerror = () => setFailure(deletionRequest.error ?? new Error("Could not read the room deletion state."));
+      const range = IDBKeyRange.bound([room, ""], [room, "\uffff"]);
+      const request = messageStore.openCursor(range, "next");
+      request.onerror = () => setFailure(request.error ?? new Error("Could not scan accepted message IDs."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          cursorDone = true;
+          finishIfReady();
+          return;
+        }
+        if (deletionDone && deletionRequest.result) return;
+        const row = cursor.value as StoredMessage;
+        try {
+          if (!collector.record(row, room, validate)) {
+            cursorDone = true;
+            finishIfReady();
+            return;
+          }
+        } catch (error) {
+          setFailure(error);
+          try { transaction.abort(); } catch { /* the transaction may already be inactive */ }
+          return;
+        }
+        cursor.continue();
+      };
+    },
+  );
+}
+
+/** Read only the requested accepted rows, in request order, within one readonly transaction. */
+export async function loadRequestedMessages(
+  room: string,
+  ids: string[],
+  validate: (packet: MessagePacket) => boolean,
+): Promise<StoredMessage[]> {
+  if (ids.length > MAX_SYNC_REQUESTED_STORAGE_IDS) throw new Error("A synchronization read may request at most 100 message IDs.");
+  if (ids.some((id) => !isProtocolIdentifier(id))) throw new Error("A synchronization read contains an invalid message ID.");
+  const uniqueIds = [...new Set(ids)];
+  return withTransaction<StoredMessage[]>(
+    "Could not read requested synchronization messages",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readonly",
+    (_store, complete, setFailure, transaction) => {
+      const messageStore = transaction.objectStore(MESSAGE_STORE);
+      const deletionStore = transaction.objectStore(ROOM_DELETION_STORE);
+      const results = new Map<string, StoredMessage>();
+      let remaining = uniqueIds.length + 1;
+      const finishOne = () => {
+        remaining -= 1;
+        if (remaining === 0) complete(ids.flatMap((id) => results.has(id) ? [results.get(id)!] : []));
+      };
+      const deletionRequest = deletionStore.get(room);
+      deletionRequest.onsuccess = () => {
+        if (deletionRequest.result) {
+          complete([]);
+          return;
+        }
+        for (const id of uniqueIds) {
+          const request = messageStore.get([room, id]);
+          request.onsuccess = () => {
+            const row = request.result as StoredMessage | undefined;
+            try {
+              if (row?.packet?.room === room && row.packet.id === id && row.delivery === "sent"
+                && row.failure === undefined && validate(row.packet)) results.set(id, row);
+            } catch (error) {
+              setFailure(error);
+              try { transaction.abort(); } catch { /* the transaction may already be inactive */ }
+              return;
+            }
+            finishOne();
+          };
+          request.onerror = () => setFailure(request.error ?? new Error("Could not read a requested synchronization message."));
+        }
+        finishOne();
+      };
+      deletionRequest.onerror = () => setFailure(deletionRequest.error ?? new Error("Could not read the room deletion state."));
     },
   );
 }
@@ -716,6 +853,8 @@ export const browserConversationStore: ConversationStore = {
   loadIdentity,
   saveIdentity,
   loadMessages,
+  loadAcceptedMessageIds,
+  loadRequestedMessages,
   saveMessage,
   acceptInboundMessage,
   updateDelivery,

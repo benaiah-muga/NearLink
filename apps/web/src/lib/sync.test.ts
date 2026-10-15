@@ -107,6 +107,18 @@ function stored(id: string, sender: string, delivery: "sent" | "queued" | "faile
   return { packet: packet(id, sender), direction: sender === "local-a" ? "outgoing" : "incoming", delivery, transport: "hub" };
 }
 
+function boundedStorage(load: () => Promise<StoredMessage[]>) {
+  return {
+    loadAcceptedMessageIds: async () => {
+      const rows = await load();
+      const allIds = [...new Set(rows.filter((row) => row.packet.room === room && row.delivery === "sent" && row.failure === undefined).map((row) => row.packet.id))].sort();
+      return { ids: allIds.slice(0, 4096), truncated: allIds.length > 4096 };
+    },
+    loadRequestedMessages: async (ids: string[]) => (await load()).filter((row) => ids.includes(row.packet.id)
+      && row.packet.room === room && row.delivery === "sent" && row.failure === undefined),
+  };
+}
+
 function uncompletedInventoryPages(sender: string, sessionCount = 5, pagesPerSession = 39): SyncPacket[] {
   const packets: SyncPacket[] = [];
   for (let session = 0; session < sessionCount; session += 1) {
@@ -143,7 +155,7 @@ describe("SyncCoordinator", () => {
     wasmState.ready = false;
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local", send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local", send: (value) => sent.push(value), ...boundedStorage(async () => []), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     expect(state).toBe("error");
     expect(sent).toEqual([]);
@@ -153,7 +165,7 @@ describe("SyncCoordinator", () => {
   it("releases a blocked sender inventory and request state", async () => {
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => []), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "peer-session", sender: "local-b", cursor: null, messageIds: [], nextCursor: null, hasMore: false, limitReached: false });
     for (let index = 0; index < 193; index += 1) {
@@ -176,7 +188,7 @@ describe("SyncCoordinator", () => {
       sender: "local-a",
       makeId: () => "local-session",
       send: (value) => sent.push(value),
-      loadAccepted: () => { loads += 1; return loads === 1 ? Promise.resolve(rows) : responseSnapshot; },
+      ...boundedStorage(() => { loads += 1; return loads === 1 ? Promise.resolve(rows) : responseSnapshot; }),
       validateMessage: () => true,
       onState: (next) => { state = next; },
     });
@@ -196,7 +208,7 @@ describe("SyncCoordinator", () => {
     const rows = [stored("alpha", "local-a"), stored("bravo", "local-a")];
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, messageIntervalMs: 10_000, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true, messageIntervalMs: 10_000, onState: (next) => { state = next; } });
     await coordinator.start();
     const response = coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "paced-response", sender: "local-b", targetSender: "local-a", messageIds: ["alpha", "bravo"] });
     await vi.waitFor(() => expect(sent.some((value) => value.type === "message" && value.id === "alpha")).toBe(true));
@@ -219,7 +231,7 @@ describe("SyncCoordinator", () => {
       sender: "local-a",
       makeId: () => "local-session",
       send: (value) => sent.push(value),
-      loadAccepted: () => { loads += 1; return loads === 1 ? Promise.resolve([]) : pendingCheck; },
+      ...boundedStorage(() => { loads += 1; return loads === 1 ? Promise.resolve([]) : pendingCheck; }),
       validateMessage: () => true,
       onState: (next) => { state = next; },
     });
@@ -236,7 +248,7 @@ describe("SyncCoordinator", () => {
   it("discards exchange state on stop and creates fresh state after restart", async () => {
     const sent: Array<SyncPacket | MessagePacket> = [];
     let sequence = 0;
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => `local-${++sequence}`, send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => `local-${++sequence}`, send: (value) => sent.push(value), ...boundedStorage(async () => []), validateMessage: () => true });
     const remoteInventory: SyncPacket = { version: 1, type: "sync_inventory_page", room, syncId: "remote-session", sender: "local-b", cursor: null, messageIds: ["remote-message"], nextCursor: "remote-message", hasMore: false, limitReached: false };
     await coordinator.start();
     await coordinator.receive(remoteInventory);
@@ -259,7 +271,7 @@ describe("SyncCoordinator", () => {
       sender: "local-a",
       makeId: (() => { let id = 0; return () => `epoch-${++id}`; })(),
       send: (value) => sent.push(value),
-      loadAccepted: () => new Promise<StoredMessage[]>((resolve) => { pending.push(resolve); }),
+      ...boundedStorage(() => new Promise<StoredMessage[]>((resolve) => { pending.push(resolve); })),
       validateMessage: () => true,
     });
     const staleStart = coordinator.start();
@@ -285,8 +297,8 @@ describe("SyncCoordinator", () => {
     let a!: SyncCoordinator;
     let b!: SyncCoordinator;
     const states: SyncState[] = [];
-    a = new SyncCoordinator({ room, sender: "local-a", makeId: (() => { let id = 0; return () => `a-${++id}`; })(), send: (value) => queue.push({ target: "b", packet: value }), loadAccepted: async () => aRows, validateMessage: () => true, onState: (state) => states.push(state) });
-    b = new SyncCoordinator({ room, sender: "local-b", makeId: (() => { let id = 0; return () => `b-${++id}`; })(), send: (value) => queue.push({ target: "a", packet: value }), loadAccepted: async () => bRows, validateMessage: () => true });
+    a = new SyncCoordinator({ room, sender: "local-a", makeId: (() => { let id = 0; return () => `a-${++id}`; })(), send: (value) => queue.push({ target: "b", packet: value }), ...boundedStorage(async () => aRows), validateMessage: () => true, onState: (state) => states.push(state) });
+    b = new SyncCoordinator({ room, sender: "local-b", makeId: (() => { let id = 0; return () => `b-${++id}`; })(), send: (value) => queue.push({ target: "a", packet: value }), ...boundedStorage(async () => bRows), validateMessage: () => true });
 
     await Promise.all([a.start(), b.start()]);
     while (queue.length) {
@@ -312,7 +324,7 @@ describe("SyncCoordinator", () => {
     const rows = Array.from({ length: 4097 }, (_, index) => stored(`id-${String(index).padStart(4, "0")}`, "local-a"));
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "session", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     const pages = sent.filter((value) => value.type === "sync_inventory_page");
     expect(pages).toHaveLength(41);
@@ -322,25 +334,65 @@ describe("SyncCoordinator", () => {
     coordinator.stop();
   });
 
+  it("never reports complete when the accepted-ID snapshot is truncated", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: () => "truncated-session",
+      send: (value) => sent.push(value),
+      loadAcceptedMessageIds: async () => ({ ids: [], truncated: true }),
+      loadRequestedMessages: async () => [],
+      validateMessage: () => true,
+      onState: (next) => { state = next; },
+    });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: [], nextCursor: null, hasMore: false, limitReached: false });
+    expect(state).toBe("partial");
+    expect(sent.some((item) => item.type === "sync_page_complete")).toBe(false);
+    coordinator.stop();
+  });
+
+  it("fails storage reads without sending completion or claiming a complete exchange", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: () => "storage-failure-session",
+      send: (value) => sent.push(value),
+      loadAcceptedMessageIds: async () => ({ ids: [], truncated: false }),
+      loadRequestedMessages: async () => { throw new Error("storage unavailable"); },
+      validateMessage: () => true,
+      onState: (next) => { state = next; },
+    });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "storage-failure-session", requestId: "failed-request", sender: "local-b", targetSender: "local-a", messageIds: ["wanted"] });
+    expect(state).toBe("error");
+    expect(sent.some((item) => item.type === "sync_page_complete")).toBe(false);
+    coordinator.stop();
+  });
+
   it("compares peer inventories against local history larger than the inventory bound", async () => {
     const rows = Array.from({ length: 4097 }, (_, index) => stored(`local-${String(index).padStart(4, "0")}`, "local-a"));
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
     let detail = "";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "request", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next, message) => { state = next; detail = message; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "request", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true, onState: (next, message) => { state = next; detail = message; } });
     await coordinator.start();
     await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: ["local-4096", "remote-missing"], nextCursor: "remote-missing", hasMore: false, limitReached: false });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(state, detail).not.toBe("error");
     await vi.waitFor(() => expect(sent.some((value) => value.type === "sync_missing_request")).toBe(true));
-    expect(sent.find((value) => value.type === "sync_missing_request")).toMatchObject({ messageIds: ["remote-missing"] });
-    expect(state).not.toBe("error");
+    expect(sent.find((value) => value.type === "sync_missing_request")).toMatchObject({ messageIds: ["local-4096", "remote-missing"] });
+    expect(state).toBe("partial");
     coordinator.stop();
   });
 
   it("stops when a sender changes a previously received inventory page", async () => {
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local", send: () => undefined, loadAccepted: async () => [], validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local", send: () => undefined, ...boundedStorage(async () => []), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     const first: SyncPacket = { version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: ["alpha"], nextCursor: "alpha", hasMore: false, limitReached: false };
     await coordinator.receive(first);
@@ -352,7 +404,7 @@ describe("SyncCoordinator", () => {
   it("marks omitted completion IDs partial instead of claiming full synchronization", async () => {
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "request", send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "request", send: (value) => sent.push(value), ...boundedStorage(async () => []), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: ["alpha", "bravo"], nextCursor: "bravo", hasMore: false, limitReached: false });
     await vi.waitFor(() => expect(sent.some((value) => value.type === "sync_missing_request")).toBe(true));
@@ -368,7 +420,7 @@ describe("SyncCoordinator", () => {
     const sent: Array<SyncPacket | MessagePacket> = [];
     let release!: (value: StoredMessage[]) => void;
     const snapshot = new Promise<StoredMessage[]>((resolve) => { release = resolve; });
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: () => snapshot, validateMessage: () => true });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => snapshot), validateMessage: () => true });
     const starting = coordinator.start();
     const serving = coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "early-request", sender: "local-b", targetSender: "local-a", messageIds: ["local-saved"] });
     await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote-session", sender: "local-c", cursor: null, messageIds: ["remote-saved"], nextCursor: "remote-saved", hasMore: false, limitReached: false });
@@ -384,7 +436,7 @@ describe("SyncCoordinator", () => {
   it("does not retransmit an already handled duplicate request ID", async () => {
     const rows = [stored("local-saved", "local-a")];
     const sent: Array<SyncPacket | MessagePacket> = [];
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true });
     await coordinator.start();
     const request: SyncPacket = { version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "duplicate-request", sender: "local-b", targetSender: "local-a", messageIds: ["local-saved"] };
     await coordinator.receive(request);
@@ -399,7 +451,7 @@ describe("SyncCoordinator", () => {
     const rows = [stored("local-saved", "local-a")];
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     const request: SyncPacket = { version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "reused-request", sender: "local-b", targetSender: "local-a", messageIds: ["local-saved"] };
     await coordinator.receive(request);
@@ -414,7 +466,7 @@ describe("SyncCoordinator", () => {
     const rows = [stored("shared-message", "local-a")];
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     const request = (sender: string): SyncPacket => ({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "same-opaque-id", sender, targetSender: "local-a", messageIds: ["shared-message"] });
     await coordinator.receive(request("local-b"));
@@ -436,7 +488,7 @@ describe("SyncCoordinator", () => {
         advertCount += 1;
         if (advertCount === 2) throw new Error("Simulated transport send failure.");
       },
-      loadAccepted: async () => [],
+      ...boundedStorage(async () => []),
       validateMessage: () => true,
       onState: (next) => { state = next; },
     });
@@ -452,7 +504,7 @@ describe("SyncCoordinator", () => {
     const rows = [stored("local-saved", "local-a")];
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, onState: (next) => { state = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true, onState: (next) => { state = next; } });
     await coordinator.start();
     for (let index = 0; index < 300; index += 1) {
       await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "other-session", requestId: `broadcast-${index}`, sender: "local-b", targetSender: "local-c", messageIds: ["local-saved"] });
@@ -468,7 +520,7 @@ describe("SyncCoordinator", () => {
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
     let detail = "";
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "request", send: (value) => sent.push(value), loadAccepted: async () => [], validateMessage: () => true, onState: (next, message) => { state = next; detail = message; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "request", send: (value) => sent.push(value), ...boundedStorage(async () => []), validateMessage: () => true, onState: (next, message) => { state = next; detail = message; } });
     await coordinator.start();
     await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: ["older-message"], nextCursor: "older-message", hasMore: false, limitReached: false });
     await vi.waitFor(() => expect(sent.some((value) => value.type === "sync_missing_request")).toBe(true));
@@ -483,7 +535,7 @@ describe("SyncCoordinator", () => {
   it("cancels a paced hub response timer when the coordinator stops", async () => {
     const rows = [stored("alpha", "local-a"), stored("bravo", "local-a")];
     const sent: Array<SyncPacket | MessagePacket> = [];
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), loadAccepted: async () => rows, validateMessage: () => true, messageIntervalMs: 1000 });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => sent.push(value), ...boundedStorage(async () => rows), validateMessage: () => true, messageIntervalMs: 1000 });
     await coordinator.start();
     const response = coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "stop-request", sender: "local-b", targetSender: "local-a", messageIds: ["alpha", "bravo"] });
     await vi.waitFor(() => expect(sent.some((value) => value.type === "message" && value.id === "alpha")).toBe(true));
@@ -500,7 +552,7 @@ describe("SyncCoordinator", () => {
     coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => "local-session", send: (value) => {
       sent.push(value);
       if (value.type === "message") coordinator.noteMessageRateLimited("The hub rate-limited a sync message. This exchange is partial.");
-    }, loadAccepted: async () => rows, validateMessage: () => true, messageIntervalMs: 700 });
+    }, ...boundedStorage(async () => rows), validateMessage: () => true, messageIntervalMs: 700 });
     await coordinator.start();
     await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "local-session", requestId: "remote-request", sender: "local-b", targetSender: "local-a", messageIds: ["alpha", "bravo"] });
     expect(sent.filter((value) => value.type === "message")).toHaveLength(1);
@@ -513,10 +565,10 @@ describe("SyncCoordinator", () => {
     const bRows: StoredMessage[] = [];
     const toA: Array<SyncPacket | MessagePacket> = [];
     const toB: Array<SyncPacket | MessagePacket> = [];
-    const a = new SyncCoordinator({ room, sender: "local-a", makeId: () => "a-session", send: (value) => toB.push(value), loadAccepted: async () => aRows, validateMessage: () => true, rebroadcastOnPeerInventory: true });
+    const a = new SyncCoordinator({ room, sender: "local-a", makeId: () => "a-session", send: (value) => toB.push(value), ...boundedStorage(async () => aRows), validateMessage: () => true, rebroadcastOnPeerInventory: true });
     await a.start();
     toB.length = 0; // The peer had not confirmed its direct session and ignored the first advertisement.
-    const b = new SyncCoordinator({ room, sender: "local-b", makeId: () => "b-session", send: (value) => toA.push(value), loadAccepted: async () => bRows, validateMessage: () => true });
+    const b = new SyncCoordinator({ room, sender: "local-b", makeId: () => "b-session", send: (value) => toA.push(value), ...boundedStorage(async () => bRows), validateMessage: () => true });
     await b.start();
     const bInventory = toA.find((value) => value.type === "sync_inventory_page");
     expect(bInventory).toBeTruthy();
@@ -537,7 +589,7 @@ describe("SyncCoordinator", () => {
   it("limits aggregate peer controls and lets an unaffected peer continue", async () => {
     const state = { value: "idle" as SyncState };
     const sent: Array<SyncPacket | MessagePacket> = [];
-    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => `request-${sent.length}`, send: (packet) => sent.push(packet), loadAccepted: async () => [], validateMessage: () => true, onState: (next) => { state.value = next; } });
+    const coordinator = new SyncCoordinator({ room, sender: "local-a", makeId: () => `request-${sent.length}`, send: (packet) => sent.push(packet), ...boundedStorage(async () => []), validateMessage: () => true, onState: (next) => { state.value = next; } });
     await coordinator.start();
     let budgetReached = false;
     for (let peer = 0; peer < 32 && !budgetReached; peer += 1) {
