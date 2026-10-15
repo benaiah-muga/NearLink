@@ -16,6 +16,7 @@
     "test:unit": "node scripts/run-unit-tests.mjs",
     "test:e2e": "npm run build && playwright test --project=chromium",
     "test:e2e:compat": "npm run build && playwright test --project=firefox-smoke --project=webkit-smoke",
+    "test:e2e:real-hub-compat": "npm run build && playwright test e2e/real-hub-compat.spec.ts",
     "test:wasm": "node scripts/test-protocol-wasm.mjs",
     "test:release-artifact": "node --test scripts/build-release-candidate.test.mjs",
     "release:candidate-artifact": "node scripts/build-release-candidate.mjs",

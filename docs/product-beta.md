@@ -173,24 +173,27 @@ and do not attach it to bug reports.
 
 ## Compatibility and verification status
 
-The most recent completed CI run for this implementation baseline used
+The most recent completed CI run before the NL-52 compatibility journey used
 source commit
-[`98325cae1bcdd304960d2558395a68e88721bf58`](https://github.com/benaiah-muga/NearLink/commit/98325cae1bcdd304960d2558395a68e88721bf58)
+[`15762bce371e9d93f69423e8ce603c31a5000c6e`](https://github.com/benaiah-muga/NearLink/commit/15762bce371e9d93f69423e8ce603c31a5000c6e)
 and successful GitHub Actions run
-[`38706774941`](https://github.com/benaiah-muga/NearLink/actions/runs/38706774941).
+[`38812980383`](https://github.com/benaiah-muga/NearLink/actions/runs/38812980383).
 The run used Ubuntu 24.04, Node 24, and Playwright's Chromium, Firefox, and
-WebKit projects. It passed both `verify` and `security-audit`. These results
-describe automated CI on that runner and commit. They do not establish support
-for a named operating system, physical device, browser release, or network
-configuration.
+WebKit projects. It passed both `verify` and `security-audit`, but predates the
+NL-52 real-hub browser journey below. In local production-build checks on
+2026-10-16, the NL-52 journey passed in Chromium and Firefox. WebKit could not
+launch on this development host because `libavif13` is missing. The NL-52 CI
+result is pending. These automated checks do not establish support for a named
+operating system, physical device, browser release, or network configuration.
 
 | Target or behavior | Current evidence | Status |
 | --- | --- | --- |
-| Production build and foundation checks | CI run [38706774941](https://github.com/benaiah-muga/NearLink/actions/runs/38706774941), source commit [`98325ca`](https://github.com/benaiah-muga/NearLink/commit/98325cae1bcdd304960d2558395a68e88721bf58), passed `npm run verify:all`, the production build, protocol checks, and `test:wasm`. `verify:all` reported 174 unit and UI tests. | Automated CI passed on the recorded commit. This is not a release artifact or device sign-off. |
-| Chromium production E2E | The same CI run passed 6 of 6 Playwright tests against the production build served by the preview server in Chromium. Coverage includes local queued-message persistence, narrow viewport layout, hub history paging, a real local hub conversation with two browser contexts, a direct WebRTC session between browser contexts, and service-worker offline emulation with hub resume. External requests are blocked in the real-hub test. | Automated Chromium coverage passed on the CI runner. Browser contexts run on one CI host, not on two physical devices. |
-| Firefox and WebKit persistence | The same CI run passed one persistence-across-reload smoke in each Playwright Firefox and WebKit engine project. The tested path saves a profile and queued message, reloads, and checks that both remain. | Automated engine smokes passed. This is not Firefox or Safari release support, mobile support, or OS sign-off. Playwright WebKit does not replace testing Safari on Apple devices. |
-| Automated accessibility checks | Chromium E2E invokes axe scans on selected setup, diagnostics, queue, deletion, narrow viewport, and history states, using WCAG 2.0 A/AA, WCAG 2.1 A/AA, and WCAG 2.2 AA tags. Those scans passed in the recorded CI run. | Automated axe coverage only. It is not a complete accessibility audit or manual assistive-technology review. |
-| Unit and simulated DOM UI behavior | `npm run verify:all` in the recorded CI run reported 174 passing Vitest tests across 10 test files. The app UI tests run in jsdom and use test storage setup. | Automated unit and simulated DOM UI coverage passed. It does not prove real browser, operating system, or device behavior. |
+| Production build and foundation checks | CI run [38812980383](https://github.com/benaiah-muga/NearLink/actions/runs/38812980383), source commit [`15762bce`](https://github.com/benaiah-muga/NearLink/commit/15762bce371e9d93f69423e8ce603c31a5000c6e), passed `npm run verify:all`, the production build, protocol checks, and `test:wasm`. | Automated CI passed on the recorded commit. This is not a release artifact or device sign-off, and the run predates NL-52. |
+| Chromium production E2E | CI run [38812980383](https://github.com/benaiah-muga/NearLink/actions/runs/38812980383) passed the production E2E suite on Chromium. It includes queued-message persistence, layout, hub history paging, a real local hub conversation, direct WebRTC between browser contexts, and service-worker offline emulation with hub resume. The NL-52 local-hub compatibility journey also passed locally in Chromium on 2026-10-16. | Automated Chromium coverage passed. Browser contexts run on one host, not on two physical devices. The current CI run predates NL-52. |
+| Firefox and WebKit persistence | CI run [38812980383](https://github.com/benaiah-muga/NearLink/actions/runs/38812980383) passed one persistence-across-reload smoke in each Playwright engine. The path saves a profile and queued message, reloads, and checks that both remain. | Automated engine smokes passed. This is not Firefox or Safari release support, mobile support, or OS sign-off. Playwright WebKit does not replace testing Safari on Apple devices. |
+| Production local-hub compatibility journey | The NL-52 journey opens two independent contexts in the selected Playwright engine, connects to the checked-in local hub, verifies hub ACK and recipient IndexedDB persistence, disconnects a recipient while sending, and checks reconnect replay is duplicate-free. Non-loopback HTTP and WebSocket requests are blocked. Local runs passed in Chromium and Firefox on 2026-10-16. The WebKit run could not launch because this host lacks `libavif13`; NL-52 CI is pending. | Automated same-host engine coverage only. It does not establish two-device LAN behavior, physical browser support, or Safari support. |
+| Automated accessibility checks | Chromium E2E invokes axe scans on selected setup, diagnostics, queue, deletion, narrow viewport, and history states, using WCAG 2.0 A/AA, WCAG 2.1 A/AA, and WCAG 2.2 AA tags. Those scans passed in CI run [38812980383](https://github.com/benaiah-muga/NearLink/actions/runs/38812980383). | Automated axe coverage only. It is not a complete accessibility audit or manual assistive-technology review. |
+| Unit and simulated DOM UI behavior | `npm run verify:all` passed in CI run [38812980383](https://github.com/benaiah-muga/NearLink/actions/runs/38812980383). The app UI tests run in jsdom and use test storage setup. | Automated unit and simulated DOM UI coverage passed. It does not prove real browser, operating system, or device behavior. |
 | Chromium on a named desktop OS or physical device | CI runs Playwright Chromium on Ubuntu 24.04. No actual end-user OS or device acceptance record is included. | Pending manual OS and device acceptance. |
 | Chromium Android, installed and browser modes | No physical Android device check or installation record is included. | Pending. No Android support claim. |
 | Safari on macOS and iOS, installed and browser modes | WebKit engine smoke only; no real Safari, Apple OS, or device acceptance record is included. | Pending. No Safari or Apple device support claim. |

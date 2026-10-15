@@ -26,12 +26,12 @@ export default defineConfig({
     },
     {
       name: "firefox-smoke",
-      testMatch: "cross-browser-smoke.spec.ts",
+      testMatch: ["cross-browser-smoke.spec.ts", "real-hub-compat.spec.ts"],
       use: { ...devices["Desktop Firefox"] },
     },
     {
       name: "webkit-smoke",
-      testMatch: "cross-browser-smoke.spec.ts",
+      testMatch: ["cross-browser-smoke.spec.ts", "real-hub-compat.spec.ts"],
       use: { ...devices["Desktop Safari"] },
     },
   ],
