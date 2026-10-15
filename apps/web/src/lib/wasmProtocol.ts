@@ -56,6 +56,7 @@ interface WasmSyncModule {
 type WasmModule = WasmSyncModule & {
   default: () => Promise<unknown>;
   validate_json: WasmValidator;
+  classify_inbound_json?: (expectedRoom: string, roomDeleted: boolean, candidateJson: string, existingJson?: string) => string;
 };
 
 export const MAX_PROTOCOL_ENVELOPE_BYTES = 18 * 1024;
@@ -63,6 +64,7 @@ export const MAX_SYNC_SELECTION_CHUNK_IDS = 4_096;
 
 let wasmValidator: WasmValidator | null = null;
 let wasmSyncModule: WasmSyncModule | null = null;
+let wasmAcceptanceClassifier: WasmModule["classify_inbound_json"] | null = null;
 let initialization: Promise<boolean> | null = null;
 
 export function initializeWasmProtocol(): Promise<boolean> {
@@ -71,7 +73,13 @@ export function initializeWasmProtocol(): Promise<boolean> {
     try {
       const wasm = await import("../generated/nearlink_protocol_wasm.js") as WasmModule;
       await wasm.default();
-      wasmValidator = wasm.validate_json;
+      const validator = typeof wasm.validate_json === "function" ? wasm.validate_json : null;
+      const acceptanceClassifier = "classify_inbound_json" in wasm && typeof wasm.classify_inbound_json === "function"
+        ? wasm.classify_inbound_json
+        : null;
+      if (!validator || !acceptanceClassifier) throw new Error("Required WASM protocol exports are unavailable.");
+      wasmValidator = validator;
+      wasmAcceptanceClassifier = acceptanceClassifier;
       wasmSyncModule = "WasmSyncInventoryReceiver" in wasm && "WasmSyncRequestBook" in wasm
         && "WasmMissingIdSelector" in wasm && "plan_missing_batch_json" in wasm
         && typeof wasm.WasmSyncInventoryReceiver === "function"
@@ -82,6 +90,8 @@ export function initializeWasmProtocol(): Promise<boolean> {
     } catch {
       wasmValidator = null;
       wasmSyncModule = null;
+      wasmAcceptanceClassifier = null;
+      initialization = null;
       return false;
     }
   })();
@@ -89,7 +99,7 @@ export function initializeWasmProtocol(): Promise<boolean> {
 }
 
 export function isWasmProtocolReady(): boolean {
-  return wasmValidator !== null;
+  return wasmValidator !== null && wasmAcceptanceClassifier !== null;
 }
 
 export function isWasmSyncStateReady(): boolean {
@@ -181,6 +191,26 @@ export function validateWithWasm(validator: Validator, value: unknown): boolean 
   } catch {
     return false;
   }
+}
+
+export type InboundAcceptanceDecision = "saved" | "duplicate" | "conflict" | "room_deleted";
+
+/** Run the portable acceptance classifier synchronously while IndexedDB is active. */
+export function classifyInboundAcceptance(
+  expectedRoom: string,
+  roomDeleted: boolean,
+  candidate: MessagePacket,
+  existing?: MessagePacket,
+): InboundAcceptanceDecision {
+  if (!wasmAcceptanceClassifier) throw new Error("WASM inbound acceptance is unavailable.");
+  const raw = wasmAcceptanceClassifier(expectedRoom, roomDeleted, JSON.stringify(candidate), existing ? JSON.stringify(existing) : undefined);
+  const result = parseSyncResult(raw);
+  if (result.ok === true && (result.outcome === "saved" || result.outcome === "duplicate"
+    || result.outcome === "conflict" || result.outcome === "room_deleted")) {
+    return result.outcome;
+  }
+  const code = typeof result.code === "string" ? result.code : "invalid_result";
+  throw new Error(`WASM rejected inbound acceptance (${code}).`);
 }
 
 export function validateJsonWithWasm(validator: "client" | "message" | "server", json: string): boolean {

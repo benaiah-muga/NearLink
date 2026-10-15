@@ -18,10 +18,11 @@ use nearlink_protocol_core::sync::{
     MAX_SYNC_SELECTION_CHUNK_IDS,
 };
 use nearlink_protocol_core::{
-    is_client_packet, is_history_page_complete_packet, is_history_request_packet, is_join_packet,
-    is_message_packet, is_protocol_identifier, is_protocol_room, is_protocol_timestamp,
-    is_server_packet, is_sync_inventory_page_packet, is_sync_missing_request_packet,
-    is_sync_page_complete_packet,
+    classify_inbound_acceptance, is_client_packet, is_history_page_complete_packet,
+    is_history_request_packet, is_join_packet, is_message_packet, is_protocol_identifier,
+    is_protocol_room, is_protocol_timestamp, is_server_packet, is_sync_inventory_page_packet,
+    is_sync_missing_request_packet, is_sync_page_complete_packet, InboundAcceptance,
+    InboundAcceptanceError, MAX_PROTOCOL_ENVELOPE_BYTES,
 };
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
@@ -85,6 +86,51 @@ impl ErrorCode {
             Self::SyncRequestConflict => "sync_request_conflict",
             Self::InvalidSyncCompletion => "invalid_sync_completion",
         }
+    }
+}
+
+fn acceptance_error_json(error: InboundAcceptanceError) -> String {
+    json!({"ok": false, "code": error.code()}).to_string()
+}
+
+/// Classify a candidate packet against the room state read by the caller.
+/// This bounded, synchronous decision performs no storage or transport work.
+#[wasm_bindgen]
+pub fn classify_inbound_json(
+    expected_room: &str,
+    room_deleted: bool,
+    candidate_json: &str,
+    existing_json: Option<String>,
+) -> String {
+    if candidate_json.len() > MAX_PROTOCOL_ENVELOPE_BYTES
+        || existing_json
+            .as_ref()
+            .is_some_and(|json| json.len() > MAX_PROTOCOL_ENVELOPE_BYTES)
+    {
+        return acceptance_error_json(InboundAcceptanceError::InputTooLarge);
+    }
+    let candidate: Value = match serde_json::from_str(candidate_json) {
+        Ok(value) => value,
+        Err(_) => return acceptance_error_json(InboundAcceptanceError::InvalidJson),
+    };
+    let existing = match existing_json.as_deref() {
+        Some(encoded) => match serde_json::from_str(encoded) {
+            Ok(value) => Some(value),
+            Err(_) => return acceptance_error_json(InboundAcceptanceError::InvalidJson),
+        },
+        None => None,
+    };
+    match classify_inbound_acceptance(expected_room, room_deleted, &candidate, existing.as_ref()) {
+        Ok(outcome) => {
+            let outcome = match outcome {
+                InboundAcceptance::Saved => "saved",
+                InboundAcceptance::Duplicate => "duplicate",
+                InboundAcceptance::Conflict => "conflict",
+                InboundAcceptance::RoomDeleted => "room_deleted",
+            };
+            json!({"ok": true, "outcome": outcome}).to_string()
+        }
+        Err(error) => acceptance_error_json(error),
     }
 }
 
@@ -496,6 +542,42 @@ mod tests {
                 json!({"ok": true, "valid": expected}),
                 "vector: {vector}"
             );
+        }
+    }
+
+    #[test]
+    fn shared_inbound_acceptance_vectors_match_through_the_facade() {
+        let vectors: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../packages/protocol/vectors/inbound-acceptance-v1.json"
+        ))
+        .expect("shared acceptance vectors are valid JSON");
+        for vector in vectors {
+            let candidate = vector
+                .get("candidateJson")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| vector["candidate"].to_string());
+            let existing = vector.get("existing").map(Value::to_string);
+            let actual = parse_result(&classify_inbound_json(
+                vector["expectedRoom"].as_str().unwrap(),
+                vector["roomDeleted"].as_bool().unwrap(),
+                &candidate,
+                existing,
+            ));
+            let expected = &vector["expected"];
+            let expected_result = if let Some(outcome) = expected.get("outcome") {
+                json!({"ok": true, "outcome": outcome})
+            } else {
+                json!({"ok": false, "code": expected["code"]})
+            };
+            assert_eq!(actual, expected_result, "vector: {}", vector["name"]);
+            if actual["ok"] == false {
+                assert_eq!(
+                    actual.as_object().unwrap().len(),
+                    2,
+                    "error leaked packet data"
+                );
+            }
         }
     }
 

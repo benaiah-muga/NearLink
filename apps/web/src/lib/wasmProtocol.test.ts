@@ -9,7 +9,11 @@ describe("WASM protocol validator bridge", () => {
   it("initializes explicitly and accepts valid Rust validator results", async () => {
     const validateJson = vi.fn(() => JSON.stringify({ ok: true, valid: true }));
     const initialize = vi.fn(async () => undefined);
-    vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({ default: initialize, validate_json: validateJson }));
+    vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({
+      default: initialize,
+      validate_json: validateJson,
+      classify_inbound_json: () => JSON.stringify({ ok: true, outcome: "saved" }),
+    }));
     const bridge = await import("./wasmProtocol");
 
     expect(bridge.isWasmProtocolReady()).toBe(false);
@@ -24,10 +28,31 @@ describe("WASM protocol validator bridge", () => {
     expect(bridge.validateJsonWithWasm("server", "é".repeat(9 * 1024 + 1))).toBe(false);
   });
 
+  it("fails initialization when the required inbound acceptance export is missing", async () => {
+    const validateJson = vi.fn(() => JSON.stringify({ ok: true, valid: true }));
+    vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({
+      default: vi.fn(async () => undefined),
+      validate_json: validateJson,
+    }));
+    const bridge = await import("./wasmProtocol");
+
+    expect(await bridge.initializeWasmProtocol()).toBe(false);
+    expect(bridge.isWasmProtocolReady()).toBe(false);
+    expect(bridge.isWasmSyncStateReady()).toBe(false);
+    expect(bridge.validateWithWasm("message", { type: "message" })).toBe(false);
+    const packet = { version: 1, type: "message", id: "m1", room: "room1", sender: "device1", senderName: "Amina", createdAt: "2026-10-14T12:00:00Z", body: "hello" } as const;
+    expect(() => bridge.classifyInboundAcceptance("room1", false, packet)).toThrow("WASM inbound acceptance is unavailable.");
+    expect(validateJson).not.toHaveBeenCalled();
+  });
+
   it("rejects invalid packet results from the ready Rust validator", async () => {
     const validateJson = vi.fn(() => JSON.stringify({ ok: true, valid: false }));
     const initialize = vi.fn(async () => undefined);
-    vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({ default: initialize, validate_json: validateJson }));
+    vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({
+      default: initialize,
+      validate_json: validateJson,
+      classify_inbound_json: () => JSON.stringify({ ok: true, outcome: "saved" }),
+    }));
     const bridge = await import("./wasmProtocol");
 
     expect(await bridge.initializeWasmProtocol()).toBe(true);
@@ -78,6 +103,7 @@ describe("WASM protocol validator bridge", () => {
     vi.doMock("../generated/nearlink_protocol_wasm.js", () => ({
       default: initialize,
       validate_json: () => JSON.stringify({ ok: true, valid: true }),
+      classify_inbound_json: () => JSON.stringify({ ok: true, outcome: "saved" }),
       WasmSyncInventoryReceiver,
       WasmSyncRequestBook,
       WasmMissingIdSelector,

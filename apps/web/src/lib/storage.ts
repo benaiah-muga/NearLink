@@ -1,5 +1,6 @@
 import type { MessagePacket } from "@nearlink/protocol";
 import type { ConversationStore } from "./conversationStore";
+import { classifyInboundAcceptance, initializeWasmProtocol } from "./wasmProtocol";
 
 export type DeliveryState = "queued" | "sent" | "failed";
 
@@ -77,17 +78,6 @@ function compareDisplayOrder(left: StoredMessage, right: StoredMessage): number 
   const leftOrder = Number.isFinite(left.displayOrder) ? left.displayOrder! : Number.MAX_SAFE_INTEGER;
   const rightOrder = Number.isFinite(right.displayOrder) ? right.displayOrder! : Number.MAX_SAFE_INTEGER;
   return leftOrder - rightOrder;
-}
-
-function samePacket(left: MessagePacket, right: MessagePacket): boolean {
-  return left.version === right.version
-    && left.type === right.type
-    && left.id === right.id
-    && left.room === right.room
-    && left.sender === right.sender
-    && left.senderName === right.senderName
-    && left.createdAt === right.createdAt
-    && left.body === right.body;
 }
 
 function ensureStore(
@@ -403,6 +393,7 @@ export async function saveMessage(message: StoredMessage): Promise<boolean> {
 
 /** Accept a received packet atomically with the room tombstone and message row checks. */
 export async function acceptInboundMessage(message: StoredMessage): Promise<InboundAcceptanceResult> {
+  if (!await initializeWasmProtocol()) throw new Error("Could not initialize protocol acceptance.");
   return withTransaction<InboundAcceptanceResult>(
     "Could not accept the local message",
     [MESSAGE_STORE, ROOM_DELETION_STORE],
@@ -419,14 +410,16 @@ export async function acceptInboundMessage(message: StoredMessage): Promise<Inbo
       let roomMessages: StoredMessage[] | undefined;
       const maybeAccept = () => {
         if (!tombstoneReady || !existingReady || !roomMessages) return;
-        if (deleted) {
-          complete("room_deleted");
+        let decision: ReturnType<typeof classifyInboundAcceptance>;
+        try {
+          decision = classifyInboundAcceptance(message.packet.room, deleted, message.packet, existing?.packet);
+        } catch (error) {
+          setFailure(error);
+          transaction.abort();
           return;
         }
-        if (existing && !samePacket(existing.packet, message.packet)) {
-          complete("conflict");
-          return;
-        }
+        if (decision === "room_deleted") { complete("room_deleted"); return; }
+        if (decision === "conflict") { complete("conflict"); return; }
         if (existing) {
           const accepted: StoredMessage = message.transport === "hub"
             ? { ...existing, transport: "hub", delivery: "sent" }
@@ -518,6 +511,7 @@ export async function reconcileHubReplayOrder(room: string, orderedIds: string[]
 /** Atomically save one verified newest-to-oldest history page before the current oldest row. */
 export async function saveHubHistoryPage(messages: StoredMessage[], cursor: string | null, requestStartOrder: number): Promise<boolean> {
   if (messages.length === 0) return true;
+  if (!await initializeWasmProtocol()) throw new Error("Could not initialize protocol acceptance.");
   const room = messages[0].packet.room;
   if (messages.some((message) => message.packet.room !== room)) {
     throw new Error("A history page must contain messages from one room.");
@@ -542,13 +536,24 @@ export async function saveHubHistoryPage(messages: StoredMessage[], cursor: stri
           return;
         }
         const byId = new Map(roomMessages.map((item) => [item.packet.id, item]));
+        const pagePackets = new Map<string, MessagePacket>();
         for (const candidate of messages) {
-          const existing = byId.get(candidate.packet.id);
-          if (existing && !samePacket(existing.packet, candidate.packet)) {
+          const existing = byId.get(candidate.packet.id)?.packet ?? pagePackets.get(candidate.packet.id);
+          let decision: ReturnType<typeof classifyInboundAcceptance>;
+          try {
+            decision = classifyInboundAcceptance(room, deleted, candidate.packet, existing);
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
+            return;
+          }
+          if (decision === "room_deleted") { complete(false); return; }
+          if (decision === "conflict") {
             setFailure(new Error("A history page ID conflicts with saved message content."));
             transaction.abort();
             return;
           }
+          pagePackets.set(candidate.packet.id, candidate.packet);
         }
 
         const pageIds = new Set(messages.map((item) => item.packet.id));

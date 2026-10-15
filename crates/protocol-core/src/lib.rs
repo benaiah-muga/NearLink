@@ -17,6 +17,83 @@ pub const MAX_HISTORY_PAGE_BYTES: u64 = 512 * 1024;
 pub const MAX_SYNC_INVENTORY_IDS: usize = 4_096;
 pub const MAX_SYNC_PACKET_IDS: usize = 100;
 
+/// Result of comparing one inbound packet with durable message content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundAcceptance {
+    Saved,
+    Duplicate,
+    Conflict,
+    RoomDeleted,
+}
+
+/// Stable, content-free failure codes for inbound acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundAcceptanceError {
+    InvalidRoom,
+    InputTooLarge,
+    InvalidJson,
+    InvalidMessage,
+    RoomMismatch,
+}
+
+impl InboundAcceptanceError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRoom => "invalid_room",
+            Self::InputTooLarge => "input_too_large",
+            Self::InvalidJson => "invalid_json",
+            Self::InvalidMessage => "invalid_message",
+            Self::RoomMismatch => "room_mismatch",
+        }
+    }
+}
+
+/// Classify an inbound packet without performing persistence or transport work.
+/// Callers remain responsible for reading tombstones and rows atomically.
+pub fn classify_inbound_acceptance(
+    expected_room: &str,
+    room_deleted: bool,
+    candidate: &Value,
+    existing: Option<&Value>,
+) -> Result<InboundAcceptance, InboundAcceptanceError> {
+    if !is_protocol_room(expected_room) {
+        return Err(InboundAcceptanceError::InvalidRoom);
+    }
+    if serde_json::to_vec(candidate)
+        .map_err(|_| InboundAcceptanceError::InvalidMessage)?
+        .len()
+        > MAX_PROTOCOL_ENVELOPE_BYTES
+    {
+        return Err(InboundAcceptanceError::InputTooLarge);
+    }
+    if !is_message_packet(candidate) {
+        return Err(InboundAcceptanceError::InvalidMessage);
+    }
+    if text_field(candidate, "room") != Some(expected_room) {
+        return Err(InboundAcceptanceError::RoomMismatch);
+    }
+    if room_deleted {
+        return Ok(InboundAcceptance::RoomDeleted);
+    }
+    if let Some(existing) = existing {
+        if serde_json::to_vec(existing)
+            .map_err(|_| InboundAcceptanceError::InvalidMessage)?
+            .len()
+            > MAX_PROTOCOL_ENVELOPE_BYTES
+            || !is_message_packet(existing)
+            || text_field(existing, "room") != Some(expected_room)
+        {
+            return Err(InboundAcceptanceError::InvalidMessage);
+        }
+        return Ok(if existing == candidate {
+            InboundAcceptance::Duplicate
+        } else {
+            InboundAcceptance::Conflict
+        });
+    }
+    Ok(InboundAcceptance::Saved)
+}
+
 const HUB_WHITESPACE: &[char] = &[
     '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{001c}', '\u{001d}', '\u{001e}',
     '\u{001f}', '\u{0020}', '\u{0085}', '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}',
@@ -541,5 +618,57 @@ mod tests {
         });
         assert!(serde_json::to_vec(&value).unwrap().len() > MAX_PROTOCOL_ENVELOPE_BYTES);
         assert!(!is_message_packet(&value));
+    }
+
+    #[test]
+    fn shared_inbound_acceptance_vectors_match() {
+        let vectors: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../packages/protocol/vectors/inbound-acceptance-v1.json"
+        ))
+        .expect("shared acceptance vectors are valid JSON");
+
+        for vector in vectors {
+            let name = vector["name"].as_str().expect("vector name");
+            let expected_room = vector["expectedRoom"].as_str().expect("expected room");
+            let deleted = vector["roomDeleted"].as_bool().expect("tombstone state");
+            let candidate = vector
+                .get("candidateJson")
+                .and_then(Value::as_str)
+                .map(serde_json::from_str)
+                .transpose();
+            let (candidate, parse_error) = match candidate {
+                Ok(Some(value)) => (Some(value), None),
+                Ok(None) => (vector.get("candidate").cloned(), None),
+                Err(_) => (None, Some(InboundAcceptanceError::InvalidJson)),
+            };
+            let actual = if let Some(error) = parse_error {
+                Err(error)
+            } else {
+                classify_inbound_acceptance(
+                    expected_room,
+                    deleted,
+                    candidate.as_ref().expect("candidate value"),
+                    vector.get("existing"),
+                )
+            };
+            let expected = &vector["expected"];
+            if let Some(outcome) = expected.get("outcome").and_then(Value::as_str) {
+                let actual = actual.expect("expected acceptance outcome");
+                let actual = match actual {
+                    InboundAcceptance::Saved => "saved",
+                    InboundAcceptance::Duplicate => "duplicate",
+                    InboundAcceptance::Conflict => "conflict",
+                    InboundAcceptance::RoomDeleted => "room_deleted",
+                };
+                assert_eq!(actual, outcome, "vector: {name}");
+            } else {
+                let error = actual.expect_err("expected stable acceptance error");
+                assert_eq!(
+                    error.code(),
+                    expected["code"].as_str().unwrap(),
+                    "vector: {name}"
+                );
+            }
+        }
     }
 }

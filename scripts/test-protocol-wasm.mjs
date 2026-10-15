@@ -54,7 +54,7 @@ try {
     `<!doctype html>
 <meta charset="utf-8">
 <script type="module">
-  import init, { validate_json, plan_missing_batch_json, WasmMessageIndex, WasmMissingIdSelector, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
+  import init, { validate_json, classify_inbound_json, plan_missing_batch_json, WasmMessageIndex, WasmMissingIdSelector, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
 
   const check = (condition, label) => {
     if (!condition) throw new Error(label);
@@ -70,9 +70,20 @@ try {
     await init();
     const vectors = await fetch("/vectors.json").then((response) => response.json());
     const syncVectors = await fetch("/sync-state-vectors.json").then((response) => response.json());
+    const acceptanceVectors = await fetch("/inbound-acceptance-vectors.json").then((response) => response.json());
     for (const vector of vectors) {
       const actual = result(validate_json(vector.validator, JSON.stringify(vector.value)));
       check(actual.ok && actual.valid === vector.valid, "protocol vector mismatch");
+    }
+    for (const vector of acceptanceVectors) {
+      const candidateJson = vector.candidateJson ?? JSON.stringify(vector.candidate);
+      const existingJson = vector.existing === undefined ? undefined : JSON.stringify(vector.existing);
+      const actual = result(classify_inbound_json(vector.expectedRoom, vector.roomDeleted, candidateJson, existingJson));
+      const expected = vector.expected.outcome
+        ? { ok: true, outcome: vector.expected.outcome }
+        : { ok: false, code: vector.expected.code };
+      check(JSON.stringify(stable(actual)) === JSON.stringify(stable(expected)), "acceptance vector mismatch: " + vector.name);
+      if (!actual.ok) check(Object.keys(actual).sort().join(",") === "code,ok", "acceptance error leaked packet data");
     }
 
     const packet = (id, body) => JSON.stringify({
@@ -146,6 +157,8 @@ try {
   await writeFile(path.join(temp, "vectors.json"), vectors);
   const syncVectors = await readFile(path.join(root, "packages/protocol/vectors/sync-state-v1.json"));
   await writeFile(path.join(temp, "sync-state-vectors.json"), syncVectors);
+  const acceptanceVectors = await readFile(path.join(root, "packages/protocol/vectors/inbound-acceptance-v1.json"));
+  await writeFile(path.join(temp, "inbound-acceptance-vectors.json"), acceptanceVectors);
 
   server = createServer(async (request, response) => {
     const requested = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
@@ -153,10 +166,12 @@ try {
       ? "vectors.json"
       : requested === "/sync-state-vectors.json"
         ? "sync-state-vectors.json"
+        : requested === "/inbound-acceptance-vectors.json"
+          ? "inbound-acceptance-vectors.json"
         : requested === "/"
           ? "index.html"
           : path.basename(requested);
-    if (filename !== "index.html" && filename !== "vectors.json" && filename !== "sync-state-vectors.json" && !/^[\w.-]+$/.test(filename)) {
+    if (filename !== "index.html" && filename !== "vectors.json" && filename !== "sync-state-vectors.json" && filename !== "inbound-acceptance-vectors.json" && !/^[\w.-]+$/.test(filename)) {
       response.writeHead(404);
       response.end();
       return;

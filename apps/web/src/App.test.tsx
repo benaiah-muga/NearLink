@@ -43,6 +43,13 @@ vi.mock("./lib/wasmProtocol", async () => {
   return {
     MAX_PROTOCOL_ENVELOPE_BYTES: 18 * 1024,
     initializeWasmProtocol: async () => !wasmGate.fail,
+    classifyInboundAcceptance: (expectedRoom: string, roomDeleted: boolean, candidate: MessagePacket, existing?: MessagePacket) => {
+      if (wasmGate.fail) throw new Error("WASM inbound acceptance is unavailable.");
+      if (candidate.room !== expectedRoom) throw new Error("WASM rejected inbound acceptance (room_mismatch).");
+      if (roomDeleted) return "room_deleted";
+      if (!existing) return "saved";
+      return JSON.stringify(candidate) === JSON.stringify(existing) ? "duplicate" : "conflict";
+    },
     validateJsonWithWasm: (validator: string, json: string) => {
       if (wasmGate.fail || json.length > 18 * 1024) return false;
       try {

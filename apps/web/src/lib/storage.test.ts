@@ -3,6 +3,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
 import { acceptInboundMessage, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadIdentity, loadMessages, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
+const classifierGate = vi.hoisted(() => ({ failNext: false }));
+
+vi.mock("./wasmProtocol", () => ({
+  initializeWasmProtocol: async () => true,
+  classifyInboundAcceptance: (expectedRoom: string, roomDeleted: boolean, candidate: MessagePacket, existing?: MessagePacket) => {
+    if (classifierGate.failNext) {
+      classifierGate.failNext = false;
+      throw new Error("WASM inbound acceptance is unavailable.");
+    }
+    if (candidate.room !== expectedRoom) throw new Error("WASM rejected inbound acceptance (room_mismatch).");
+    if (roomDeleted) return "room_deleted";
+    if (!existing) return "saved";
+    return JSON.stringify(candidate) === JSON.stringify(existing) ? "duplicate" : "conflict";
+  },
+}));
+
 const DATABASE_NAME = "nearlink-local";
 
 function openRequest(version?: number): IDBOpenDBRequest {
@@ -36,6 +52,7 @@ function message(id: string, createdAt: string, delivery: StoredMessage["deliver
 }
 
 afterEach(async () => {
+  classifierGate.failNext = false;
   vi.restoreAllMocks();
   await deleteDatabase();
 });
@@ -138,6 +155,16 @@ describe("local IndexedDB storage", () => {
       message: expect.stringContaining("Storage quota exceeded"),
     });
     vi.restoreAllMocks();
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+  });
+
+  it("aborts inbound acceptance when the portable decision fails", async () => {
+    const incoming: StoredMessage = { packet: packet("classifier-failure", "2026-10-14T09:00:00.000Z"), direction: "incoming", delivery: "sent" };
+    classifierGate.failNext = true;
+    await expect(acceptInboundMessage(incoming)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("WASM inbound acceptance is unavailable."),
+    });
     await expect(loadMessages("alpha")).resolves.toEqual([]);
   });
 
