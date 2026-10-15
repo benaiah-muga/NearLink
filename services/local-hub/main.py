@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
+import stat
 import sqlite3
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -607,8 +610,189 @@ def purge_retained_history(path: str | Path, *, room: str | None = None) -> int:
         connection.close()
 
 
+@dataclass(frozen=True)
+class HistoryBackupSummary:
+    path: str
+    message_count: int
+    room_count: int
+    truncated_room_count: int
+    marker_overflow: bool
+
+
+def _history_backup_counts(connection: sqlite3.Connection) -> tuple[int, int, int, bool]:
+    message_count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    room_count = connection.execute("SELECT COUNT(*) FROM room_state").fetchone()[0]
+    truncated_room_count = connection.execute(
+        "SELECT COUNT(*) FROM room_state WHERE history_truncated = 1"
+    ).fetchone()[0]
+    marker_overflow = connection.execute(
+        "SELECT marker_overflow FROM store_state WHERE id = 1"
+    ).fetchone()[0]
+    return message_count, room_count, truncated_room_count, bool(marker_overflow)
+
+
+def _history_backup_fingerprint(connection: sqlite3.Connection) -> str:
+    digest = hashlib.sha256()
+    queries = (
+        "SELECT sequence, room, message_id, packet, packet_bytes, stored_at FROM messages ORDER BY sequence",
+        "SELECT room, history_truncated, touched_at FROM room_state ORDER BY room COLLATE BINARY",
+        "SELECT id, marker_overflow FROM store_state ORDER BY id",
+    )
+    for query in queries:
+        for row in connection.execute(query):
+            digest.update(repr(tuple(row)).encode("utf-8"))
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _path_has_symlink(path: Path) -> bool:
+    """Check each existing path component without following symbolic links."""
+    candidate = path if path.is_absolute() else Path.cwd() / path
+    absolute = Path(candidate.anchor)
+    current = Path(absolute.anchor)
+    for part in candidate.parts[1:]:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def backup_retained_history(source_path: str | Path, output_path: str | Path) -> HistoryBackupSummary:
+    """Create and verify an atomic, owner-only SQLite snapshot of local history."""
+    source = Path(source_path).expanduser()
+    output = Path(output_path).expanduser()
+    if _path_has_symlink(source):
+        raise ValueError("source database path must not contain a symbolic link")
+    source_connection = _open_history_admin_database(source, writable=False)
+
+    temporary_path: Path | None = None
+    temporary_directory: tempfile.TemporaryDirectory | None = None
+    published = False
+    completed = False
+    output_identity: tuple[int, int] | None = None
+    try:
+        if _path_has_symlink(output):
+            raise ValueError("backup destination path must not contain a symbolic link")
+        output_absolute = Path(os.path.abspath(output))
+        parent = output_absolute.parent
+        if not parent.is_dir():
+            raise ValueError("backup destination directory must already exist")
+        parent = parent.resolve(strict=True)
+        output_absolute = parent / output_absolute.name
+        directory = parent
+        while True:
+            directory_mode = directory.stat().st_mode
+            if directory_mode & (stat.S_IWGRP | stat.S_IWOTH) and not directory_mode & stat.S_ISVTX:
+                raise ValueError(
+                    "backup destination path crosses a directory writable by other users without the sticky bit"
+                )
+            if directory.parent == directory:
+                break
+            directory = directory.parent
+        source_real = Path(source).resolve(strict=True)
+        output_real = parent.resolve(strict=True) / output_absolute.name
+        if source_real == output_real:
+            raise ValueError("backup destination must not be the source database")
+        if os.path.lexists(output_absolute):
+            raise ValueError("backup destination already exists")
+
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix=f".{output_absolute.name}.", dir=parent
+        )
+        temporary_path = Path(temporary_directory.name) / "snapshot.sqlite3"
+        descriptor = os.open(
+            temporary_path,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+        # Pin source reads to one SQLite snapshot, including committed WAL rows.
+        source_connection.execute("BEGIN")
+        source_counts = _history_backup_counts(source_connection)
+        source_fingerprint = _history_backup_fingerprint(source_connection)
+        destination_connection = sqlite3.connect(str(temporary_path), timeout=2)
+        try:
+            source_connection.backup(destination_connection)
+            destination_connection.commit()
+        finally:
+            destination_connection.close()
+
+        os.chmod(temporary_path, 0o600)
+        with temporary_path.open("rb") as backup_file:
+            os.fsync(backup_file.fileno())
+
+        verified = _open_history_admin_database(temporary_path, writable=False)
+        try:
+            integrity = verified.execute("PRAGMA integrity_check").fetchall()
+            if len(integrity) != 1 or integrity[0][0] != "ok":
+                raise ValueError("backup failed SQLite integrity check")
+            backup_counts = _history_backup_counts(verified)
+            if backup_counts != source_counts or _history_backup_fingerprint(verified) != source_fingerprint:
+                raise ValueError("backup retained history does not match the source snapshot")
+        finally:
+            verified.close()
+
+        temporary_stat = temporary_path.stat(follow_symlinks=False)
+        output_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        # link() publishes atomically and fails if another process created output.
+        os.link(temporary_path, output_absolute)
+        published = True
+        temporary_path.unlink()
+        temporary_path = None
+        try:
+            directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            raise
+        summary = HistoryBackupSummary(
+            str(output_absolute),
+            backup_counts[0],
+            backup_counts[1],
+            backup_counts[2],
+            backup_counts[3],
+        )
+        completed = True
+        return summary
+    except FileExistsError as error:
+        raise ValueError("backup destination already exists") from error
+    finally:
+        source_connection.close()
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+        if temporary_directory is not None:
+            try:
+                temporary_directory.cleanup()
+            except OSError:
+                pass
+        if published and not completed and output_identity is not None:
+            try:
+                current = output_absolute.stat(follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == output_identity:
+                    output_absolute.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def history_cli(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Inspect or purge local NearLink hub history")
+    parser = argparse.ArgumentParser(description="Inspect, purge, or back up local NearLink hub history")
     commands = parser.add_subparsers(dest="command", required=True)
     history = commands.add_parser("history", help="manage retained room history")
     actions = history.add_subparsers(dest="action", required=True)
@@ -617,6 +801,8 @@ def history_cli(argv: list[str] | None = None) -> int:
     selection = purge.add_mutually_exclusive_group(required=True)
     selection.add_argument("--room", help="purge one room")
     selection.add_argument("--all", action="store_true", help="purge all rooms")
+    backup = actions.add_parser("backup", help="create a verified local history snapshot")
+    backup.add_argument("--output", required=True, help="new destination file in an existing directory")
     args = parser.parse_args(argv)
     path = database_path()
     try:
@@ -625,11 +811,20 @@ def history_cli(argv: list[str] | None = None) -> int:
             print("room\tmessages\thistoryTruncated")
             for room_name, count, truncated in rows:
                 print(f"{room_name}\t{count}\t{str(truncated).lower()}")
-        else:
+        elif args.action == "purge":
             removed = purge_retained_history(path, room=args.room if args.room is not None else None)
             target = f"room {args.room}" if args.room is not None else "all rooms"
             print(f"Purged {removed} message(s) from {target}.")
             print("SQLite file remnants may remain; this command does not securely erase data.")
+        else:
+            summary = backup_retained_history(path, args.output)
+            print(f"Backup created: {summary.path}")
+            print(
+                "Retained rows: "
+                f"{summary.message_count}; room markers: {summary.room_count}; "
+                f"truncated room markers: {summary.truncated_room_count}; "
+                f"marker overflow: {str(summary.marker_overflow).lower()}."
+            )
     except (OSError, sqlite3.Error, ValueError) as error:
         parser.exit(2, f"nearlink hub history: {error}\n")
     return 0

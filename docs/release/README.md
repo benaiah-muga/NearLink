@@ -159,6 +159,7 @@ unsupported database.
 python services/local-hub/main.py history list
 python services/local-hub/main.py history purge --room ROOM_CODE
 python services/local-hub/main.py history purge --all
+python services/local-hub/main.py history backup --output /secure/local/path/nearlink-history.sqlite3
 ```
 
 The list reports retained message counts and each room's `historyTruncated`
@@ -169,6 +170,32 @@ browsers, peers, backups, SQLite pages, or sidecar files. SQLite may retain
 recoverable remnants after deletion. These commands do not securely erase
 history. Hub packets are plaintext, so protect the database directory and
 backups as message content.
+
+The backup command reads the configured existing database through SQLite's
+backup API, so committed rows in a live WAL are included. It only creates a
+new destination in an existing trusted directory, verifies SQLite integrity,
+the hub schema, retained row counts, and truncation markers, then publishes the
+owner-only file atomically. Its working copy stays in a private temporary
+directory. It rejects symbolic-link path components and directories writable
+by other users unless the sticky bit protects their entries. It prints counts
+and marker state without message contents. Stop the hub during routine
+maintenance so no new messages arrive while preparing or restoring a snapshot.
+
+Backups contain plaintext packets and are as sensitive as the live database.
+Restrict access to the backup directory, include backups in retention reviews,
+and remove expired backup files using the normal filesystem process for that
+storage. Deleting a file does not promise secure erasure, and other copies may
+remain in snapshots or storage media.
+
+To restore a snapshot, stop the hub and confirm the configured database path.
+Keep a rollback copy of the current database and its `-wal` and `-shm` sidecars
+in protected storage. Move the active database and any sidecars out of the
+active directory, copy the selected backup to the configured database path,
+and restrict the restored database to its owner. Start the hub and run
+`history list` to confirm the retained counts and truncation markers. This is
+an operator procedure, not a restore command in the hub CLI. Treat rollback
+copies and the selected snapshot as plaintext message data, and remove
+unneeded copies through the normal retention process.
 
 ## 5. Publish and monitor a controlled beta
 

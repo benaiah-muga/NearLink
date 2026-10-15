@@ -57,6 +57,7 @@ offline commands operate on the existing database selected by
 python services/local-hub/main.py history list
 python services/local-hub/main.py history purge --room ROOM_CODE
 python services/local-hub/main.py history purge --all
+python services/local-hub/main.py history backup --output /secure/local/path/nearlink-history.sqlite3
 ```
 
 The list reports retained message counts and whether history may be incomplete.
@@ -66,6 +67,29 @@ complete. The hub will no longer replay purged rows. Purging does not remove
 copies already stored by browsers or peers. The data is plaintext, and SQLite
 pages, WAL or SHM files, and backups may retain recoverable copies. This is not
 secure erasure. Protect the database and backups as message content.
+
+The backup command uses SQLite's backup API to include committed data in a
+live WAL. It requires a new output path in an existing trusted directory,
+writes the working copy inside a private owner-only temporary directory,
+checks integrity, supported schema, retained row counts, and truncation
+markers, then publishes the snapshot atomically. It rejects path components
+that are symbolic links and directories writable by other users unless the
+sticky bit protects their entries. It prints counts and marker state only,
+never message contents. Stop the hub for routine maintenance and before
+restoring a snapshot.
+
+Backups contain plaintext packets and are as sensitive as the live database.
+Restrict access to their directory, review them under the same retention
+schedule as message history, and remove expired copies through the normal
+filesystem process. File deletion does not promise secure erasure.
+
+To restore a snapshot, stop the hub, confirm `NEARLINK_HUB_DB_PATH`, and keep a
+protected rollback copy of the active database with its `-wal` and `-shm`
+sidecars. Move the active database and sidecars out of the active directory,
+copy the chosen snapshot to the configured database path, and restrict it to
+owner access. Start the hub and run `history list` to confirm counts and
+truncation markers. The CLI has no restore command. Treat rollback copies as
+plaintext message data and remove them under the normal retention process.
 
 Connect clients to `ws://127.0.0.1:8000/ws`. Each connection must send a valid
 version 1 `join` packet first. The hub responds with `joined`, which carries a
