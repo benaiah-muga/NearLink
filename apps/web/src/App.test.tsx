@@ -18,6 +18,9 @@ const messageReadGate = vi.hoisted(() => ({
   pending: null as Promise<unknown> | null,
   releaseRead: null as (() => void) | null,
   requestedRooms: [] as string[],
+  ackDispatching: false,
+  ackDispatchRoomReads: 0,
+  rejectAckFallbackRead: false,
   failNextSaveIds: [] as string[],
   failDeleteRoomMessages: false,
   failCancelRoomDeletion: false,
@@ -109,6 +112,13 @@ vi.mock("./lib/storage", async (importOriginal) => {
     },
     loadMessages: (room: string) => {
       messageReadGate.requestedRooms.push(room);
+      if (messageReadGate.ackDispatching && room === messageReadGate.room) {
+        messageReadGate.ackDispatchRoomReads += 1;
+        if (messageReadGate.rejectAckFallbackRead) {
+          messageReadGate.rejectAckFallbackRead = false;
+          return Promise.reject(new Error("Injected message read failure."));
+        }
+      }
       const roomReadCount = messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === room).length;
       if (room === messageReadGate.room && messageReadGate.pending && (messageReadGate.readGateAfter === null || roomReadCount >= messageReadGate.readGateAfter)) {
         return messageReadGate.pending as ReturnType<typeof actual.loadMessages>;
@@ -307,6 +317,9 @@ beforeEach(async () => {
   messageReadGate.pending = null;
   messageReadGate.releaseRead = null;
   messageReadGate.requestedRooms = [];
+  messageReadGate.ackDispatching = false;
+  messageReadGate.ackDispatchRoomReads = 0;
+  messageReadGate.rejectAckFallbackRead = false;
   messageReadGate.failNextSaveIds = [];
   messageReadGate.failDeleteRoomMessages = false;
   messageReadGate.failCancelRoomDeletion = false;
@@ -1371,6 +1384,80 @@ describe("browser app messaging flow", () => {
     await screen.findByText("On frequency");
     expect(screen.queryByText(/A hub message could not be saved or checked/)).toBeNull();
   });
+
+  it("records a hub acknowledgment for a persisted message missing from the React snapshot", async () => {
+    messageReadGate.identityPending = Promise.resolve({ sender: IDENTITY.sender, senderName: "" });
+    render(<App />);
+    await screen.findByText("Start with three details");
+    fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: IDENTITY.senderName } });
+    fireEvent.click(screen.getByRole("button", { name: "Save and join room" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const socket = MockWebSocket.instances[0];
+    act(() => socket.open());
+    act(() => socket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    act(() => socket.receive({ version: 1, type: "presence", room: ROOM, peers: 1 }));
+    await screen.findByText("On frequency");
+    messageReadGate.room = ROOM;
+
+    const packet = {
+      version: 1 as const,
+      type: "message" as const,
+      id: "ack-race-message",
+      room: ROOM,
+      sender: IDENTITY.sender,
+      senderName: IDENTITY.senderName,
+      createdAt: "2026-10-15T00:00:00.000Z",
+      body: "Persisted before its acknowledgment",
+    };
+    await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+    act(() => {
+      messageReadGate.ackDispatching = true;
+      try { socket.receive({ version: 1, type: "ack", id: packet.id }); }
+      finally { messageReadGate.ackDispatching = false; }
+    });
+    expect(messageReadGate.ackDispatchRoomReads).toBe(1);
+    await waitFor(async () => expect((await loadMessages(ROOM)).find((item) => item.packet.id === packet.id)?.delivery).toBe("sent"));
+    const stored = await loadMessages(ROOM);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ packet, direction: "outgoing", delivery: "sent", transport: "hub" });
+  }, 15000);
+
+  it("warns when the persisted message lookup for a hub acknowledgment fails", async () => {
+    messageReadGate.identityPending = Promise.resolve({ sender: IDENTITY.sender, senderName: "" });
+    render(<App />);
+    await screen.findByText("Start with three details");
+    fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: IDENTITY.senderName } });
+    fireEvent.click(screen.getByRole("button", { name: "Save and join room" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    const socket = MockWebSocket.instances[0];
+    act(() => socket.open());
+    act(() => socket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    act(() => socket.receive({ version: 1, type: "presence", room: ROOM, peers: 1 }));
+    await screen.findByText("On frequency");
+    messageReadGate.room = ROOM;
+    const packet = {
+      version: 1 as const,
+      type: "message" as const,
+      id: "ack-read-failure",
+      room: ROOM,
+      sender: IDENTITY.sender,
+      senderName: IDENTITY.senderName,
+      createdAt: "2026-10-15T00:00:00.000Z",
+      body: "Awaiting status confirmation",
+    };
+    await saveMessage({ packet, direction: "outgoing", delivery: "queued", transport: "hub" });
+    messageReadGate.rejectAckFallbackRead = true;
+
+    act(() => {
+      messageReadGate.ackDispatching = true;
+      try { socket.receive({ version: 1, type: "ack", id: packet.id }); }
+      finally { messageReadGate.ackDispatching = false; }
+    });
+
+    expect(messageReadGate.ackDispatchRoomReads).toBe(1);
+    expect(await screen.findByText(/saved outgoing message could not be checked on this device/i)).toBeTruthy();
+    expect((await loadMessages(ROOM))[0]).toMatchObject({ packet, delivery: "queued" });
+  }, 15000);
 
   it("does not replay a conflicted outgoing message when its status save finishes after disconnect", async () => {
     render(<App />);

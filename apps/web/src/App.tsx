@@ -707,14 +707,33 @@ function App() {
           return;
         }
         if (packet.type === "ack") {
-          const pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === room.trim() && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
+          const connectionRoom = room.trim();
+          if (currentRoomRef.current !== connectionRoom) return;
+          let pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
+          if (!pending) {
+            let persisted: StoredMessage[];
+            try {
+              persisted = await conversationStore.loadMessages(connectionRoom);
+            } catch {
+              if (socketRef.current === socket && currentRoomRef.current === connectionRoom) {
+                setNotice("The hub acknowledged a message, but the saved outgoing message could not be checked on this device. Its status was not changed.");
+              }
+              return;
+            }
+            if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+            pending = persisted.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
+          }
           if (!pending) return;
-          let saved = true;
-          try { await conversationStore.updateDelivery(pending.packet.room, packet.id, "sent"); }
-          catch { saved = false; }
-          if (socketRef.current !== socket) return;
-          setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === pending.packet.room ? { ...item, delivery: "sent" } : item));
-          if (!saved) setNotice("The hub accepted your message, but its status could not be saved on this device. It may be retried after reload.");
+          try {
+            await conversationStore.updateDelivery(connectionRoom, packet.id, "sent");
+          } catch {
+            if (socketRef.current === socket && currentRoomRef.current === connectionRoom) {
+              setNotice("The hub accepted your message, but its status could not be saved on this device. It may be retried after reload.");
+            }
+            return;
+          }
+          if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
+          setMessages((current) => current.map((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub" ? { ...item, delivery: "sent" } : item));
           return;
         }
         if (packet.type === "error") {
