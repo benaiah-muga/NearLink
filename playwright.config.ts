@@ -17,10 +17,18 @@ export default defineConfig({
     screenshot: "off",
     video: "off",
   },
-  webServer: {
-    command: "npm run preview --workspace @nearlink/web -- --host 127.0.0.1 --port 4173 --strictPort",
-    url: "http://127.0.0.1:4173",
-    reuseExistingServer: !process.env.CI,
-    timeout: 30_000,
-  },
+  webServer: [
+    {
+      command: "npm run preview --workspace @nearlink/web -- --host 127.0.0.1 --port 4173 --strictPort",
+      url: "http://127.0.0.1:4173",
+      reuseExistingServer: !process.env.CI,
+      timeout: 30_000,
+    },
+    {
+      command: "python3 scripts/start-e2e-hub.py",
+      url: "http://127.0.0.1:8000/health",
+      reuseExistingServer: false,
+      timeout: 30_000,
+    },
+  ],
 });

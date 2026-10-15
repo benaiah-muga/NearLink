@@ -19,9 +19,15 @@ python -m pip install -r services/local-hub/requirements-dev.lock
 The verification command generates the pinned Rust/WASM protocol module, builds
 the web client, runs the web unit and FastAPI hub test suites, and scans tracked
 and non-ignored untracked project files for the em dash character. The
-end-to-end command builds the production client, starts
-Vite preview, and runs the Chromium local-message journey. It scans the initial
-and queued-message screens for WCAG 2.1 A/AA and WCAG 2.2 AA issues with axe. Install the
+end-to-end command builds the production client, starts Vite preview and the
+checked-in FastAPI hub, and runs Chromium journeys. The real-hub journey uses
+two independent browser contexts and a temporary SQLite database. It checks hub
+acceptance separately from recipient persistence, then exercises live delivery,
+reconnect replay, and a bounded history response. It blocks and fails on
+non-loopback HTTP and WebSocket requests. Other journeys cover local queue
+behavior, offline service-worker behavior, synchronization, and direct browser
+communication. The accessibility journeys scan relevant screens for WCAG 2.1
+A/AA and WCAG 2.2 AA issues with axe. Install the
 Playwright Chromium build with:
 
 ```sh
@@ -37,7 +43,7 @@ npx playwright install --with-deps chromium
 Generated output, dependency folders, and the ignored `.unlazy` work ledgers
 are excluded from the em dash scan.
 
-GitHub Actions runs the same build, unit, hub, Chromium journey, Rust, and
+GitHub Actions runs the same build, unit, hub, Chromium journeys, Rust, and
 em dash checks on pushes to `main` and pull requests. It also audits npm,
 Python, and Rust dependencies for known advisories. The browser journey covers
 Chromium desktop only. It does not replace the physical-device and browser
