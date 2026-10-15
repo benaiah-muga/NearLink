@@ -116,10 +116,43 @@ local-state patterns. They are not a comprehensive scan of file contents, so
 reviewers must still inspect the source and generated bundle for accidental
 secrets before approving distribution.
 
-The workflow pins Node 24.18.0, Rust 1.84.1, and wasm-bindgen 0.2.103. It
-records the npm version and Ubuntu runner platform in the manifest, but does
-not pin their patch or image-build versions. Python is not used by this
-artifact pipeline.
+The release artifact builder pins Node 24.18.0, Rust 1.84.1, and
+wasm-bindgen 0.2.103. It records the npm version and Ubuntu runner platform in
+the manifest, but does not pin their patch or image-build versions. The builder
+uses GNU tar and gzip. Python is used by the CI archive verifier and extractor.
+
+The main foundation CI workflow builds the same web and source archives from
+its clean checkout, then runs the packaged web smoke against that archive. The
+archive verifier checks the web checksum and size in `SHA256SUMS.json`, requires
+the expected package root and PWA files, and rejects traversal paths, duplicate
+members, file/directory collisions, links and other special filesystem entries,
+and common secret or local-state paths. It caps the manifest at 1 MiB, the
+compressed archive at 16 MiB, the decompressed tar at 128 MiB, the archive at
+10,000 members, and individual and total extracted file data at 64 MiB and
+128 MiB. It extracts regular files manually into a temporary directory.
+Chromium serves that extracted directory on loopback,
+checks the application JavaScript, CSS, WASM loader and binary, then saves a
+profile and queued message. The journey makes the package origin return 503,
+requires the navigation response to come from the service worker's CacheStorage
+fallback, verifies the same IndexedDB row remains queued, restores the origin,
+and proves that the local hub accepts that row once.
+
+This is automated same-host evidence for the release web archive path. It does
+not test a downloaded artifact on a separate machine, installation as a PWA,
+operating-system browser support, two-device networking, or release approval.
+For local checks, run `npm run test:package-archive` for adversarial archive
+fixtures. The packaged browser journey needs an artifact directory produced by
+the clean-checkout release command:
+
+```sh
+NEARLINK_REVIEW_ARTIFACT_DIR=/tmp/nearlink-review-artifact
+NEARLINK_RELEASE_VERSION=0.1.0 NEARLINK_ARTIFACT_DIR="$NEARLINK_REVIEW_ARTIFACT_DIR" npm run release:candidate-artifact
+npm run test:packaged-smoke -- "$NEARLINK_REVIEW_ARTIFACT_DIR"
+```
+
+The CI workflow runs the archive fixtures and browser journey after creating
+the candidate archive. This smoke does not change the review artifact workflow
+into a release, and it creates no tag or public distribution.
 
 For local script behavior tests, run `npm run test:release-artifact`. To run
 the full artifact pipeline locally, use a clean checkout with Node 24.18.0, Rust

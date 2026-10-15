@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: npm
       - uses: actions/setup-python@v6
         with:
@@ -41,6 +41,15 @@ jobs:
       - run: cargo +1.84.1 test --manifest-path crates/protocol-wasm/Cargo.toml --locked
       - run: cargo +1.84.1 clippy --manifest-path crates/protocol-wasm/Cargo.toml --locked -- -D warnings
       - run: npm run test:wasm
+      - name: Build release archives for the packaged smoke
+        run: node scripts/build-release-candidate.mjs
+        env:
+          NEARLINK_RELEASE_VERSION: 0.1.0
+          NEARLINK_ARTIFACT_DIR: ${{ runner.temp }}/nearlink-package-smoke-artifact
+      - name: Verify and extract the web archive
+        run: npm run test:package-archive
+      - name: Smoke test the extracted release web archive
+        run: npm run test:packaged-smoke -- "$RUNNER_TEMP/nearlink-package-smoke-artifact"
 
   security-audit:
     runs-on: ubuntu-24.04

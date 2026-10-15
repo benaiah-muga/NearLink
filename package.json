@@ -21,6 +21,8 @@
     "test:e2e:direct-cross-browser": "npm run build && playwright test e2e/direct-cross-browser.spec.ts --project=firefox-smoke",
     "test:wasm": "node scripts/test-protocol-wasm.mjs",
     "test:release-artifact": "node --test scripts/build-release-candidate.test.mjs",
+    "test:package-archive": "python3 scripts/test-inspect-web-archive.py",
+    "test:packaged-smoke": "node scripts/run-packaged-smoke.mjs",
     "release:candidate-artifact": "node scripts/build-release-candidate.mjs",
     "verify:all": "node scripts/verify-foundation.mjs",
     "verify:foundation": "node scripts/verify-foundation.mjs"
