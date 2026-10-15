@@ -1,6 +1,7 @@
 # MLS implementation investigation
 
-Status: implementation candidate, not approved for a security claim
+Status: candidate research and compatibility evidence, no implementation
+candidate selected and no security claim approved
 
 Research snapshot: 2026-10-15. Repository support statements below were checked
 against `mls-rs` commit `d4c5b19f4bbf8a931face27fc9e30f2db33ce83e` and OpenMLS
@@ -157,18 +158,28 @@ weaken a row to make a candidate pass.
 ## Proposed identity verification behavior
 
 The QR flow is a proposal and must be reviewed with the credential profile
-before implementation. It verifies a device credential key against the
-identity binding displayed by the app. It does not prove a civil identity or
-that a human controls a device.
+before implementation. The candidate-neutral [initial MLS deployment profile
+and decision register](initial-mls-deployment-profile.md) proposes exact OOB
+comparison of device identity and the exact KeyPackage reference used for
+admission. It verifies a device credential key against the identity binding
+displayed by the app. It does not prove a civil identity or that a human
+controls a device.
 
-The proposed QR payload contains a format version, the canonical encoding of
-the application identity-to-device credential binding, the credential type,
-and the MLS credential public authentication key. It contains no private key,
-group secret, message key, or one-time KeyPackage. The displayed fingerprint
-is the full SHA-256 digest of the domain-separated canonical payload:
+The proposed identity-verification QR contains a format version, the canonical
+encoding of the application identity-to-device credential binding, the
+credential type, and the MLS credential public authentication key. It contains
+no private key, group secret, message key, or one-time KeyPackage. It is
+separate from the invitation QR, which carries the invitee's public one-use
+KeyPackage and reference as described in the
+[identity and authorization profile](identity-and-authorization-profile.md).
+The displayed fingerprint is the full SHA-256 digest of the domain-separated
+identity-verification payload:
 `SHA-256("NearLink MLS credential fingerprint v1" || canonical_payload)`.
-The canonical encoding and trust root for the identity binding must be fixed in
-the selected profile and independently reviewed before this format is frozen.
+The profile recommends assessing RFC 8785 JSON Canonicalization Scheme for
+application-owned binding data, but does not freeze that encoding. The
+canonical encoding and trust root for the identity binding must be selected
+and independently reviewed before this format is frozen. RFC 8785 does not
+replace MLS serialization or establish identity.
 Users compare by scanning a peer's QR in person or by comparing the complete
 fingerprint through another trusted channel. A shortened fingerprint may be
 used for display only if the full value remains available for comparison.
@@ -229,8 +240,12 @@ documented as limits, not described as solved by MLS.
 
 ## Delivery and partition model
 
-The delivery topology is an open architecture decision. NearLink must compare
-at least these deployment shapes:
+The proposed initial topology is one optional local hub for hub delivery and
+direct peer delivery for exactly two-member groups. This is a candidate-neutral
+design baseline, not a library selection or validated feasibility result. The
+profile and its decision register are in
+[initial-mls-deployment-profile.md](initial-mls-deployment-profile.md). Future
+topologies require a reviewed profile revision. The baseline includes:
 
 1. An optional local hub performing DS functions for devices on the same LAN.
 2. Direct peer-to-peer delivery for a two-member conversation, with the
@@ -238,11 +253,11 @@ at least these deployment shapes:
 3. Any future multi-device or offline store-and-forward arrangement, which
    must not require a remote cloud service for core local communication.
 
-For each shape, document where AS functions and initial KeyPackages live, what
-the DS can observe, how clients order Commit messages, and how a returning
-client catches up. RFC 9750 describes strongly consistent and eventually
-consistent DS approaches. The implementation must choose and test a compatible
-policy rather than assuming MLS itself provides one global delivery order.
+The initial profile has no centralized AS. Clients validate credential
+bindings and exact out-of-band comparisons. The local hub is only a DS. RFC
+9750 describes strongly consistent and eventually consistent DS approaches.
+An implementation must prove its ordering policy and test catch-up behavior;
+MLS itself does not provide one global delivery order.
 
 During a network partition, delivery and group state progress may pause. The
 design must define how clients detect a missing or conflicting Commit, avoid

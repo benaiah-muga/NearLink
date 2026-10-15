@@ -1,12 +1,15 @@
 # Identity and authorization profile proposal
 
-Status: proposal pending independent security review
+Status: proposed initial profile, pending independent security review
 
-This document proposes a conservative identity, group authorization, delivery,
-and storage profile for NearLink. It is a design artifact, not an implementation
-description or security assessment. Decisions below must be checked against the
-selected MLS library, supported platforms, and a complete threat model before
-implementation.
+This document specifies identity, group authorization, delivery, and storage
+policy for NearLink's proposed initial deployment. The candidate-neutral
+[initial MLS deployment profile and decision register](initial-mls-deployment-profile.md)
+is the review index for proposed scope and unresolved feasibility gates. This
+document remains a design artifact, not an implementation description or
+security assessment. No MLS library, provider, cipher suite, or target has been
+selected. Proposed decisions require independent review and implementation
+feasibility evidence before use.
 
 ## Current implementation status
 
@@ -72,11 +75,15 @@ policy accepts its binding and succession from any previously trusted key.
 
 ### Verification and changed credentials
 
-The initial state for every discovered device is `unverified`. A user can
-verify a device by scanning its NearLink QR code in person or by comparing its
-full credential fingerprint through another trusted channel. The QR contains
-public identity-binding data and public key material only. It must not contain
-private keys, group secrets, recovery secrets, or a one-time KeyPackage.
+The initial state for every discovered device is `unverified`. Both sides of an
+admission, the owner and invitee, must verify the other's full credential
+fingerprint through an in-person QR scan or another trusted channel. The
+identity-verification QR contains stable public identity-binding data and
+public key material only. It is separate from an invitation QR and contains
+no one-time KeyPackage, private key, group secret, or recovery secret. An
+invitation QR carries the invitee's public one-use KeyPackage and its
+reference, but is not identity evidence and cannot replace reciprocal OOB
+verification.
 
 The fingerprint is calculated over a versioned, domain-separated canonical
 encoding after the encoding has been independently reviewed. Keep the full
@@ -115,10 +122,17 @@ The first group policy is owner-controlled:
    other than the owner may send application messages, but may not commit an
    Add, Remove, Update, external commit, or any other group-state change.
 3. The owner may create a Commit only after explicitly approving one policy
-   action: adding one verified device, removing one non-owner device, or
-   rotating the owner's own credential with an old-key-authorized successor.
-   Batching several membership actions into one Commit is not allowed by the
-   initial profile.
+   action: adding one mutually OOB-verified device, removing one non-owner
+   device, or applying one authenticated Update proposal. The rotating member
+   creates an Update proposal for its own leaf. For non-owner rotation, the
+   owner includes that proposal in the sole Commit after the owner and member
+   complete reciprocal OOB comparison and every current member verifies the
+   new fingerprint. The non-owner never creates a Commit. The owner authors
+   its own Update proposal when rotating its credential. [RFC 9420, Section
+   12.1.2](https://www.rfc-editor.org/rfc/rfc9420.html#section-12.1.2) defines
+   Update as replacing the sender's leaf, so another member cannot originate
+   that proposal for the rotating member. Batching several
+   membership actions into one Commit is not allowed by the initial profile.
 4. Owner self-removal, owner replacement, external commits, and group-policy
    changes are prohibited. The policy version and owner device identifier are
    fixed for the lifetime of the group. Owner key rotation preserves the owner
@@ -136,26 +150,29 @@ provided MLS messages. The exact policy encoding and selected MLS API are
 implementation gates. Before implementation, a prototype and independent
 review must demonstrate rejection of non-owner Commits, external commits,
 owner self-removal, unauthorized credential updates, policy changes, malformed
-or stale Commits, and Commits with unrelated or batched proposals. If the
-selected library cannot expose enough authenticated Commit data to enforce
-these rules before state advancement, it is unsuitable for this profile. No
+or stale Commits, and Commits with unrelated or batched proposals. It must
+also prove that a non-owner Update proposal is authenticated as originating
+from that member, replaces only that member's leaf, and changes no group state
+until included in an owner-created Commit after OOB approval. The selected
+library must expose enough proposal and Commit data to enforce these rules
+before state advancement. If it cannot, it is unsuitable for this profile. No
 product implementation may treat an owner name or sender string as sufficient
 authorization.
 
 ### Admission binds verification to the exact KeyPackage
 
-Out-of-band comparison must cover the exact MLS KeyPackage that the owner
-admits, not only a long-lived device fingerprint. The proposed invite QR
-contains the credential binding, its full fingerprint, the serialized
-KeyPackage, and the MLS KeyPackage reference computed according to RFC 9420.
-The invitee shows the same full fingerprint and KeyPackage reference for the
-owner to compare through the trusted channel. The owner validates the
-KeyPackage, verifies that its credential key matches the OOB-verified binding,
-checks that the KeyPackage has not been used or superseded, and admits that
-exact object. The accepted Commit and Welcome must correspond to that admitted
-KeyPackage. A regenerated, expired, already-used, or otherwise changed package
-requires a new OOB comparison. QR data contains public material only, and
-KeyPackages are treated as one-use material according to the protocol.
+The identity-verification QR and invitation QR are different objects. The
+identity-verification QR contains the stable public credential binding and
+fingerprint only. Owner and invitee first compare each other's fingerprints
+through a trusted channel. Separately, the invitation QR contains the
+invitee's public, one-use serialized KeyPackage, credential fingerprint, and
+MLS KeyPackage reference computed according to RFC 9420. The owner verifies
+that its key matches the mutually verified invitee credential, checks the
+reference and one-use status, and admits that exact object. The accepted Commit
+and Welcome must correspond to that package. A regenerated, expired, used, or
+changed package requires a new package confirmation. The invitation QR is not
+identity evidence and does not verify the owner. Both QR types contain public
+material only.
 
 If the chosen library or application flow cannot bind the OOB-confirmed
 KeyPackage reference to the exact Add and corresponding Welcome, admission is
@@ -164,13 +181,14 @@ credential fingerprint comparison as approval of an arbitrary later package.
 
 ### Owner loss and group continuation
 
-If the owner device is lost, destroyed, unavailable indefinitely, or its
-credential is revoked, remaining members may continue exchanging application
+If the owner device is lost, destroyed, or unavailable indefinitely without
+suspected compromise, remaining members may continue exchanging application
 messages under the current group epoch if their MLS state remains valid. They
 cannot add or remove members, transfer ownership, or recover the lost owner's
-identity under this profile. Membership changes are frozen. An offline owner
-cannot receive a revocation request; the group continues at its last shared
-epoch until the owner returns or members abandon it and create a new group.
+identity under this profile. Membership changes are frozen. There is no
+mechanism to revoke the owner from the existing group. If owner compromise is
+suspected, members freeze state changes and admissions, stop trusting the
+group, and create a new group only after fresh OOB verification.
 
 To continue with membership changes, remaining members create a new group and
 re-verify and re-invite the desired devices. The old group remains separate;
@@ -183,34 +201,47 @@ making the hub an implicit trust root.
 
 ### Routine rotation
 
-A device key rotation creates a new credential sequence. Where the old key is
-available, it authorizes its successor. The application checks the transition,
-shows a changed-key notice, and requires a fresh out-of-band comparison before
-preserving the user's verified-device status. A new credential does not inherit
-the old fingerprint pin automatically. Exact rotation timing and credential
-expiry are unresolved pending library and usability review.
+A routine owner or non-owner key rotation creates a new credential sequence.
+The rotating member's old key authenticates an MLS Update proposal replacing
+its own leaf, as required by [RFC 9420, Section
+12.1.2](https://www.rfc-editor.org/rfc/rfc9420.html#section-12.1.2). For non-owner rotation,
+only the group owner may include that proposal in a Commit, after reciprocal
+OOB comparison with the member and fresh fingerprint verification by every
+current member. The non-owner does not create a Commit. The owner creates its
+own Update proposal and Commit for owner rotation. A new credential never
+inherits a verification pin automatically. The exact selected library must
+prove proposal authorship, replacement-leaf binding, owner-only inclusion,
+and no state advance before the owner Commit. Rotation timing and expiry
+remain unresolved pending library and usability review. If the old key is
+unavailable or compromise is suspected, succession is prohibited: the owner
+removes the old non-owner credential and separately adds a newly identified,
+mutually OOB-verified device.
 
 ### Lost or compromised device revocation
 
-The group owner removes the affected device with an MLS membership change.
-Revocation takes effect for a member only when it has accepted the removal
-Commit and advanced to the resulting epoch. The removed device does not receive
-new epoch secrets through that Commit and cannot create valid application
-messages for the new epoch. An offline device cannot be revoked at a distance
-until an authorized owner creates the removal Commit, and it may still send
-messages for an old epoch while disconnected. On receiving the removal Commit,
-remaining members reject messages from earlier epochs, including valid old
-epoch messages that were delayed in transit. Such delayed messages are marked
-unavailable and are not decrypted or displayed after the new epoch is
-accepted. This is an intentional loss policy to avoid displaying a message
-from a state that predates the accepted membership change. A member may already
-have copied old plaintext or old-epoch secrets. Revocation cannot undo that
-access or retract delivered messages.
+The group owner removes the affected device with an MLS Remove Commit.
+Surviving members process and persist that Commit to advance to the new epoch.
+The removed device is excluded from that epoch, does not receive its epoch
+secret, and does not process the Commit as a member of the resulting group.
+Therefore revocation takes effect in each surviving member's state when that
+member durably applies the Commit, not when the removed device acknowledges it.
+An offline removed device can retain stale state and create old-epoch messages
+until notified; surviving members that applied the removal reject those
+messages, including delayed messages from earlier epochs. This loss policy
+does not invalidate plaintext or secrets already copied by that device.
 
-If the owner device itself is lost or compromised, the owner cannot be
-replaced under this profile. Remaining members may continue the existing group
-without membership changes or create a new group and re-invite members after
-verification.
+If a non-owner device is lost without suspected compromise, the owner may leave
+it in the group until its return or remove it with one Remove Commit. If its
+credential is suspected compromised, remove it promptly; do not accept a
+successor authorized by that credential. A new installation receives a new
+identity and must complete mutual OOB verification before a separate Add. If
+the owner is unavailable or its device is lost without suspected compromise,
+remaining members may continue at their last shared epoch but cannot change
+membership. If owner compromise is suspected, the compromised key retains
+protocol authority and other clients cannot distinguish its holder from the
+owner. Members freeze state changes and admissions, stop trusting the group,
+and create a new group only after fresh OOB verification. The owner cannot be
+replaced under this profile.
 
 ### Recovery
 
@@ -262,6 +293,18 @@ clients accept its consistent log; it is not a cryptographic trust root.
 - It stores the envelope and sequence durably before acknowledging or
   broadcasting it.
 - It broadcasts the same sequence order to all connected group members.
+- It delivers the exact serialized invitee-addressed Welcome as an opaque log
+  entry to existing group members and the designated invitee. Only the
+  designated invitee passes the bytes to MLS Welcome processing. Existing
+  members validate the sequence, previous hash, and envelope hash, then persist
+  only their delivery cursor. They do not pass the Welcome to MLS and do not
+  mutate group state because of that entry. The Welcome's GroupSecrets are
+  encrypted to the invitee's KeyPackage. Existing members and the hub still
+  observe the invitation event and routing, size, and timing metadata.
+- An identical sequence and hash is an idempotent transport no-op. Different
+  bytes or hash at an already seen sequence freeze the group. A sequence gap
+  pauses group changes and triggers bounded repair; clients never skip a
+  Welcome entry. Identical Welcome bytes retain their original sequence.
 - Every history page includes the group identifier, sequence, canonical
   envelope hash, previous sequence hash, and a retention/truncation marker.
   The hash chain is over the canonical sequence and envelope bytes.
@@ -302,24 +345,71 @@ old group identifier at sequence 1.
 
 Hub hash chains make inconsistent views detectable when clients compare
 checkpoints; they do not stop a hub from presenting one internally consistent
-but stale view to a client with no prior checkpoint. A new client must obtain
-the current group checkpoint from a trusted existing member through the
-authenticated invite flow. Checkpoint comparison is required after a suspected
-rollback or hub change. No claim is made that a hub can prove completeness of
-history by itself.
+but stale view to a client with no prior checkpoint. The new invitee computes
+and checks the exact Welcome envelope hash and uses its bytes to create pending
+MLS join state. The hub-assigned Welcome sequence/hash remains provisional; it
+is not yet a trusted transport cursor. The invitee does not replay pre-join
+history. It then receives an MLS-authenticated checkpoint from the verified
+owner. The payload contains the immutable group identifier, epoch, epoch
+authenticator, and the exact Welcome sequence/hash. The client checks group
+and epoch against its pending MLS state and rejects any different Welcome
+cursor. Only after this authentication succeeds does one durable transaction
+promote the pending join state and Welcome cursor, process the checkpoint, and
+persist the checkpoint envelope's own sequence and hash as its active
+contiguous cursor. It requests history only after that cursor. A mismatch is
+not acknowledged, does not promote the cursor, and does not fetch any prefix;
+retry the identical checkpoint or abandon and recreate the group after fresh
+OOB verification. An existing client uses its locally persisted checkpoint
+on reconnect or hub change. If the hub cannot continue from that exact
+checkpoint, the client freezes the group; it
+does not accept a fresh lower checkpoint from the hub. A new or restored hub
+log cannot bootstrap continuity by itself. If no common authenticated
+checkpoint can be established, members create a new group and repeat OOB
+verification. No claim is made that a hub can prove completeness of history
+by itself.
+
+Admission has a strict barrier. From ordering the Add Commit until the invitee
+accepts the checkpoint, no MLS envelope may be transmitted except the ordered
+Welcome entry and the owner's first application checkpoint envelope. This
+includes proposals such as a non-owner's authenticated Update proposal.
+Proposal creation may be queued locally, but transmission waits until
+checkpoint acceptance. The hub orders the checkpoint after the Welcome/Add
+transition. The payload identifies the cursor immediately before that
+envelope, not the checkpoint's own cursor. The invitee validates that
+predecessor and persists the checkpoint envelope's own ordered sequence and
+hash before requesting later history. Only after checkpoint acceptance may
+the invitee send its authenticated delivery ACK and members resume application
+sends or transmit queued proposals. No later Commit may be created until the
+invitee ACK confirms durable checkpoint and cursor persistence. The owner
+retransmits identical checkpoint bytes after loss. A missing checkpoint or
+ACK keeps Commits blocked, so the invitee cannot be forced to decrypt a later
+epoch before the checkpoint.
 
 This gives a local hub an ordering role, not authority to create members,
 authenticate identities, or learn MLS secrets. The hub can still observe
-routing metadata, suppress delivery, or make a group unavailable. The design
-must later specify behavior for multiple hub processes, hub database rollback,
-and a client reconnecting to a different hub. No cloud service is required.
+routing metadata, suppress delivery, or make a group unavailable. The initial
+profile supports one hub process per group at a time. Multiple concurrent hubs
+remain unsupported. Rollback freezes clients with a prior checkpoint, while a
+new member bootstraps only from the verified owner's group-authenticated
+checkpoint after Welcome processing under the admission barrier above. No
+cloud service is required.
 
 ### Direct peer transport
 
 Direct transport uses the same MLS envelopes and group state as hub delivery.
 It does not add a second identity or encryption protocol. In the initial
 direct adapter, a group has exactly two members and only its owner may create
-Commits. The owner serializes all Commits through one durable per-group state
+Commits. During admission, from the Add Commit until checkpoint acceptance,
+neither client transmits any MLS envelope except Welcome and the owner's first
+application checkpoint; proposals may be created locally but remain queued.
+The owner sends the group ID, epoch, and epoch authenticator as the first
+application envelope after Welcome. The invitee persists it before sending an
+authenticated ACK. The owner blocks later Commits until that ACK is
+durably recorded and retransmits identical checkpoint bytes after loss. Direct
+mode uses its persisted per-group generation and processed-envelope record,
+not a hub sequence/hash cursor. If the checkpoint or ACK is missing, the group
+stays at that epoch and cannot skip to another Commit. The owner serializes all
+Commits through one durable per-group state
 actor and permits only one unacknowledged Commit at a time. The owner sends the
 same Commit bytes again on retry; it never creates a replacement Commit for
 the same pending transition. The other member accepts only the next Commit
@@ -439,8 +529,15 @@ implemented by this document.
 
 - New devices start unverified; changing display names does not change device
   identity or verification.
-- Exact out-of-band comparison can mark a device verified; an altered key or
-  binding clears that state and requires a new comparison.
+- Owner and invitee each verify the other's full credential fingerprint out of
+  band before admission. Identity-verification QR and invitation QR are
+  distinct; the invitation carries only public one-use KeyPackage material
+  and its reference cannot replace reciprocal identity verification.
+- A changed key or binding clears its verification state. Routine rotation
+  uses a member-authenticated Update proposal and owner-issued Commit, with
+  fresh verification by every current member. Lost or suspected compromised
+  non-owner keys are removed and replaced through a separate new-identity
+  invitation.
 - Invalid credentials, unsupported profile versions, malformed canonical
   encodings, and invalid succession chains are rejected.
 - A room code, sender string, display name, IP address, or hub response cannot
@@ -452,20 +549,28 @@ implemented by this document.
 
 - Only the owner can add or remove a device; non-owner membership Commits are
   rejected by every client.
+- Hub groups never exceed the proposed 16-device cap, and direct groups
+  contain exactly two devices. Size and storage limits are measured on every
+  selected target before implementation.
 - An owner-approved addition validates the credential and accepts only the
   exact OOB-confirmed KeyPackage reference and matching Welcome for the
   accepted Commit. A substituted, replayed, regenerated, or stale KeyPackage
   is rejected.
 - Non-owner Commits, external commits, owner self-removal, policy changes,
   unauthorized Updates, and batched membership actions are rejected before
-  state advances.
+  state advances. A permitted non-owner-authored Update proposal changes no
+  state unless the owner includes it in its Commit after OOB checks. The
+  selected MLS library must authenticate the proposal sender, bind the Update
+  to that sender's own leaf, and reject another member originating it.
 - Removed members cannot create a valid new-epoch application message for
   remaining clients.
-- Valid old-epoch messages delayed until after a removal Commit are rejected
-  and not displayed. Offline revocation is not represented as complete until
-  the owner creates the Commit.
-- Owner loss freezes membership changes and does not trigger automatic owner
-  election or recovery.
+- A Remove Commit advances surviving members only when each durably applies
+  it. The removed member is not expected to ACK or advance into the new epoch;
+  survivors reject its stale-epoch traffic after applying the Commit.
+- Owner loss without suspected compromise freezes membership. Suspected owner
+  compromise freezes trust in that group and requires a fresh group; a
+  compromised owner credential retains protocol authority until clients stop
+  accepting it.
 - New-group recovery requires explicit credential verification and invites.
 
 ### Ordering, partitions, and storage
@@ -473,12 +578,42 @@ implemented by this document.
 - Hub clients observe one durable ordered sequence across sender echo, replay,
   reconnect, and history repair. Sequence values are scoped to the MLS group
   identifier, cover all MLS envelopes, and never reset.
+- Existing members receiving a Welcome advance only the transport sequence and
+  hash cursor. The invitee alone invokes MLS Welcome processing. Tests verify
+  exact duplicate no-op, same-sequence conflict freeze, gap repair, and no
+  existing-member MLS state mutation.
 - Duplicated envelopes are idempotent; missing sequence numbers pause group
   changes; conflicting same-epoch Commits never silently advance state.
 - A hub history rollback, broken hash chain, or different envelope at an
-  already seen sequence freezes the group. Checkpoint comparison detects
-  inconsistent views; a new client requires a current checkpoint from a
-  trusted existing member.
+  already seen sequence freezes the group. New members obtain the checkpoint
+  from the OOB-verified owner in an MLS-authenticated application message after
+  Welcome processing, then fetch only later history. Existing clients resume
+  from their persisted checkpoint. The hub cannot bootstrap or lower it.
+- On hub admission, verify that Welcome's assigned sequence/hash remains
+  provisional until an authenticated checkpoint confirms the exact pair. The
+  checkpoint is the first application envelope after Welcome. A matching
+  checkpoint atomically promotes the join state and Welcome cursor, persists
+  the checkpoint envelope's own sequence/hash, and starts history after it
+  without replaying pre-join history. Reject a mismatched predecessor without
+  cursor promotion or history fetch. On direct admission, verify the same
+  first-envelope barrier with the direct generation/dedup cursor.
+- Later Commits remain blocked until the invitee's authenticated ACK proves
+  durable checkpoint state and cursor persistence. Lost checkpoints retransmit
+  identical bytes; lost ACKs cannot release the Commit barrier or create a
+  checkpoint/epoch cycle.
+- On admission, all members pause application sends after the Add Commit. The
+  owner checkpoint is the first post-Welcome application envelope. For hub
+  delivery, its payload names the preceding sequence/hash; the invitee verifies
+  that predecessor and persists the checkpoint envelope's own sequence/hash.
+  For direct delivery, the invitee persists its generation/dedup state. In
+  both modes the owner blocks later Commits until the invitee's authenticated
+  durable ACK, and retries use identical checkpoint bytes.
+- Test the complete admission interval: from Add Commit through checkpoint
+  acceptance, no MLS envelope other than the ordered Welcome and first
+  checkpoint is transmitted. A queued member Update proposal cannot enter the
+  interval or take a hub sequence. The invitee's authenticated delivery ACK is
+  sent only after checkpoint acceptance; application envelopes and queued
+  proposals resume afterward.
 - In direct two-member mode, only the owner creates one Commit at a time, waits
   for an authenticated acknowledgment before the next Commit, retransmits the
   identical pending Commit after disconnect, and freezes on conflicting
@@ -521,9 +656,14 @@ credential binding and fingerprint, group policy encoding, owner authorization
 checks, credential lifetime and rotation rules, direct-transport recovery,
 MLS state transaction model, endpoint key handling, and exact library/provider
 profile. Product decisions remain open for account semantics, multiple-device
-management, expiry interval, whether message queues send old-epoch messages
-after reconnection, and any future owner succession or encrypted recovery.
+management, expiry interval, and whether message queues send old-epoch messages
+after reconnection. Owner succession and encrypted recovery are prohibited by
+this initial profile. Either capability requires a future profile revision
+that defines its authority and key-handling model and receives independent
+security review before implementation.
 
+The proposed deployment choices are summarized in the
+[candidate-neutral decision register](initial-mls-deployment-profile.md).
 Until those reviews and the full implementation gates pass, current NearLink
 behavior and security claims remain as documented in the
 [`threat model`](threat-model.md) and [`MLS investigation`](mls-architecture.md).
