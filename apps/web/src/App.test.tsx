@@ -468,6 +468,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   if (originalStorageDescriptor) Object.defineProperty(navigator, "storage", originalStorageDescriptor);
   else Reflect.deleteProperty(navigator, "storage");
   if (originalClipboardDescriptor) Object.defineProperty(navigator, "clipboard", originalClipboardDescriptor);
@@ -478,6 +479,141 @@ afterEach(() => {
   else Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("hub join handshake", () => {
+  async function enableFakeTimersAfterReady(): Promise<void> {
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    vi.useFakeTimers();
+  }
+
+  async function advance(ms: number): Promise<void> {
+    await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  }
+
+  it("times out an open socket without joined and caps backoff before join", async () => {
+    render(<App />);
+    await enableFakeTimersAfterReady();
+
+    const retryDelays = [2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+    for (const [index, retryDelay] of retryDelays.entries()) {
+      const socket = MockWebSocket.instances[index];
+      expect(socket).toBeDefined();
+      act(() => socket.open());
+      await advance(10_000);
+      expect(socket.readyState).toBe(MockWebSocket.CLOSED);
+      expect(screen.getByText("The hub did not confirm the room join. The radio will retry.")).toBeTruthy();
+      await advance(retryDelay - 1);
+      expect(MockWebSocket.instances).toHaveLength(index + 1);
+      await advance(1);
+      expect(MockWebSocket.instances).toHaveLength(index + 2);
+    }
+  });
+
+  it("clears the join timeout on a validated join and resets the retry delay", async () => {
+    render(<App />);
+    await enableFakeTimersAfterReady();
+
+    const firstSocket = MockWebSocket.instances[0];
+    act(() => firstSocket.open());
+    await advance(10_000);
+    await advance(1_999);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    await advance(1);
+
+    const joinedSocket = MockWebSocket.instances[1];
+    act(() => joinedSocket.open());
+    act(() => joinedSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    expect(screen.getByText("On frequency")).toBeTruthy();
+    await advance(10_000);
+    expect(joinedSocket.readyState).toBe(MockWebSocket.OPEN);
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    act(() => joinedSocket.close());
+    await advance(0);
+    await advance(1_999);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    await advance(1);
+    expect(MockWebSocket.instances).toHaveLength(3);
+  });
+
+  it("ignores stale socket callbacks after hub changes and unmount", async () => {
+    const view = render(<App />);
+    await enableFakeTimersAfterReady();
+    const socket = MockWebSocket.instances[0];
+    act(() => socket.open());
+    await advance(10_000);
+
+    vi.useRealTimers();
+    fireEvent.change(screen.getByLabelText("Hub address"), { target: { value: "ws://localhost:9000/ws" } });
+    await act(async () => { await Promise.resolve(); });
+    const staleClose = socket.onclose;
+    const staleError = socket.onerror;
+    act(() => {
+      staleClose?.({} as CloseEvent);
+      staleError?.(new Event("error"));
+    });
+    expect(screen.queryByText("The radio link reported a socket error. Retrying automatically.")).toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2));
+    vi.useFakeTimers();
+    const replacementSocket = MockWebSocket.instances[1];
+    act(() => replacementSocket.open());
+    await advance(10_000);
+    await advance(1_999);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    await advance(1);
+    expect(MockWebSocket.instances).toHaveLength(3);
+
+    const currentSocket = MockWebSocket.instances[2];
+    act(() => currentSocket.open());
+    act(() => {
+      currentSocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 });
+      currentSocket.receive({ version: 1, type: "presence", room: ROOM, peers: 1 });
+    });
+    view.unmount();
+    const lateClose = currentSocket.onclose;
+    const lateError = currentSocket.onerror;
+    act(() => {
+      lateClose?.({} as CloseEvent);
+      lateError?.(new Event("error"));
+    });
+    await advance(60_000);
+    expect(MockWebSocket.instances).toHaveLength(3);
+  });
+
+  it("replays persisted outbox messages when a timed out join eventually succeeds", async () => {
+    await saveMessage({
+      packet: hubMessage("queued-replay-first", "2026-10-15T08:00:00.000Z", "First queued message"),
+      direction: "outgoing",
+      delivery: "queued",
+      transport: "hub",
+    });
+    await expect(loadMessages(ROOM)).resolves.toMatchObject([{ packet: { id: "queued-replay-first" }, direction: "outgoing", delivery: "queued", transport: "hub" }]);
+    render(<App />);
+    await enableFakeTimersAfterReady();
+
+    const firstSocket = MockWebSocket.instances[0];
+    act(() => firstSocket.open());
+    await advance(10_000);
+    await advance(2_000);
+    const retrySocket = MockWebSocket.instances[1];
+    act(() => retrySocket.open());
+    act(() => retrySocket.receive({ version: 1, type: "joined", room: ROOM, peers: 1 }));
+    await advance(0);
+    vi.useRealTimers();
+
+    await screen.findByText("On frequency");
+    await waitFor(() => expect(messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === ROOM).length).toBeGreaterThan(1));
+    await expect(loadMessages(ROOM)).resolves.toMatchObject([{ packet: { id: "queued-replay-first" }, direction: "outgoing", delivery: "queued", transport: "hub" }]);
+    expect(screen.queryByText("A saved message did not pass protocol checks and was not sent.")).toBeNull();
+    await waitFor(() => expect(retrySocket.sent.map((raw) => JSON.parse(raw).id)).toContain("queued-replay-first"));
+  });
 });
 
 describe("browser storage retention feedback", () => {

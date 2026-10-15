@@ -28,6 +28,7 @@ const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//
 // Leave headroom below the hub's 120 messages per fixed 60-second window.
 const HUB_MESSAGE_RATE_INTERVAL_MS = 550;
 const HUB_MESSAGE_ACK_TIMEOUT_MS = 10_000;
+const HUB_JOIN_TIMEOUT_MS = 10_000;
 const MAX_HUB_OUTBOUND_QUEUE_ENTRIES = 64;
 const ROOM_DELETION_CHANNEL = "nearlink-room-deletion-v1";
 const HUB_REPLAY_FAILURE_NOTICE = "A hub message could not be saved or checked on this device. It was not accepted and can be retried after reconnecting.";
@@ -164,6 +165,7 @@ function App() {
   const socketRef = useRef<WebSocket | null>(null);
   const directRef = useRef<DirectWebRtcTransport | null>(null);
   const hubSyncRef = useRef<SyncCoordinator | null>(null);
+  const hubSyncSocketRef = useRef<WebSocket | null>(null);
   const directSyncRef = useRef<SyncCoordinator | null>(null);
   const messagesRef = useRef(messages);
   const callSignEditedRef = useRef(false);
@@ -334,6 +336,7 @@ function App() {
       else socket.send(JSON.stringify(packet));
     });
     hubSyncRef.current = coordinator;
+    hubSyncSocketRef.current = socket;
     setSyncStatus({ state: "syncing", detail: "Exchanging bounded local message inventories over the hub." });
     void coordinator.start();
   }
@@ -378,6 +381,7 @@ function App() {
     stopHubOutboundQueue();
     hubSyncRef.current?.stop();
     hubSyncRef.current = null;
+    hubSyncSocketRef.current = null;
     socketRef.current = null;
     socket?.close();
     closeDirectTransport();
@@ -790,6 +794,7 @@ function App() {
   useEffect(() => {
     hubSyncRef.current?.stop();
     hubSyncRef.current = null;
+    hubSyncSocketRef.current = null;
     closeDirectTransport();
     setSyncStatus({ state: "idle", detail: "" });
     setSignalInput("");
@@ -866,6 +871,15 @@ function App() {
     shouldReconnectRef.current = true;
     let cancelled = false;
     let retryTimer: number | undefined;
+    const joinTimers = new Map<WebSocket, number>();
+    const connectionRoom = room.trim();
+    const connectionHubUrl = hubUrl.trim();
+
+    const clearJoinTimeout = (socket: WebSocket) => {
+      const timer = joinTimers.get(socket);
+      if (timer !== undefined) window.clearTimeout(timer);
+      joinTimers.delete(socket);
+    };
 
     const connect = () => {
       if (cancelled || !shouldReconnectRef.current) return;
@@ -883,10 +897,9 @@ function App() {
       const socket = new WebSocket(target.toString());
       socketRef.current = socket;
       socket.onopen = () => {
-        if (cancelled) { socket.close(); return; }
-        attemptRef.current = 0;
+        if (cancelled || socketRef.current !== socket || currentRoomRef.current !== connectionRoom || currentHubUrlRef.current !== connectionHubUrl) { socket.close(); return; }
         setLinkState("linking");
-        const joinPacket: ClientPacket = { version: PROTOCOL_VERSION, type: "join", room: room.trim(), sender: identity.sender, senderName: identity.senderName };
+        const joinPacket: ClientPacket = { version: PROTOCOL_VERSION, type: "join", room: connectionRoom, sender: identity.sender, senderName: identity.senderName };
         if (!validateWithWasm("client", joinPacket)) {
           shouldReconnectRef.current = false;
           setLinkRequested(false);
@@ -895,11 +908,16 @@ function App() {
           socket.close();
           return;
         }
+        joinTimers.set(socket, window.setTimeout(() => {
+          if (cancelled || socketRef.current !== socket || currentRoomRef.current !== connectionRoom || currentHubUrlRef.current !== connectionHubUrl || !shouldReconnectRef.current) return;
+          setNotice("The hub did not confirm the room join. The radio will retry.");
+          socket.close();
+        }, HUB_JOIN_TIMEOUT_MS));
         try { socket.send(JSON.stringify(joinPacket)); }
         catch { setNotice("Could not reach the hub. The radio will retry."); socket.close(); }
       };
       socket.onmessage = async (event) => {
-        if (socketRef.current !== socket) return;
+        if (cancelled || socketRef.current !== socket || currentRoomRef.current !== connectionRoom || currentHubUrlRef.current !== connectionHubUrl) return;
         const rawPacket = String(event.data);
         let packet: unknown;
         try { packet = JSON.parse(rawPacket); } catch { setNotice("The hub sent unreadable data. It was ignored."); return; }
@@ -909,7 +927,9 @@ function App() {
           return;
         }
         if (packet.type === "joined") {
-          if (packet.room !== room.trim()) { setNotice("The hub confirmed a different room. Check the room code."); return; }
+          if (packet.room !== connectionRoom) { setNotice("The hub confirmed a different room. Check the room code."); return; }
+          clearJoinTimeout(socket);
+          attemptRef.current = 0;
           const joinedHubUrl = socket.url;
           if (joinedHistoryHubUrlRef.current !== null && joinedHistoryHubUrlRef.current !== joinedHubUrl) {
             const pendingHistory = historyRequestRef.current;
@@ -1286,18 +1306,24 @@ function App() {
           });
         }
       };
-      socket.onerror = () => setNotice("The radio link reported a socket error. Retrying automatically.");
+      socket.onerror = () => {
+        if (cancelled || socketRef.current !== socket || currentRoomRef.current !== connectionRoom || currentHubUrlRef.current !== connectionHubUrl) return;
+        setNotice("The radio link reported a socket error. Retrying automatically.");
+      };
       socket.onclose = () => {
         stopHubOutboundQueue(socket);
-        if (socketRef.current === socket) socketRef.current = null;
-        if (hubSyncRef.current) {
+        clearJoinTimeout(socket);
+        if (cancelled || socketRef.current !== socket || currentRoomRef.current !== connectionRoom || currentHubUrlRef.current !== connectionHubUrl) return;
+        socketRef.current = null;
+        if (hubSyncRef.current && hubSyncSocketRef.current === socket) {
           hubSyncRef.current.stop();
           hubSyncRef.current = null;
+          hubSyncSocketRef.current = null;
           setSyncStatus({ state: "partial", detail: "The connection ended. Reconnect to restart message synchronization from fresh inventories." });
         }
         const pendingHistory = historyRequestRef.current;
         if (pendingHistory?.socket === socket) failHistoryRequest(pendingHistory, "The connection closed before this history page finished. Reconnect, then retry the same cursor.");
-        if (cancelled || !shouldReconnectRef.current) return;
+        if (!shouldReconnectRef.current) return;
         setLinkState("retrying");
         attemptRef.current += 1;
         retryTimer = window.setTimeout(connect, Math.min(1000 * 2 ** Math.min(attemptRef.current, 5), 30000));
@@ -1307,8 +1333,14 @@ function App() {
     return () => {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);
+      for (const socket of joinTimers.keys()) clearJoinTimeout(socket);
       shouldReconnectRef.current = false;
       stopHubOutboundQueue();
+      if (hubSyncSocketRef.current === socketRef.current) {
+        hubSyncRef.current?.stop();
+        hubSyncRef.current = null;
+        hubSyncSocketRef.current = null;
+      }
       socketRef.current?.close();
       socketRef.current = null;
       attemptRef.current = 0;
