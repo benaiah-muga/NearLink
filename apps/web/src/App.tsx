@@ -4,6 +4,7 @@ import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type Ackno
 import { browserConversationStore as conversationStore, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, WebRtcTransportError, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
+import { createSecureUuid, SecureRandomUnavailableError } from "./lib/secureId";
 import { buildDiagnosticsSummary, formatDiagnosticsSummary } from "./lib/diagnostics";
 import { initializeWasmProtocol, MAX_PROTOCOL_ENVELOPE_BYTES, validateJsonWithWasm, validateWithWasm } from "./lib/wasmProtocol";
 
@@ -34,6 +35,7 @@ const MAX_HUB_OUTBOUND_QUEUE_ENTRIES = 64;
 const ROOM_DELETION_CHANNEL = "nearlink-room-deletion-v1";
 const HUB_REPLAY_FAILURE_NOTICE = "A hub message could not be saved or checked on this device. It was not accepted and can be retried after reconnecting.";
 const WASM_PROTOCOL_FAILURE_NOTICE = "Protocol checks could not start. NearLink will not connect, send messages, or accept peer packets. Reload the page. If this continues, update the browser and report this error.";
+const SECURE_RANDOM_FAILURE_NOTICE = "Secure NearLink IDs are unavailable in this browser. Update the browser or use a secure browser context, then reload.";
 
 function readLocalSetting(key: string): string | null {
   try { return localStorage.getItem(key); }
@@ -68,8 +70,9 @@ function addRecentRoom(rooms: string[], room: string): string[] {
 }
 
 function makeId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
-  return `nl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  const id = createSecureUuid();
+  if (!id) throw new SecureRandomUnavailableError();
+  return id;
 }
 
 function normalizeFingerprint(value: string): string | null {
@@ -202,7 +205,8 @@ function App() {
   const deletionInProgressRef = useRef(false);
   const deletionGenerationRef = useRef(0);
   const deletionEventsRef = useRef(new Map<string, "deleting" | "deleted" | "cancelled">());
-  const tabIdRef = useRef(makeId());
+  const tabIdRef = useRef<string | null>(null);
+  if (tabIdRef.current === null) tabIdRef.current = createSecureUuid();
   const deletionChannelRef = useRef<BroadcastChannel | null>(null);
   const shouldReconnectRef = useRef(false);
   const attemptRef = useRef(0);
@@ -267,10 +271,17 @@ function App() {
     const cursor = cursorOverride === undefined
       ? historyCursorRef.current === undefined ? oldestLoadedHubMessageId() : historyCursorRef.current
       : cursorOverride;
+    let requestId: string;
+    try { requestId = makeId(); }
+    catch {
+      setHistoryPagingState("retry");
+      setHistoryPagingMessage(SECURE_RANDOM_FAILURE_NOTICE);
+      return;
+    }
     const request: HistoryRequestPacket = {
       version: PROTOCOL_VERSION,
       type: "history_request",
-      requestId: makeId(),
+      requestId,
       room: connectionRoom,
       cursor,
       limit: historyLimitRef.current,
@@ -401,6 +412,7 @@ function App() {
   }
 
   function publishRoomDeletion(type: "deleting" | "deleted" | "cancelled", selectedRoom: string) {
+    if (!tabIdRef.current) return;
     deletionChannelRef.current?.postMessage({
       version: 1,
       type,
@@ -700,7 +712,7 @@ function App() {
   }, [deletingRoom, notice]);
 
   useEffect(() => {
-    if (typeof BroadcastChannel === "undefined") return;
+    if (!tabIdRef.current || typeof BroadcastChannel === "undefined") return;
     const channel = new BroadcastChannel(ROOM_DELETION_CHANNEL);
     deletionChannelRef.current = channel;
     channel.onmessage = (event: MessageEvent<unknown>) => {
@@ -761,7 +773,16 @@ function App() {
     let active = true;
     conversationStore.loadIdentity().then((saved) => {
       if (!active) return;
-      const next = saved ?? { sender: makeId(), senderName: "" };
+      let next = saved;
+      if (!next) {
+        try { next = { sender: makeId(), senderName: "" }; }
+        catch {
+          setNotice(SECURE_RANDOM_FAILURE_NOTICE);
+          setProfileSaved(false);
+          setStorageReady(true);
+          return;
+        }
+      }
       setIdentity(next);
       if (!callSignEditedRef.current) setDisplayName(next.senderName);
       setProfileSaved(Boolean(saved?.senderName.trim()));
@@ -769,8 +790,16 @@ function App() {
       setStorageReady(true);
     }).catch(() => {
       if (active) {
+        let sender: string;
+        try { sender = makeId(); }
+        catch {
+          setNotice(SECURE_RANDOM_FAILURE_NOTICE);
+          setProfileSaved(false);
+          setStorageReady(true);
+          return;
+        }
         setNotice("Local storage is unavailable. Messages may not survive a reload.");
-        setIdentity({ sender: makeId(), senderName: "" });
+        setIdentity({ sender, senderName: "" });
         setProfileSaved(false);
         setStorageReady(true);
       }
@@ -1747,10 +1776,16 @@ function App() {
     try {
       const submittedDraft = draft;
       const messageRoom = room.trim();
+      let messageId: string;
+      try { messageId = makeId(); }
+      catch {
+        setNotice(SECURE_RANDOM_FAILURE_NOTICE);
+        return;
+      }
       const packet: MessagePacket = {
         version: PROTOCOL_VERSION,
         type: "message",
-        id: makeId(),
+        id: messageId,
         room: messageRoom,
         sender: identity.sender,
         senderName: identity.senderName,

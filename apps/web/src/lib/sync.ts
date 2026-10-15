@@ -21,6 +21,7 @@ import {
   type SyncInventoryState,
   type SyncRequestState,
 } from "./wasmProtocol";
+import { SecureRandomUnavailableError } from "./secureId";
 import type { StoredMessage } from "./storage";
 
 export type SyncState = "idle" | "syncing" | "partial" | "complete" | "error";
@@ -133,8 +134,11 @@ export class SyncCoordinator {
         this.partial = true;
         this.options.onState?.("partial", "The local inventory exceeded 4,096 IDs. This exchange can only report partial synchronization.");
       }
-    } catch {
-      if (this.isRunActive(startEpoch)) this.fail("Local storage could not provide an accepted-message snapshot. Reconnect to restart synchronization.");
+    } catch (error) {
+      if (!this.isRunActive(startEpoch)) return;
+      this.fail(error instanceof SecureRandomUnavailableError
+        ? "Secure NearLink IDs are unavailable. Synchronization cannot start in this browser."
+        : "Local storage could not provide an accepted-message snapshot. Reconnect to restart synchronization.");
     }
   }
 
@@ -454,7 +458,12 @@ export class SyncCoordinator {
       this.fail("WASM could not plan synchronization request batches. Reconnect to start over.");
       return;
     }
-    const requestId = this.options.makeId();
+    let requestId: string;
+    try { requestId = this.options.makeId(); }
+    catch {
+      this.fail("Secure NearLink IDs are unavailable. Synchronization cannot continue in this browser.");
+      return;
+    }
     const request: SyncMissingRequestPacket = {
       version: PROTOCOL_VERSION,
       type: "sync_missing_request",

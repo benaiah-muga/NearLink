@@ -463,6 +463,31 @@ describe("guided station setup", () => {
 });
 
 describe("browser app messaging flow", () => {
+  it("shows a startup error without creating an identity when secure randomness is unavailable", async () => {
+    vi.stubGlobal("crypto", undefined);
+    messageReadGate.identityPending = Promise.resolve(null);
+
+    render(<App />);
+
+    expect(await screen.findByText(/Secure NearLink IDs are unavailable in this browser/i)).toBeTruthy();
+    expect(MockBroadcastChannel.instances).toHaveLength(0);
+    expect((screen.getByRole("button", { name: "Save and join room" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("keeps an existing identity usable but refuses to queue a message without secure randomness", async () => {
+    vi.stubGlobal("crypto", undefined);
+
+    render(<App />);
+
+    const draft = await screen.findByRole("textbox", { name: "Write a message" });
+    await waitFor(() => expect((draft as HTMLTextAreaElement).disabled).toBe(false));
+    fireEvent.change(draft, { target: { value: "Must not get a weak ID" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByText(/Secure NearLink IDs are unavailable in this browser/i)).toBeTruthy();
+    expect(await loadMessages(ROOM)).toHaveLength(0);
+  });
+
   it("exchanges a hub inventory and serves a missing-message batch from accepted local storage", async () => {
     const accepted: StoredMessage = {
       packet: { version: 1, type: "message", id: "saved-sync-message", room: ROOM, sender: IDENTITY.sender, senderName: IDENTITY.senderName, createdAt: "2026-10-14T09:00:00.000Z", body: "Saved sync body" },
