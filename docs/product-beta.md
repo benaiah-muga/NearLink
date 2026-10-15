@@ -19,6 +19,9 @@ confidential, or otherwise sensitive communication.
 
 - A browser client that saves a local call sign, room selection, and message
   history in browser storage.
+- A station setup selector for up to 10 valid recent room codes, stored locally
+  on the device. The selected room remains the last-selected room after reload.
+  These codes are routing values and do not identify or verify participants.
 - Local hub messaging over WebSocket. The hub can keep bounded SQLite room
   history and replay recent messages when clients reconnect.
 - Bounded message-ID reconciliation runs over the joined local hub relay or a

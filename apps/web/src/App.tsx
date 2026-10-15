@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
-import { MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPacket } from "@nearlink/protocol";
+import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPacket } from "@nearlink/protocol";
 import { browserConversationStore as conversationStore, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
@@ -21,6 +21,8 @@ interface PendingHistoryRequest {
 const DEFAULT_HUB = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8000/ws`;
 const HUB_KEY = "nearlink.hub";
 const ROOM_KEY = "nearlink.room";
+const RECENT_ROOMS_KEY = "nearlink.recent-rooms";
+const MAX_RECENT_ROOMS = 10;
 const ROOM_DELETION_CHANNEL = "nearlink-room-deletion-v1";
 const HUB_REPLAY_FAILURE_NOTICE = "A hub message could not be saved or checked on this device. It was not accepted and can be retried after reconnecting.";
 const WASM_PROTOCOL_FAILURE_NOTICE = "Protocol checks could not start. NearLink will not connect, send messages, or accept peer packets. Reload the page. If this continues, update the browser and report this error.";
@@ -33,6 +35,28 @@ function readLocalSetting(key: string): string | null {
 function writeLocalSetting(key: string, value: string): boolean {
   try { localStorage.setItem(key, value); return true; }
   catch { return false; }
+}
+
+function parseRecentRooms(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    const rooms: string[] = [];
+    for (const room of parsed) {
+      if (isProtocolRoom(room) && !rooms.includes(room)) rooms.push(room);
+      if (rooms.length === MAX_RECENT_ROOMS) break;
+    }
+    return rooms;
+  } catch {
+    return [];
+  }
+}
+
+function addRecentRoom(rooms: string[], room: string): string[] {
+  if (!isProtocolRoom(room)) return rooms;
+  if (rooms[0] === room) return rooms;
+  return [room, ...rooms.filter((recent) => recent !== room)].slice(0, MAX_RECENT_ROOMS);
 }
 
 function makeId(): string {
@@ -116,6 +140,7 @@ function App() {
   const [profileSaved, setProfileSaved] = useState(false);
   const [displayName, setDisplayName] = useState("");
   const [room, setRoom] = useState(() => readLocalSetting(ROOM_KEY) ?? "");
+  const [recentRooms, setRecentRooms] = useState(() => addRecentRoom(parseRecentRooms(readLocalSetting(RECENT_ROOMS_KEY)), readLocalSetting(ROOM_KEY) ?? ""));
   const [hubUrl, setHubUrl] = useState(() => readLocalSetting(HUB_KEY) ?? DEFAULT_HUB);
   const [linkRequested, setLinkRequested] = useState(false);
   const [linkState, setLinkState] = useState<LinkState>("offline");
@@ -174,6 +199,9 @@ function App() {
   const shouldReconnectRef = useRef(false);
   const attemptRef = useRef(0);
   const currentRoomRef = useRef(room.trim());
+  const currentHubUrlRef = useRef(hubUrl.trim());
+  const currentSendTransportRef = useRef(sendTransport);
+  const currentDisplayNameRef = useRef(displayName.trim());
   const fingerprintConfirmedRef = useRef(fingerprintConfirmed);
   const directInFlightRef = useRef(new Set<string>());
   const directInboundOperationsRef = useRef(new Map<string, Promise<void>>());
@@ -195,6 +223,9 @@ function App() {
   messagesRef.current = messages;
   activeRoomRef.current = room.trim();
   currentRoomRef.current = room.trim();
+  currentHubUrlRef.current = hubUrl.trim();
+  currentSendTransportRef.current = sendTransport;
+  currentDisplayNameRef.current = displayName.trim();
   fingerprintConfirmedRef.current = fingerprintConfirmed;
 
   function oldestLoadedHubMessageId(): string | null {
@@ -390,6 +421,10 @@ function App() {
   }, []);
 
   useEffect(() => {
+    writeLocalSetting(RECENT_ROOMS_KEY, JSON.stringify(recentRooms));
+  }, [recentRooms]);
+
+  useEffect(() => {
     const dialog = roomDeletionDialogRef.current;
     if (!confirmRoomDeletion || !dialog) return;
     if (!dialog.open) dialog.showModal();
@@ -503,9 +538,6 @@ function App() {
     if (!hasHubInboundFailure(hubInboundFailuresRef.current, room.trim())) {
       setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
     }
-    if (room && !writeLocalSetting(ROOM_KEY, room)) {
-      setNotice("Your room setting could not be saved. Re-enter it if you reload this page.");
-    }
     setRoomDeletedLocally(false);
     const pendingHistory = historyRequestRef.current;
     if (pendingHistory) window.clearTimeout(pendingHistory.timeout);
@@ -536,6 +568,16 @@ function App() {
     }
     return () => { active = false; };
   }, [room]);
+
+  function selectRecentRoom(selectedRoom: string): void {
+    if (!isProtocolRoom(selectedRoom) || deletingRoom) return;
+    setRecentRooms((current) => addRecentRoom(current, selectedRoom));
+    if (!writeLocalSetting(ROOM_KEY, selectedRoom)) setNotice("Your room setting could not be saved. Re-enter it if you reload this page.");
+    setConversationReady(false);
+    setRoom(selectedRoom);
+    setLinkRequested(false);
+    setLinkState("offline");
+  }
 
   useEffect(() => () => directRef.current?.close(), []);
 
@@ -985,22 +1027,46 @@ function App() {
   async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (deletionInProgressRef.current || deletingRoom) return;
-    if (!wasmReady || !identity || !validateWithWasm("identifier", identity.sender) || !isValidCallSign(normalizedName) || !validateWithWasm("room", room.trim())) return;
+    const selectedRoom = room.trim();
+    const selectedHubUrl = hubUrl.trim();
+    const selectedTransport = sendTransport;
+    const settingsChanged = () => currentRoomRef.current !== selectedRoom
+      || currentHubUrlRef.current !== selectedHubUrl
+      || currentSendTransportRef.current !== selectedTransport
+      || currentDisplayNameRef.current !== normalizedName;
+    const settingsChangedNotice = () => currentRoomRef.current !== selectedRoom
+      ? "The room changed while your profile was being saved. Save again to join the selected room."
+      : "Station settings changed while your profile was being saved. Save again to use the selected settings.";
+    if (!wasmReady || !identity || !validateWithWasm("identifier", identity.sender) || !isValidCallSign(normalizedName) || !validateWithWasm("room", selectedRoom)) return;
+    setRecentRooms((current) => addRecentRoom(current, selectedRoom));
+    const roomSaved = writeLocalSetting(ROOM_KEY, selectedRoom);
+    const settingsSaved = writeLocalSetting(HUB_KEY, selectedHubUrl) && roomSaved;
     const nextIdentity = { ...identity, senderName: normalizedName };
     setIdentity(nextIdentity);
     let identitySaved = true;
     try { await conversationStore.saveIdentity(nextIdentity); }
     catch { identitySaved = false; }
     if (deletionInProgressRef.current || deletingRoom) return;
+    if (settingsChanged()) {
+      setLinkRequested(false);
+      setLinkState("offline");
+      setNotice(settingsChangedNotice());
+      return;
+    }
     setProfileSaved(identitySaved && Boolean(nextIdentity.senderName.trim()));
-    const settingsSaved = writeLocalSetting(HUB_KEY, hubUrl.trim());
-    if (sendTransport === "direct") {
+    if (selectedTransport === "direct") {
       setLinkRequested(false);
       setLinkState("offline");
     } else {
       try {
-        await resumeRoomForUserAction(room.trim());
+        await resumeRoomForUserAction(selectedRoom);
         if (deletionInProgressRef.current || deletingRoom) return;
+        if (settingsChanged()) {
+          setLinkRequested(false);
+          setLinkState("offline");
+          setNotice(settingsChangedNotice());
+          return;
+        }
         setRoomDeletedLocally(false);
       } catch {
         setLinkRequested(false);
@@ -1491,6 +1557,13 @@ function App() {
 
             <label htmlFor="room-code">Room frequency</label>
             <input id="room-code" maxLength={64} placeholder="Enter a shared room code" value={room} disabled={deletingRoom} onChange={(event) => { setConversationReady(false); setRoom(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />
+
+            <label htmlFor="recent-rooms">Recent rooms on this device</label>
+            <select id="recent-rooms" aria-label="Recent rooms on this device" value={recentRooms.includes(room.trim()) ? room.trim() : ""} disabled={deletingRoom || recentRooms.length === 0} onChange={(event) => selectRecentRoom(event.target.value)}>
+              <option value="">{recentRooms.length ? "Choose a recent room" : "No recent rooms"}</option>
+              {recentRooms.map((recentRoom) => <option key={recentRoom} value={recentRoom}>{recentRoom}</option>)}
+            </select>
+            <p className="field-hint">Room codes are saved only on this device. They do not identify or verify participants.</p>
 
             <label htmlFor="hub-address">Hub address</label>
             <input id="hub-address" type="url" inputMode="url" spellCheck={false} placeholder="ws://192.168.1.20:8000/ws" value={hubUrl} disabled={deletingRoom} onChange={(event) => { setHubUrl(event.target.value); setLinkRequested(false); setLinkState("offline"); }} />

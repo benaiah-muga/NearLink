@@ -8,6 +8,9 @@ const messageReadGate = vi.hoisted(() => ({
   room: null as string | null,
   readGateAfter: null as number | null,
   identityPending: null as Promise<import("./lib/storage").LocalIdentity | null> | null,
+  identitySavePending: null as Promise<void> | null,
+  identitySaveStarted: false,
+  releaseIdentitySave: null as (() => void) | null,
   reconcilePendingId: null as string | null,
   reconcilePending: null as Promise<void> | null,
   releaseReconcile: null as (() => void) | null,
@@ -90,6 +93,13 @@ vi.mock("./lib/storage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/storage")>();
   const overrides = {
     loadIdentity: () => messageReadGate.identityPending ?? actual.loadIdentity(),
+    saveIdentity: async (...args: Parameters<typeof actual.saveIdentity>) => {
+      if (messageReadGate.identitySavePending) {
+        messageReadGate.identitySaveStarted = true;
+        await messageReadGate.identitySavePending;
+      }
+      return actual.saveIdentity(...args);
+    },
     reconcileHubReplayOrder: async (...args: Parameters<typeof actual.reconcileHubReplayOrder>) => {
       if (args[1].includes(messageReadGate.reconcilePendingId ?? "") && messageReadGate.reconcilePending) {
         messageReadGate.reconcileStarted = true;
@@ -287,6 +297,9 @@ beforeEach(async () => {
   messageReadGate.room = null;
   messageReadGate.readGateAfter = null;
   messageReadGate.identityPending = null;
+  messageReadGate.identitySavePending = null;
+  messageReadGate.identitySaveStarted = false;
+  messageReadGate.releaseIdentitySave = null;
   messageReadGate.reconcilePendingId = null;
   messageReadGate.reconcilePending = null;
   messageReadGate.releaseReconcile = null;
@@ -1474,5 +1487,125 @@ describe("browser app messaging flow", () => {
     });
 
     expect(screen.queryByText(priorMessage.packet.body)).toBeNull();
+  });
+
+  it("keeps only valid, unique recent room codes and caps the list at ten", async () => {
+    localStorage.setItem("nearlink.recent-rooms", JSON.stringify([
+      "room-1", "room-2", "room-1", "has spaces", 7, "room/3", ...Array.from({ length: 12 }, (_, index) => `room-${index + 3}`),
+    ]));
+
+    render(<App />);
+    const recentRooms = await screen.findByRole("combobox", { name: "Recent rooms on this device" });
+    await waitFor(() => expect([...within(recentRooms).getAllByRole("option")].map((option) => (option as HTMLOptionElement).value)).toEqual([
+      "", ROOM, "room-1", "room-2", "room-3", "room-4", "room-5", "room-6", "room-7", "room-8", "room-9",
+    ]));
+    expect(JSON.parse(localStorage.getItem("nearlink.recent-rooms") ?? "null")).toEqual([
+      ROOM, "room-1", "room-2", "room-3", "room-4", "room-5", "room-6", "room-7", "room-8", "room-9",
+    ]);
+  });
+
+  it("ignores malformed recent-room settings and restores the last valid room", async () => {
+    localStorage.setItem("nearlink.recent-rooms", "{broken json");
+    localStorage.setItem("nearlink.room", "saved-room");
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "saved-room" })).toBeTruthy();
+    const recentRooms = await screen.findByRole("combobox", { name: "Recent rooms on this device" });
+    await waitFor(() => expect(JSON.parse(localStorage.getItem("nearlink.recent-rooms") ?? "null")).toEqual(["saved-room"]));
+    expect([...within(recentRooms).getAllByRole("option")].map((option) => (option as HTMLOptionElement).value)).toEqual(["", "saved-room"]);
+  });
+
+  it("records a room only after its profile is saved", async () => {
+    render(<App />);
+    await screen.findByRole("combobox", { name: "Recent rooms on this device" });
+    fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "draft-room" } });
+
+    expect(localStorage.getItem("nearlink.room")).toBe(ROOM);
+    expect(JSON.parse(localStorage.getItem("nearlink.recent-rooms") ?? "null")).toEqual([ROOM]);
+    cleanup();
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: ROOM })).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem("nearlink.recent-rooms") ?? "null")).toEqual([ROOM]);
+
+    fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "draft-room" } });
+    fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: "Sam" } });
+    const saveButton = screen.getByRole("button", { name: "Save and join room" });
+    await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(localStorage.getItem("nearlink.room")).toBe("draft-room"));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem("nearlink.recent-rooms") ?? "null")).toEqual(["draft-room", ROOM]));
+  });
+
+  it("does not join a room that changes while the profile save is pending", async () => {
+    let releaseSave!: () => void;
+    messageReadGate.identitySavePending = new Promise<void>((resolve) => { releaseSave = resolve; });
+    messageReadGate.releaseIdentitySave = releaseSave;
+    render(<App />);
+    await screen.findByRole("combobox", { name: "Recent rooms on this device" });
+    fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: "Sam" } });
+    const saveButton = screen.getByRole("button", { name: "Save and join room" });
+    await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(messageReadGate.identitySaveStarted).toBe(true));
+    fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "next-room" } });
+    messageReadGate.releaseIdentitySave?.();
+
+    expect(await screen.findByText("The room changed while your profile was being saved. Save again to join the selected room.")).toBeTruthy();
+    expect(MockWebSocket.instances).toHaveLength(0);
+    expect(localStorage.getItem("nearlink.room")).toBe(ROOM);
+    expect(JSON.parse(localStorage.getItem("nearlink.recent-rooms") ?? "null")).toEqual([ROOM]);
+  });
+
+  it("rechecks station settings after the room resume step", async () => {
+    messageReadGate.resumeRoom = ROOM;
+    messageReadGate.resumePending = new Promise<void>((resolve) => { messageReadGate.releaseResume = resolve; });
+    render(<App />);
+    await screen.findByRole("combobox", { name: "Recent rooms on this device" });
+    fireEvent.change(screen.getByLabelText("Your call sign"), { target: { value: "Sam" } });
+    const saveButton = screen.getByRole("button", { name: "Save and join room" });
+    await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(messageReadGate.resumeStarted).toBe(true));
+    fireEvent.change(screen.getByLabelText("Room frequency"), { target: { value: "next-room" } });
+    messageReadGate.releaseResume?.();
+
+    expect(await screen.findByText("The room changed while your profile was being saved. Save again to join the selected room.")).toBeTruthy();
+    expect(MockWebSocket.instances).toHaveLength(0);
+    expect(localStorage.getItem("nearlink.room")).toBe(ROOM);
+  });
+
+  it("switches through the room lifecycle, scopes history, and restores selection after reload", async () => {
+    const otherRoom = "saved-room";
+    const currentMessage: StoredMessage = {
+      packet: { version: 1, type: "message", id: "current-room-message", room: ROOM, sender: "station-b", senderName: "Bea", createdAt: "2026-10-14T09:00:00.000Z", body: "Message in current room" },
+      direction: "incoming",
+      delivery: "sent",
+    };
+    const otherMessage: StoredMessage = {
+      packet: { ...currentMessage.packet, id: "saved-room-message", room: otherRoom, body: "Message in saved room" },
+      direction: "incoming",
+      delivery: "sent",
+    };
+    await saveMessage(currentMessage);
+    await saveMessage(otherMessage);
+    localStorage.setItem("nearlink.recent-rooms", JSON.stringify([ROOM, otherRoom]));
+    render(<App />);
+    await screen.findByText(currentMessage.packet.body);
+
+    const selector = screen.getByRole("combobox", { name: "Recent rooms on this device" });
+    fireEvent.change(selector, { target: { value: otherRoom } });
+    await screen.findByText(otherMessage.packet.body);
+    expect(screen.getByRole("heading", { name: otherRoom })).toBeTruthy();
+    expect(screen.queryByText(currentMessage.packet.body)).toBeNull();
+    await waitFor(() => expect(localStorage.getItem("nearlink.room")).toBe(otherRoom));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem("nearlink.recent-rooms") ?? "null")).toEqual([otherRoom, ROOM]));
+
+    cleanup();
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: otherRoom })).toBeTruthy();
+    expect(await screen.findByText(otherMessage.packet.body)).toBeTruthy();
+    expect(screen.queryByText(currentMessage.packet.body)).toBeNull();
   });
 });

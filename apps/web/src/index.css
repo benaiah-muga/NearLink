@@ -42,6 +42,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .station-form { display: flex; flex-direction: column; }
 .station-form label { margin: 0 0 7px; color: #aeb4a8; font-size: 10px; font-weight: 600; letter-spacing: .035em; }
 .station-form input { width: 100%; height: 42px; margin-bottom: 17px; padding: 0 12px; border: 1px solid #ffffff25; border-radius: 4px; color: #f3f0e4; background: #ffffff09; font-size: 12px; transition: border-color .15s, background .15s; }
+.station-form select { width: 100%; height: 42px; margin-bottom: 17px; padding: 0 12px; border: 1px solid #ffffff25; border-radius: 4px; color: #f3f0e4; background: #242821; font-size: 12px; }
+.station-form select:focus { border-color: #d2b95f; }
+.station-form select:disabled { color: #858f85; }
 .station-form input::placeholder { color: #858f85; }
 .station-form input:focus { border-color: #d2b95f; background: #ffffff0d; }
 .station-form input[type="url"] { font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
@@ -226,6 +229,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
   .station-form { display: grid; grid-template-columns: 1fr; }
   .station-form label { margin-bottom: 4px; font-size: 9px; }
   .station-form input { height: 34px; margin-bottom: 8px; padding: 0 9px; font-size: 10px; }
+  .station-form select { height: 34px; margin-bottom: 8px; padding: 0 9px; font-size: 10px; }
   .station-form input[type="url"] { font-size: 9px; }
   .field-hint { display: none; }
   .primary-button { height: 34px; font-size: 9px; }
