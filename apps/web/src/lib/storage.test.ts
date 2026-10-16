@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
-import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessages, loadRequestedMessages, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadRequestedMessages, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const classifierGate = vi.hoisted(() => ({ failNext: false }));
 
@@ -160,6 +160,138 @@ describe("local IndexedDB storage", () => {
       { ...message("incoming", "2026-10-14T09:30:00.000Z", "sent"), direction: "incoming", displayOrder: 2 },
     ]);
     await expect(loadMessages("missing")).resolves.toEqual([]);
+  });
+
+  it("loads large local rooms in bounded reverse-index pages without gaps or duplicate rows", async () => {
+    const rowCount = 137;
+    await seedLargeRoom(rowCount);
+    let materializedRoomRows = 0;
+    const cursorDirections: IDBCursorDirection[] = [];
+    const originalGetAll = IDBIndex.prototype.getAll;
+    const originalOpenCursor = IDBIndex.prototype.openCursor;
+    vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+      if (this.name === "roomCreatedAt") materializedRoomRows += 1;
+      return originalGetAll.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["openCursor"]>) {
+      if (this.name === "roomDisplayOrder") cursorDirections.push(args[1] ?? "next");
+      return originalOpenCursor.apply(this, args);
+    });
+
+    const pages: string[][] = [];
+    let page = await loadMessagePage("alpha", null, 25);
+    while (true) {
+      expect(page.messages.length).toBeLessThanOrEqual(25);
+      pages.push(page.messages.map((row) => row.packet.id));
+      if (!page.hasMore) break;
+      expect(page.cursor).not.toBeNull();
+      page = await loadMessagePage("alpha", page.cursor, 25);
+    }
+
+    expect(materializedRoomRows).toBe(0);
+    expect(cursorDirections).toHaveLength(6);
+    expect(cursorDirections.every((direction) => direction === "prev")).toBe(true);
+    const collected = pages.reverse().flat();
+    expect(collected).toHaveLength(rowCount);
+    expect(new Set(collected).size).toBe(rowCount);
+    expect(collected).toEqual(Array.from({ length: rowCount }, (_, index) => `large-${String(index).padStart(4, "0")}`));
+    vi.restoreAllMocks();
+  });
+
+  it("continues through display-order ties using the established timestamp and ID ordering", async () => {
+    await saveIdentity({ sender: "device-1", senderName: "Ada" });
+    const tiedRows = [
+      message("tie-z", "2026-10-14T09:00:02.000Z"),
+      message("tie-a", "2026-10-14T09:00:02.000Z"),
+      message("tie-m", "2026-10-14T09:00:03.000Z"),
+    ].map((row) => ({ ...row, displayOrder: 7 }));
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = openRequest();
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("messages", "readwrite");
+      for (const row of tiedRows) transaction.objectStore("messages").put(row);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    const first = await loadMessagePage("alpha", null, 2);
+    expect(first.messages.map((row) => row.packet.id)).toEqual(["tie-z", "tie-m"]);
+    expect(first.hasMore).toBe(true);
+    const second = await loadMessagePage("alpha", first.cursor, 2);
+    expect(second.messages.map((row) => row.packet.id)).toEqual(["tie-a"]);
+    expect(second.hasMore).toBe(false);
+  });
+
+  it("includes Number.MAX_VALUE display orders in newest reads and max lookup", async () => {
+    await saveIdentity({ sender: "device-1", senderName: "Ada" });
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = openRequest();
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("messages", "readwrite");
+      transaction.objectStore("messages").put({
+        ...message("maximum-order-existing", "2026-10-14T09:00:00.000Z"),
+        displayOrder: Number.MAX_VALUE,
+      });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    const newest = await loadMessagePage("alpha", null, 10);
+    expect(newest.messages.map((row) => row.packet.id)).toEqual(["maximum-order-existing"]);
+    await saveMessage(message("maximum-order-next", "2026-10-14T10:00:00.000Z"));
+    const rows = await loadMessages("alpha");
+    expect(rows.map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["maximum-order-existing", Number.MAX_VALUE],
+      ["maximum-order-next", Number.MAX_VALUE],
+    ]);
+  });
+
+  it("upgrades legacy rows without display order before bounded page reads", async () => {
+    await deleteDatabase();
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(DATABASE_NAME, 5);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        const messages = db.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
+        messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
+        messages.createIndex("roomDeliveryCreatedAt", ["packet.room", "delivery", "packet.createdAt"]);
+        messages.createIndex("roomDisplayOrder", ["packet.room", "displayOrder"]);
+        db.createObjectStore("identity", { keyPath: "key" });
+        db.createObjectStore("roomDeletions", { keyPath: "room" });
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("messages", "readwrite");
+      transaction.objectStore("messages").put({ ...message("existing-order", "2026-10-14T09:00:00.000Z"), displayOrder: 4 });
+      transaction.objectStore("messages").put(message("legacy-order-later", "2026-10-14T10:00:00.000Z"));
+      transaction.objectStore("messages").put(message("legacy-order-earlier", "2026-10-14T08:00:00.000Z"));
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    const page = await loadMessagePage("alpha", null, 10);
+    expect(page.messages.map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["existing-order", 4],
+      ["legacy-order-earlier", 5],
+      ["legacy-order-later", 6],
+    ]);
+    expect(page.hasMore).toBe(false);
+    expect(await loadMessages("alpha")).toMatchObject([
+      { packet: { id: "existing-order" }, displayOrder: 4 },
+      { packet: { id: "legacy-order-earlier" }, displayOrder: 5 },
+      { packet: { id: "legacy-order-later" }, displayOrder: 6 },
+    ]);
   });
 
   it("uses one reverse max cursor for large-room saves and inbound acceptance", async () => {
@@ -481,7 +613,7 @@ describe("local IndexedDB storage", () => {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
-    expect(upgraded.version).toBe(5);
+    expect(upgraded.version).toBe(6);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDeliveryCreatedAt")).toBe(true);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDisplayOrder")).toBe(true);
     expect(upgraded.objectStoreNames.contains("roomDeletions")).toBe(true);
@@ -535,11 +667,11 @@ describe("local IndexedDB storage", () => {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
-    expect(upgraded.version).toBe(5);
+    expect(upgraded.version).toBe(6);
     const transaction = upgraded.transaction(["messages", "identity", "roomDeletions"], "readonly");
     const messages = transaction.objectStore("messages");
     expect([...messages.indexNames].sort()).toEqual(["roomCreatedAt", "roomDeliveryCreatedAt", "roomDisplayOrder"]);
-    expect(messages.index("roomDisplayOrder").keyPath).toEqual(["packet.room", "displayOrder"]);
+    expect(messages.index("roomDisplayOrder").keyPath).toEqual(["packet.room", "displayOrder", "packet.createdAt", "packet.id"]);
     const persistedRows = await new Promise<StoredMessage[]>((resolve, reject) => {
       const request = messages.getAll() as IDBRequest<StoredMessage[]>;
       request.onsuccess = () => resolve(request.result);

@@ -46,13 +46,14 @@ export async function requestStoragePersistence(): Promise<StoragePersistenceRes
 }
 
 const DATABASE_NAME = "nearlink-local";
-const DATABASE_VERSION = 5;
+const DATABASE_VERSION = 6;
 const MESSAGE_STORE = "messages";
 const IDENTITY_STORE = "identity";
 const ROOM_DELETION_STORE = "roomDeletions";
 const ROOM_CREATED_INDEX = "roomCreatedAt";
 const ROOM_DELIVERY_CREATED_INDEX = "roomDeliveryCreatedAt";
 const ROOM_DISPLAY_ORDER_INDEX = "roomDisplayOrder";
+const LOCAL_MESSAGE_PAGE_SIZE = 50;
 export const MAX_SYNC_STORAGE_IDS = 4096;
 export const MAX_SYNC_STORAGE_ROWS_SCANNED = 16384;
 export const MAX_SYNC_REQUESTED_STORAGE_IDS = 100;
@@ -137,13 +138,60 @@ function migrate(database: IDBDatabase, transaction: IDBTransaction, oldVersion:
   const messages = ensureStore(database, transaction, MESSAGE_STORE, MESSAGE_KEY_PATH);
   ensureIndex(messages, ROOM_CREATED_INDEX, ROOM_CREATED_KEY_PATH);
   ensureIndex(messages, ROOM_DELIVERY_CREATED_INDEX, ROOM_DELIVERY_CREATED_KEY_PATH);
-  ensureIndex(messages, ROOM_DISPLAY_ORDER_INDEX, ["packet.room", "displayOrder"]);
+  const displayOrderKeyPath = ["packet.room", "displayOrder", "packet.createdAt", "packet.id"];
+  if (messages.indexNames.contains(ROOM_DISPLAY_ORDER_INDEX)
+    && !equalKeyPath(messages.index(ROOM_DISPLAY_ORDER_INDEX).keyPath as string[], displayOrderKeyPath)) {
+    messages.deleteIndex(ROOM_DISPLAY_ORDER_INDEX);
+  }
+  ensureIndex(messages, ROOM_DISPLAY_ORDER_INDEX, displayOrderKeyPath);
   ensureStore(database, transaction, IDENTITY_STORE, IDENTITY_KEY_PATH);
   ensureStore(database, transaction, ROOM_DELETION_STORE, "room");
 
   // Version 4 introduced displayOrder. Backfill only databases that predate it.
   // Version 4 and later contain user-visible ordering that must survive upgrades.
-  if (oldVersion >= 4) return;
+  if (oldVersion >= 6) return;
+
+  if (oldVersion >= 4) {
+    // Upgrade once, before bounded reads rely on the display-order index.
+    // This preserves the prior fallback order for old rows with no order.
+    const migration = messages.index(ROOM_CREATED_INDEX).openCursor();
+    const nextOrderByRoom = new Map<string, number>();
+    migration.onsuccess = () => {
+      const cursor = migration.result;
+      if (!cursor) {
+        const backfill = messages.index(ROOM_CREATED_INDEX).openCursor();
+        backfill.onsuccess = () => {
+          const rowCursor = backfill.result;
+          if (!rowCursor) return;
+          const row = rowCursor.value as StoredMessage;
+          if (!Number.isFinite(row.displayOrder)) {
+            const nextOrder = nextOrderByRoom.get(row.packet.room) ?? 0;
+            row.displayOrder = nextOrder;
+            nextOrderByRoom.set(row.packet.room, nextOrder + 1);
+            const update = rowCursor.update(row);
+            update.onerror = () => {
+              try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
+            };
+          }
+          rowCursor.continue();
+        };
+        backfill.onerror = () => {
+          try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
+        };
+        return;
+      }
+      const message = cursor.value as StoredMessage;
+      const nextOrder = nextOrderByRoom.get(message.packet.room) ?? 0;
+      if (Number.isFinite(message.displayOrder)) {
+        nextOrderByRoom.set(message.packet.room, Math.max(nextOrder, message.displayOrder! + 1));
+      }
+      cursor.continue();
+    };
+    migration.onerror = () => {
+      try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
+    };
+    return;
+  }
 
   const migration = messages.index(ROOM_CREATED_INDEX).openCursor();
   let activeRoom: string | undefined;
@@ -268,7 +316,7 @@ function requestNextDisplayOrder(
   complete: (nextOrder: number) => void,
   setFailure: (cause: unknown) => void,
 ): void {
-  const range = IDBKeyRange.bound([room, -Number.MAX_VALUE], [room, Number.MAX_VALUE]);
+  const range = IDBKeyRange.bound([room, -Number.MAX_VALUE], [room, []]);
   const request = index.openCursor(range, "prev");
   request.onsuccess = () => {
     const last = request.result?.value as StoredMessage | undefined;
@@ -322,6 +370,116 @@ export async function loadMessages(room: string): Promise<StoredMessage[]> {
         }
         complete(messages.sort(compareDisplayOrder));
       }, setFailure);
+    },
+  );
+}
+
+/** Read one room row without loading its conversation. */
+export async function loadMessage(room: string, id: string): Promise<StoredMessage | null> {
+  return withTransaction<StoredMessage | null>(
+    "Could not load the local message",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readonly",
+    (_store, complete, setFailure, transaction) => {
+      const deletionRequest = transaction.objectStore(ROOM_DELETION_STORE).get(room);
+      const messageRequest = transaction.objectStore(MESSAGE_STORE).get([room, id]) as IDBRequest<StoredMessage | undefined>;
+      let deletionDone = false;
+      let deleted = false;
+      let messageDone = false;
+      let message: StoredMessage | undefined;
+      const finishIfReady = () => {
+        if (deletionDone && messageDone) complete(deleted ? null : message ?? null);
+      };
+      deletionRequest.onsuccess = () => { deleted = Boolean(deletionRequest.result); deletionDone = true; finishIfReady(); };
+      deletionRequest.onerror = () => setFailure(deletionRequest.error ?? new Error("Could not read the room deletion state."));
+      messageRequest.onsuccess = () => { message = messageRequest.result; messageDone = true; finishIfReady(); };
+      messageRequest.onerror = () => setFailure(messageRequest.error ?? new Error("Could not read the local message."));
+    },
+  );
+}
+
+export interface LocalMessagePageCursor {
+  displayOrder: number;
+  createdAt: string;
+  id: string;
+}
+
+export interface LocalMessagePage {
+  messages: StoredMessage[];
+  cursor: LocalMessagePageCursor | null;
+  hasMore: boolean;
+  deleted: boolean;
+}
+
+/** Read a bounded newest page or continue toward older local rows. */
+export async function loadMessagePage(
+  room: string,
+  before: LocalMessagePageCursor | null = null,
+  limit = LOCAL_MESSAGE_PAGE_SIZE,
+): Promise<LocalMessagePage> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > LOCAL_MESSAGE_PAGE_SIZE) {
+    throw new Error(`A local message page must contain between 1 and ${LOCAL_MESSAGE_PAGE_SIZE} rows.`);
+  }
+  return withTransaction<LocalMessagePage>(
+    "Could not load a local message page",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readonly",
+    (_store, complete, setFailure, transaction) => {
+      const messages: StoredMessage[] = [];
+      const messageStore = transaction.objectStore(MESSAGE_STORE);
+      const deletionStore = transaction.objectStore(ROOM_DELETION_STORE);
+      const index = messageStore.index(ROOM_DISPLAY_ORDER_INDEX);
+      const lower = [room, -Number.MAX_VALUE];
+      const upper = before
+        ? [room, before.displayOrder, before.createdAt, before.id]
+        : [room, []];
+      const range = before ? IDBKeyRange.bound(lower, upper, false, true) : IDBKeyRange.bound(lower, upper);
+      const deletionRequest = deletionStore.get(room);
+      let deleted: { room: string } | undefined;
+      let deletionDone = false;
+      let cursorDone = false;
+      let hasMore = false;
+      const finishIfReady = () => {
+        if (!deletionDone || !cursorDone) return;
+        if (deleted) {
+          complete({ messages: [], cursor: null, hasMore: false, deleted: true });
+          return;
+        }
+        const ordered = messages.reverse();
+        const oldest = ordered[0];
+        complete({
+          messages: ordered,
+          cursor: oldest && Number.isFinite(oldest.displayOrder)
+            ? { displayOrder: oldest.displayOrder!, createdAt: oldest.packet.createdAt, id: oldest.packet.id }
+            : null,
+          hasMore,
+          deleted: false,
+        });
+      };
+      deletionRequest.onsuccess = () => {
+        deleted = deletionRequest.result as { room: string } | undefined;
+        deletionDone = true;
+        finishIfReady();
+      };
+      deletionRequest.onerror = () => setFailure(deletionRequest.error ?? new Error("Could not read the room deletion state."));
+      const request = index.openCursor(range, "prev");
+      request.onerror = () => setFailure(request.error ?? new Error("Could not read a local message page."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || deleted) {
+          cursorDone = true;
+          finishIfReady();
+          return;
+        }
+        if (messages.length === limit) {
+          hasMore = true;
+          cursorDone = true;
+          finishIfReady();
+          return;
+        }
+        messages.push(cursor.value as StoredMessage);
+        cursor.continue();
+      };
     },
   );
 }
@@ -863,6 +1021,8 @@ export const browserConversationStore: ConversationStore = {
   loadIdentity,
   saveIdentity,
   loadMessages,
+  loadMessage,
+  loadMessagePage,
   loadAcceptedMessageIds,
   loadRequestedMessages,
   saveMessage,

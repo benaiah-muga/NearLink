@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPageCompletePacket, type SyncPacket } from "@nearlink/protocol";
-import { browserConversationStore as conversationStore, type InboundAcceptanceResult, type LocalIdentity, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
+import { browserConversationStore as conversationStore, type InboundAcceptanceResult, type LocalIdentity, type LocalMessagePageCursor, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, WebRtcTransportError, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
 import { createSecureUuid, SecureRandomUnavailableError } from "./lib/secureId";
@@ -81,6 +81,18 @@ function sameMessagePacket(left: MessagePacket, right: MessagePacket): boolean {
     && left.body === right.body;
 }
 
+function compareStoredMessageOrder(left: StoredMessage, right: StoredMessage): number {
+  const leftOrder = Number.isFinite(left.displayOrder) ? left.displayOrder! : Number.MAX_SAFE_INTEGER;
+  const rightOrder = Number.isFinite(right.displayOrder) ? right.displayOrder! : Number.MAX_SAFE_INTEGER;
+  return leftOrder - rightOrder
+    || compareIndexedStringKeys(left.packet.createdAt, right.packet.createdAt)
+    || compareIndexedStringKeys(left.packet.id, right.packet.id);
+}
+
+function compareIndexedStringKeys(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function compactPacketBytes(packet: MessagePacket): number {
   return new TextEncoder().encode(JSON.stringify(packet)).byteLength;
 }
@@ -137,6 +149,8 @@ function App() {
   const [wasmFailed, setWasmFailed] = useState(false);
   const [conversationReady, setConversationReady] = useState(false);
   const [loadedRoom, setLoadedRoom] = useState<string | null>(null);
+  const [localMessagesHasMore, setLocalMessagesHasMore] = useState(false);
+  const [loadingOlderSavedMessages, setLoadingOlderSavedMessages] = useState(false);
   const [isInstallable, setIsInstallable] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [retryingMessageKeys, setRetryingMessageKeys] = useState<Set<string>>(() => new Set());
@@ -195,6 +209,8 @@ function App() {
   const hubInboundTailRef = useRef<Promise<void>>(Promise.resolve());
   const hubInboundFailuresRef = useRef(new Set<string>());
   const historyRequestRef = useRef<PendingHistoryRequest | null>(null);
+  const localMessageCursorRef = useRef<LocalMessagePageCursor | null>(null);
+  const localPageGenerationRef = useRef(0);
   const historyCursorRef = useRef<string | null | undefined>(undefined);
   const historyLimitRef = useRef(MAX_HISTORY_PAGE_MESSAGES);
   const historyRestartedRef = useRef(false);
@@ -233,7 +249,7 @@ function App() {
   function oldestLoadedHubMessageId(): string | null {
     return [...messagesRef.current]
       .filter((item) => item.packet.room === activeRoomRef.current && item.transport === "hub" && item.delivery === "sent")
-      .sort((left, right) => (left.displayOrder ?? Number.MAX_SAFE_INTEGER) - (right.displayOrder ?? Number.MAX_SAFE_INTEGER))[0]
+      .sort(compareStoredMessageOrder)[0]
       ?.packet.id ?? null;
   }
 
@@ -303,6 +319,40 @@ function App() {
     historyCursorRef.current = pending.cursor;
     setHistoryPagingState("retry");
     setHistoryPagingMessage(message);
+  }
+
+  async function loadOlderSavedMessages(): Promise<void> {
+    const selectedRoom = room.trim();
+    const cursor = localMessageCursorRef.current;
+    if (!selectedRoom || !cursor || !localMessagesHasMore || loadingOlderSavedMessages || deletingRoom) return;
+    const generation = localPageGenerationRef.current;
+    setLoadingOlderSavedMessages(true);
+    try {
+      const page = await conversationStore.loadMessagePage(selectedRoom, cursor);
+      if (currentRoomRef.current !== selectedRoom || localPageGenerationRef.current !== generation) return;
+      if (page.deleted) {
+        localMessageCursorRef.current = null;
+        setLocalMessagesHasMore(false);
+        setMessages([]);
+        messageKeysRef.current.clear();
+        setRoomDeletedLocally(true);
+        return;
+      }
+      setMessages((current) => {
+        const byId = new Map(page.messages.map((item) => [item.packet.id, item]));
+        for (const item of current) byId.set(item.packet.id, item);
+        return [...byId.values()].sort(compareStoredMessageOrder);
+      });
+      for (const item of page.messages) messageKeysRef.current.add(`${selectedRoom}\u0000${item.packet.id}`);
+      localMessageCursorRef.current = page.cursor;
+      setLocalMessagesHasMore(page.hasMore && page.cursor !== null);
+    } catch {
+      if (currentRoomRef.current === selectedRoom && localPageGenerationRef.current === generation) {
+        setNotice("Could not load older messages saved on this device. Your current conversation is still available.");
+      }
+    } finally {
+      if (currentRoomRef.current === selectedRoom && localPageGenerationRef.current === generation) setLoadingOlderSavedMessages(false);
+    }
   }
 
   function makeSyncCoordinator(transport: "hub" | "direct", connectionRoom: string, send: (packet: SyncPacket | MessagePacket) => void): SyncCoordinator {
@@ -696,6 +746,7 @@ function App() {
       if (message.version !== 1 || message.sender === tabIdRef.current || typeof message.room !== "string" || message.room !== currentRoomRef.current) return;
       if (message.type === "deleting") {
         deletionGenerationRef.current += 1;
+        localPageGenerationRef.current += 1;
         deletionEventsRef.current.set(message.room, "deleting");
         deletionInProgressRef.current = true;
         setDeletingRoom(true);
@@ -705,12 +756,16 @@ function App() {
       }
       if (message.type === "deleted") {
         deletionGenerationRef.current += 1;
+        localPageGenerationRef.current += 1;
         deletionEventsRef.current.set(message.room, "deleted");
         deletionInProgressRef.current = true;
         setDeletingRoom(true);
         stopRoomTransports();
         setMessages([]);
         messageKeysRef.current.clear();
+        localMessageCursorRef.current = null;
+        setLocalMessagesHasMore(false);
+        setLoadingOlderSavedMessages(false);
         setConflictedHubMessageKeys((current) => new Set([...current].filter((key) => !key.startsWith(`${message.room}\u0000`))));
         setRoomDeletedLocally(true);
         setNotice("Saved messages for this room were deleted from this device in another tab. Hub-retained history may appear if you reconnect.");
@@ -721,13 +776,17 @@ function App() {
       if (message.type === "cancelled") {
         const cancelledRoom = message.room as string;
         deletionGenerationRef.current += 1;
+        localPageGenerationRef.current += 1;
         deletionEventsRef.current.set(cancelledRoom, "cancelled");
         const cancelledGeneration = deletionGenerationRef.current;
-        void Promise.all([conversationStore.loadMessages(cancelledRoom), conversationStore.isRoomMessagesDeleted(cancelledRoom)]).then(([stored, deleted]) => {
+        void conversationStore.loadMessagePage(cancelledRoom).then((page) => {
           if (currentRoomRef.current !== cancelledRoom || deletionGenerationRef.current !== cancelledGeneration || deletionEventsRef.current.get(cancelledRoom) !== "cancelled") return;
+          const stored = page.deleted ? [] : page.messages;
           setMessages(stored);
           messageKeysRef.current = new Set(stored.map((item) => `${item.packet.room}\u0000${item.packet.id}`));
-          setRoomDeletedLocally(deleted);
+          localMessageCursorRef.current = page.deleted ? null : page.cursor;
+          setLocalMessagesHasMore(!page.deleted && page.hasMore && page.cursor !== null);
+          setRoomDeletedLocally(page.deleted);
           deletionInProgressRef.current = false;
           setDeletingRoom(false);
           setNotice("The other tab could not delete the conversation. Saved messages are shown again.");
@@ -815,6 +874,10 @@ function App() {
     setHistoryPagingState("unavailable");
     setHistoryPagingMessage("");
     setHistoryTruncated(false);
+    const pageGeneration = ++localPageGenerationRef.current;
+    localMessageCursorRef.current = null;
+    setLocalMessagesHasMore(false);
+    setLoadingOlderSavedMessages(false);
     setConversationReady(false);
     setLoadedRoom(null);
     setMessages([]);
@@ -822,11 +885,34 @@ function App() {
     let active = true;
     if (room.trim()) {
       const selectedRoom = room.trim();
-      Promise.all([conversationStore.loadMessages(selectedRoom), conversationStore.isRoomMessagesDeleted(selectedRoom)]).then(([stored, deleted]) => { if (active) { setMessages(stored); messageKeysRef.current = new Set(stored.map((item) => `${selectedRoom}\u0000${item.packet.id}`)); for (const item of stored) if (item.failure === "message_conflict") conflictedHubMessageKeysRef.current.add(`${selectedRoom}\u0000${item.packet.id}`); setRoomDeletedLocally(deleted); setLoadedRoom(selectedRoom); setConversationReady(true); } }).catch(() => { if (active) { setMessages([]); messageKeysRef.current.clear(); setLoadedRoom(selectedRoom); setNotice("Could not read this conversation from local storage."); setConversationReady(true); } });
+      conversationStore.loadMessagePage(selectedRoom).then((page) => {
+        if (!active || localPageGenerationRef.current !== pageGeneration) return;
+        const stored = page.deleted ? [] : page.messages;
+        setMessages(stored);
+        messageKeysRef.current = new Set(stored.map((item) => `${selectedRoom}\u0000${item.packet.id}`));
+        for (const item of stored) if (item.failure === "message_conflict") conflictedHubMessageKeysRef.current.add(`${selectedRoom}\u0000${item.packet.id}`);
+        localMessageCursorRef.current = page.deleted ? null : page.cursor;
+        setLocalMessagesHasMore(!page.deleted && page.hasMore && page.cursor !== null);
+        setRoomDeletedLocally(page.deleted);
+        setLoadedRoom(selectedRoom);
+        setConversationReady(true);
+      }).catch(() => {
+        if (active && localPageGenerationRef.current === pageGeneration) {
+          setMessages([]);
+          messageKeysRef.current.clear();
+          localMessageCursorRef.current = null;
+          setLocalMessagesHasMore(false);
+          setLoadedRoom(selectedRoom);
+          setNotice("Could not read this conversation from local storage.");
+          setConversationReady(true);
+        }
+      });
     } else {
       setMessages([]);
       messageKeysRef.current.clear();
       setRoomDeletedLocally(false);
+      localMessageCursorRef.current = null;
+      setLocalMessagesHasMore(false);
       setLoadedRoom("");
       setConversationReady(true);
     }
@@ -999,9 +1085,9 @@ function App() {
           if (queuedPacket?.packet.type === "message" && queuedPacket.persisted) outboundQueue!.ackProcessingId = packet.id;
           let pending = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
           if (!pending) {
-            let persisted: StoredMessage[];
+            let persisted: StoredMessage | null;
             try {
-              persisted = await conversationStore.loadMessages(connectionRoom);
+              persisted = await conversationStore.loadMessage(connectionRoom, packet.id);
             } catch {
               if (outboundQueue?.ackProcessingId === packet.id) outboundQueue.ackProcessingId = null;
               if (socketRef.current === socket && currentRoomRef.current === connectionRoom) {
@@ -1014,7 +1100,7 @@ function App() {
               return;
             }
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
-            pending = persisted.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
+            pending = persisted?.packet.room === connectionRoom && persisted.direction === "outgoing" && (persisted.transport ?? "hub") === "hub" ? persisted : undefined;
           }
           if (!pending) return;
           try {
@@ -1130,7 +1216,8 @@ function App() {
             let rejected = messagesRef.current.find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing");
             if (!rejected && isCurrentMessage && currentOutbound?.persisted) {
               try {
-                rejected = (await conversationStore.loadMessages(connectionRoom)).find((item) => item.packet.id === packet.id && item.packet.room === connectionRoom && item.direction === "outgoing" && (item.transport ?? "hub") === "hub");
+                const persisted = await conversationStore.loadMessage(connectionRoom, packet.id);
+                rejected = persisted?.packet.room === connectionRoom && persisted.direction === "outgoing" && (persisted.transport ?? "hub") === "hub" ? persisted : undefined;
               } catch {
                 rejected = undefined;
               }
@@ -1186,11 +1273,16 @@ function App() {
               failHistoryRequest(pending, "A streamed history message could not be saved. Retry this page; its cursor has not advanced.");
               return;
             }
-            const persisted = await conversationStore.loadMessages(pending.room);
+            const persisted = await conversationStore.loadRequestedMessages(
+              pending.room,
+              completion.messageIds,
+              (packet) => validateWithWasm("message", packet),
+            );
+            const persistedById = new Map(persisted.map((item) => [item.packet.id, item]));
             const pageMessages: StoredMessage[] = [];
             for (const id of completion.messageIds) {
               const packetForId = pending.packets.get(id);
-              const existing = persisted.find((item) => item.packet.id === id);
+              const existing = persistedById.get(id);
               const source = packetForId ?? existing?.packet;
               if (!source || source.room !== pending.room || source.id !== id || !validateWithWasm("message", source)) {
                 failHistoryRequest(pending, "The history page was incomplete or invalid. Retry the same cursor; it has not advanced.");
@@ -1219,18 +1311,41 @@ function App() {
                 failHistoryRequest(pending, "This room was cleared on this device. Resume it before loading hub history again.");
                 return;
               }
-              const verified = await conversationStore.loadMessages(pending.room);
+              const verified = await conversationStore.loadRequestedMessages(
+                pending.room,
+                completion.messageIds,
+                (packet) => validateWithWasm("message", packet),
+              );
+              const verifiedById = new Map(verified.map((item) => [item.packet.id, item]));
               if (!completion.messageIds.every((id) => {
                 const expected = pageMessages.find((item) => item.packet.id === id)?.packet;
-                const actual = verified.find((item) => item.packet.id === id)?.packet;
+                const actual = verifiedById.get(id)?.packet;
                 return Boolean(expected && actual && sameMessagePacket(expected, actual));
               })) {
                 failHistoryRequest(pending, "The saved history page could not be verified. Retry the same cursor.");
                 return;
               }
               if (historyRequestRef.current !== pending || socketRef.current !== socket || currentRoomRef.current !== pending.room) return;
+              const pageGeneration = ++localPageGenerationRef.current;
+              const newestPage = await conversationStore.loadMessagePage(pending.room);
+              if (localPageGenerationRef.current !== pageGeneration || historyRequestRef.current !== pending
+                || socketRef.current !== socket || currentRoomRef.current !== pending.room) return;
+              if (newestPage.deleted) {
+                failHistoryRequest(pending, "This room was cleared on this device. Resume it before loading hub history again.");
+                return;
+              }
               skipHistoryAutoScrollRef.current = true;
-              setMessages(verified);
+              setMessages((current) => {
+                const merged = new Map(current.map((item) => [item.packet.id, item]));
+                for (const item of verified) merged.set(item.packet.id, item);
+                for (const item of newestPage.messages) merged.set(item.packet.id, item);
+                return [...merged.values()].sort(compareStoredMessageOrder);
+              });
+              for (const item of verified) messageKeysRef.current.add(`${pending.room}\u0000${item.packet.id}`);
+              for (const item of newestPage.messages) messageKeysRef.current.add(`${pending.room}\u0000${item.packet.id}`);
+              localMessageCursorRef.current = newestPage.cursor;
+              setLocalMessagesHasMore(newestPage.hasMore && newestPage.cursor !== null);
+              setLoadingOlderSavedMessages(false);
               for (const id of completion.messageIds) messageKeysRef.current.add(`${pending.room}\u0000${id}`);
               historyCursorRef.current = completion.hasMore ? completion.nextCursor : pending.cursor;
               historyLimitRef.current = MAX_HISTORY_PAGE_MESSAGES;
@@ -1295,9 +1410,13 @@ function App() {
             hubSyncRef.current?.observeAcceptedMessage(packet);
             messageKeysRef.current.add(messageKey);
             if (!hasHubInboundFailure(hubInboundFailuresRef.current, connectionRoom)) setNotice((current) => current === HUB_REPLAY_FAILURE_NOTICE ? "" : current);
-            const refreshed = await conversationStore.loadMessages(connectionRoom);
+            const refreshed = await conversationStore.loadMessage(connectionRoom, packet.id);
             if (socketRef.current !== socket || currentRoomRef.current !== connectionRoom) return;
-            setMessages(refreshed);
+            if (refreshed) setMessages((current) => {
+              const byId = new Map(current.map((item) => [item.packet.id, item]));
+              byId.set(refreshed.packet.id, refreshed);
+              return [...byId.values()].sort(compareStoredMessageOrder);
+            });
           });
           hubInboundOperationsRef.current.set(messageKey, operation);
           hubInboundTailRef.current = operation.then(() => undefined, () => undefined);
@@ -1347,11 +1466,7 @@ function App() {
     };
   }, [linkRequested, wasmReady, storageReady, conversationReady, identity, room, hubUrl]);
 
-  const sortedMessages = useMemo(() => loadedRoom === room.trim() ? [...messages].sort((a, b) => {
-    const left = Number.isFinite(a.displayOrder) ? a.displayOrder! : Number.MAX_SAFE_INTEGER;
-    const right = Number.isFinite(b.displayOrder) ? b.displayOrder! : Number.MAX_SAFE_INTEGER;
-    return left - right;
-  }) : [], [loadedRoom, messages, room]);
+  const sortedMessages = useMemo(() => loadedRoom === room.trim() ? [...messages].sort(compareStoredMessageOrder) : [], [loadedRoom, messages, room]);
   const normalizedName = displayName.trim();
   const conversationLoaded = storageReady && conversationReady && loadedRoom === room.trim();
   const composerReady = conversationLoaded && !roomDeletedLocally;
@@ -1487,10 +1602,11 @@ function App() {
     if (validateWithWasm("server", packet) && packet.type === "ack") {
       const key = `${connectionRoom}\u0000${packet.id}`;
       if (!directInFlightRef.current.has(key)) return;
-      const persisted = await conversationStore.loadMessages(connectionRoom).catch(() => null);
-      if (!persisted || directRef.current !== transport || currentRoomRef.current !== connectionRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current || !directInFlightRef.current.has(key)) return;
-      const pending = persisted.find((item) => item.packet.id === packet.id && item.direction === "outgoing" && item.transport === "direct");
-      if (!pending) return;
+      const pending = await conversationStore.loadMessage(connectionRoom, packet.id).catch(() => null);
+      if (!pending || pending.direction !== "outgoing" || pending.transport !== "direct"
+        || directRef.current !== transport || currentRoomRef.current !== connectionRoom
+        || transport.currentState !== "connected" || !fingerprintConfirmedRef.current
+        || !directInFlightRef.current.has(key)) return;
       directInFlightRef.current.delete(key);
       try {
         await conversationStore.updateDelivery(connectionRoom, packet.id, "sent");
@@ -1537,7 +1653,14 @@ function App() {
       directSyncRef.current?.observeAcceptedMessage(packet);
       messageKeysRef.current.add(messageKey);
       if (acceptance === "saved") {
-        setMessages((current) => current.some((entry) => entry.packet.room === packet.room && entry.packet.id === packet.id) ? current : [...current, item].sort((a, b) => a.packet.createdAt.localeCompare(b.packet.createdAt)));
+        const persisted = await conversationStore.loadMessage(connectionRoom, packet.id).catch(() => null);
+        if (currentRoomRef.current !== connectionRoom) return;
+        const visible = persisted ?? item;
+        setMessages((current) => {
+          const byId = new Map(current.map((entry) => [entry.packet.id, entry]));
+          byId.set(visible.packet.id, visible);
+          return [...byId.values()].sort(compareStoredMessageOrder);
+        });
       }
       if (fingerprintConfirmedRef.current && transport.currentState === "connected") {
         const ack: AcknowledgmentPacket = { version: PROTOCOL_VERSION, type: "ack", id: packet.id };
@@ -1785,6 +1908,7 @@ function App() {
     if (!selectedRoom || !conversationReady || loadedRoom !== selectedRoom || deletionInProgressRef.current) return;
     deletionInProgressRef.current = true;
     deletionGenerationRef.current += 1;
+    localPageGenerationRef.current += 1;
     deletionEventsRef.current.set(selectedRoom, "deleting");
     focusDeletionStatusRef.current = true;
     setDeletingRoom(true);
@@ -1805,6 +1929,9 @@ function App() {
       if (currentRoomRef.current === selectedRoom) {
         setMessages([]);
         messageKeysRef.current.clear();
+        localMessageCursorRef.current = null;
+        setLocalMessagesHasMore(false);
+        setLoadingOlderSavedMessages(false);
         setRoomDeletedLocally(true);
         for (const key of hubInboundFailuresRef.current) if (key.startsWith(`${selectedRoom}\u0000`)) hubInboundFailuresRef.current.delete(key);
         for (const key of conflictedHubMessageKeysRef.current) if (key.startsWith(`${selectedRoom}\u0000`)) conflictedHubMessageKeysRef.current.delete(key);
@@ -2039,6 +2166,11 @@ function App() {
             : "This browser cannot assure that saved messages will be retained. Messages may still be lost through user action, device loss, or browser behavior. This is not a backup."}</div>
         <div ref={messageScrollRef} className="message-scroll" role="log" aria-label={`Messages in ${room.trim() || "the selected room"}`} aria-live="polite" aria-relevant="additions" tabIndex={0}>
           {notice && <div ref={deletionStatusRef} className="notice-banner" role="status" tabIndex={-1}><span>!</span>{notice}<button type="button" aria-label="Dismiss notice" onClick={() => setNotice("")}>×</button></div>}
+          {localMessagesHasMore && <section className="history-controls" aria-label="Older saved messages">
+            <button type="button" onClick={() => void loadOlderSavedMessages()} disabled={loadingOlderSavedMessages || deletingRoom} aria-busy={loadingOlderSavedMessages}>
+              {loadingOlderSavedMessages ? "Loading older saved messages…" : "Load older saved messages"}
+            </button>
+          </section>}
           {historyPagingState !== "unavailable" && <section className="history-controls" aria-label="Older room history">
             {historyPagingState === "loading" ? <p role="status" aria-live="polite" aria-busy="true">Loading older messages…</p>
               : historyPagingState === "done" ? <p role="status" aria-live="polite">No more retained hub history is available.</p>
