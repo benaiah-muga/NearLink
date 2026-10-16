@@ -64,15 +64,16 @@ and [MLS threat assumptions](mls-architecture.md#threat-assumptions-and-limits).
 
 ## Candidate evidence and status
 
-Candidate facts below are the dated research snapshot recorded in the
-[architecture investigation](mls-architecture.md#nl-45-feasibility-decision-2026-10-15).
-They must be revalidated against upstream before any later selection decision.
-Neither candidate is selected.
+Candidate facts below incorporate the upstream revalidation recorded in the
+[architecture investigation](mls-architecture.md#nl-60-upstream-revalidation-2026-10-16).
+They must be revalidated again against upstream before any later selection
+decision. No candidate is selected.
 
 | Candidate evidence | Exact reviewed revision | Status and blockers recorded |
 | --- | --- | --- |
-| `mls-rs` release 0.56.0 | Tag commit `8f1b43f447a792ff9307f1c2c7f54da63914870e`; separately observed main commit `44a4097d0b852e48ad7e822e63cb22e0ac36f232` on 2026-10-15 | Possible future research candidate. Web Crypto provider is experimental for cipher suites 2, 5, and 7; browser support for NearLink's targets and atomic IndexedDB state changes are unproven; exact dependency and license review is incomplete; upstream says no full third-party audit. Moving main is not a release candidate. |
-| OpenMLS 0.9.0 | Release tag `openmls-v0.9.0`, commit `3a3e35de3feeca8f6605143c464d5452ae584d43` | Research spike only. Upstream labels `wasm32-unknown-unknown` unsupported and its WASM package experimental; its Rust 1.91.0 minimum exceeds product Rust 1.84.1; synchronous storage does not establish safe asynchronous IndexedDB transactions; the dated lock snapshot includes RustSec findings and an active unmaintained dependency warning requiring disposition. |
+| `mls-rs` release 0.56.0 | Tag commit `8f1b43f447a792ff9307f1c2c7f54da63914870e`; revalidated 2026-10-16 | Core manifest declares Rust 1.82.0, within the product's 1.84.1 pin, but the exact WebCrypto feature graph and named browser runtime remain unverified. WebCrypto is experimental for suites 2, 5, and 7; there is no IndexedDB adapter or atomic state evidence; exact dependency/license/advisory review is incomplete; upstream says no full third-party audit. Official CI activity does not establish exact-profile cross-implementation evidence. |
+| OpenMLS 0.9.0 | Release tag `openmls-v0.9.0`, commit `3a3e35de3feeca8f6605143c464d5452ae584d43` | Research spike only. Upstream labels `wasm32-unknown-unknown` unsupported and its WASM package experimental; Rust 1.91.0 exceeds product Rust 1.84.1; synchronous storage does not establish safe asynchronous IndexedDB transactions; the 2026-10-15 lock snapshot includes RustSec findings and an active unmaintained dependency warning requiring disposition. |
+| `ts-mls` v1.6.4 | Stable tag commit `ddff62aa15d3064fff5d77dda35b3cdf2970870d`; current main is `2.0.0-rc.16` | Newly screened browser-oriented lead only. The project advertises browser use and RFC 9420 support, but says it has no formal security audit. Atomic IndexedDB persistence, NearLink identity and owner policy, exact-profile cross-implementation evidence, native counterpart behavior, and exact dependency/license/advisory review are unproven. |
 
 The OpenMLS spike proves only a narrow native group flow and a WASM compile.
 It uses OpenMLS RustCrypto and basic credentials, tests reload only within an
@@ -85,10 +86,14 @@ scope and dated dependency evidence, and the
 [dependency policy](../dependency-policy.md) for research isolation and audit
 exception handling.
 
-The current hard-gate outcome is that neither evaluated candidate passes.
+The current hard-gate outcome is that no reviewed candidate passes. The
+`mls-rs` declared core MSRV clears one narrow compatibility check but does not
+clear its provider, browser, persistence, dependency, or audit gates. The
+`ts-mls` screen does not establish that it can support NearLink's profile.
 Do not infer selection readiness from compilation, native tests, an RFC claim,
-license metadata, or activity on a moving branch. Candidate scorecard and
-selection rule are in [MLS architecture, candidate library selection](mls-architecture.md#candidate-library-selection).
+license metadata, browser suitability claims, or activity on a moving branch.
+Candidate scorecard and selection rule are in [MLS architecture, candidate
+library selection](mls-architecture.md#candidate-library-selection).
 
 ## Proposed controls for review
 

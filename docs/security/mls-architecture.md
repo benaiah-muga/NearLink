@@ -73,6 +73,74 @@ Revalidation sources: [OpenMLS v0.9.0 supported target table](https://github.com
 [mls-rs current main README at 44a4097](https://github.com/awslabs/mls-rs/blob/44a4097d0b852e48ad7e822e63cb22e0ac36f232/mls-rs/README.md),
 and [mls-rs 0.56.0 tag commit](https://github.com/awslabs/mls-rs/tree/8f1b43f447a792ff9307f1c2c7f54da63914870e).
 
+## NL-60 upstream revalidation, 2026-10-16
+
+This revalidation adds exact upstream metadata and screens one browser-oriented
+alternative. It does not select a candidate or change the hard gates. The
+result remains that no reviewed candidate is ready for product integration.
+
+The exact `mls-rs` 0.56.0 tag still resolves to
+`8f1b43f447a792ff9307f1c2c7f54da63914870e`. Its published core manifest
+declares Rust 1.82.0, which is within NearLink's pinned Rust 1.84.1. This only
+clears the declared core crate MSRV check. It does not establish that the exact
+WebCrypto feature graph and browser target build on 1.84.1, nor does it review
+the resolved dependency graph. The release README continues to describe WASM
+builds and configurable storage traits, but the WebCrypto provider remains
+experimental for suites 2, 5, and 7, with X.509 unsupported. No named-browser
+execution evidence or browser provider maturity evidence was found. The
+published storage examples remain in-memory and SQLite; there is no supplied
+IndexedDB implementation or proof of atomic transactions across MLS state,
+cursor, deduplication, and ACK intent.
+
+The exact `mls-rs-crypto-webcrypto` manifest in the 0.56.0 tag identifies
+provider package version 0.15.0. Its WebCrypto and WASM dependencies establish
+that it is intended to call browser cryptographic APIs, not that the provider
+is production mature or supported in NearLink's named browsers. The package's
+full transitive lock, license compatibility, and current advisory exposure
+have not been reviewed for a NearLink feature graph. Upstream's own statement
+that the implementation has not received a full third-party security audit
+remains a hard-gate blocker. Official upstream audit and interop workflows
+are evidence of project CI activity, but the reviewed material does not
+establish independent cross-implementation exchanges for the exact 0.56.0
+source and proposed NearLink profile.
+
+The OpenMLS v0.9.0 assessment has no material upstream status change in this
+revalidation: its Rust 1.91 minimum remains above the product pin, upstream
+still marks `wasm32-unknown-unknown` unsupported, and synchronous storage does
+not prove safe asynchronous IndexedDB persistence. The existing spike audit
+is a 2026-10-15 lockfile snapshot, not a refreshed scan or continuing coverage.
+
+The official MLS implementation inventory also lists `ts-mls`, a TypeScript
+implementation. Its latest stable release observed here is v1.6.4 at commit
+`ddff62aa15d3064fff5d77dda35b3cdf2970870d`; the moving main branch reports
+version `2.0.0-rc.16`, so it is not a stable revision to assess as a release.
+The project describes browser suitability and RFC 9420 support, and its
+repository includes interop material. Its README says it has no formal
+security audit. The evidence reviewed does not establish an atomic durable
+IndexedDB integration, the NearLink identity and owner policy, native Rust
+counterpart behavior, exact-profile cross-implementation exchanges, or a
+complete exact-release lockfile, license, and advisory review. This is an
+additional research lead only, not a selected or qualified candidate.
+
+| Hard gate | `mls-rs` 0.56.0 revalidation | OpenMLS 0.9.0 | `ts-mls` v1.6.4 screen |
+| --- | --- | --- | --- |
+| Exact release and source | Tag `0.56.0`, commit `8f1b43f447a792ff9307f1c2c7f54da63914870e` | Tag `openmls-v0.9.0`, commit `3a3e35de3feeca8f6605143c464d5452ae584d43` | Stable tag `v1.6.4`, commit `ddff62aa15d3064fff5d77dda35b3cdf2970870d`; main is RC `2.0.0-rc.16` |
+| MSRV and targets | Core manifest says Rust 1.82.0; exact provider feature graph and named-browser runtime remain unverified | Rust 1.91.0; WASM target marked unsupported despite compile CI | Browser use advertised; exact stable release target matrix and required native counterpart remain unverified |
+| Provider and persistence | WebCrypto experimental; no IndexedDB adapter or atomicity evidence | RustCrypto/native evidence only; sync storage API does not establish IndexedDB safety | Browser oriented; no NearLink-ready provider or atomic IndexedDB transaction evidence found |
+| Dependencies, licensing, advisories | Exact NearLink feature graph not inventoried or reviewed | Spike lock audit dated 2026-10-15 and still requires disposition | Exact v1.6.4 lock, licenses, and advisories not reviewed |
+| Maintenance, audit, interoperability | Upstream CI exists; no full third-party audit; exact-profile cross-implementation result not established | Active upstream, but no resolution of target/MSRV/storage blockers or independent audit | Official implementation inventory lists it; project says no formal security audit; repo interop material is not proof for the NearLink profile |
+
+None of these rows is an overall pass. In particular, the core `mls-rs`
+MSRV result and the existence of a browser-oriented TypeScript project do not
+clear the provider, persistence, dependency, identity-policy,
+interoperability, and independent-review gates. Keep all candidates
+unselected. Before a later product integration decision, complete the exact
+candidate scorecard and isolated feasibility work. Before any third-party
+implementation audit, first freeze a reviewed implementation and its release
+artifact as described in the [cryptography design review packet](cryptographic-review-packet.md#preconditions-before-a-third-party-implementation-audit).
+
+Sources checked on 2026-10-16: [mls-rs 0.56.0 release](https://github.com/awslabs/mls-rs/releases/tag/0.56.0), [mls-rs 0.56.0 manifest](https://docs.rs/crate/mls-rs/0.56.0/source/Cargo.toml.orig), [mls-rs 0.56.0 README](https://github.com/awslabs/mls-rs/blob/0.56.0/mls-rs/README.md), [WebCrypto provider manifest](https://github.com/awslabs/mls-rs/blob/0.56.0/mls-rs-crypto-webcrypto/Cargo.toml), [mls-rs audit workflow](https://github.com/awslabs/mls-rs/actions/workflows/audit.yml), [mls-rs interop workflow](https://github.com/awslabs/mls-rs/blob/main/.github/workflows/interop_tests.yml), [MLS implementation inventory](https://github.com/mlswg/mls-implementations/blob/main/implementation_list.md), [ts-mls stable release](https://github.com/LukaJCB/ts-mls/releases/tag/v1.6.4), [ts-mls exact release commit](https://github.com/LukaJCB/ts-mls/commit/ddff62aa15d3064fff5d77dda35b3cdf2970870d), [ts-mls README](https://github.com/LukaJCB/ts-mls/tree/v1.6.4), and [ts-mls current package manifest](https://github.com/LukaJCB/ts-mls/blob/main/package.json).
+
 ## Upstream and toolchain revalidation
 
 Rechecked on 2026-10-14 against the official upstream repositories and their
