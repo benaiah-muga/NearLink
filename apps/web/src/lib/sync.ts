@@ -1,7 +1,6 @@
 import {
-  MAX_SYNC_INVENTORY_IDS,
-  MAX_SYNC_PACKET_IDS,
   PROTOCOL_VERSION,
+  MAX_SYNC_PACKET_IDS,
   isSyncInventoryPagePacket,
   isSyncMissingRequestPacket,
   isSyncPageCompletePacket,
@@ -15,12 +14,12 @@ import {
   createWasmSyncInventoryReceiver,
   createWasmSyncRequestBook,
   createWasmSyncCoverage,
+  createWasmLocalInventory,
   isWasmSyncStateReady,
-  createWasmMissingIdSelector,
-  MAX_SYNC_SELECTION_CHUNK_IDS,
   type SyncInventoryState,
   type SyncRequestState,
   type SyncCoverageState,
+  type SyncLocalInventory,
 } from "./wasmProtocol";
 import { SecureRandomUnavailableError } from "./secureId";
 import type { StoredMessage } from "./storage";
@@ -64,7 +63,7 @@ export class SyncCoordinator {
   private readonly options: SyncCoordinatorOptions;
   private stopped = true;
   private localSyncId = "";
-  private localIds = new Set<string>();
+  private localInventory: SyncLocalInventory | null = null;
   private remote = new Map<string, InventorySession>();
   private wasmInventoryReceivers = new Set<SyncInventoryState>();
   private wasmRequestBooks = new Map<string, SyncRequestState>();
@@ -76,7 +75,6 @@ export class SyncCoordinator {
   private failed = false;
   private inventoryRebroadcast = false;
   private inventoryRebroadcastPending = false;
-  private localLimitReached = false;
   private nextMessageAt = 0;
   private messageSendQueue: Promise<void> = Promise.resolve();
   private pendingMessageWait: { timer: ReturnType<typeof setTimeout>; resolve: () => void; recipient: string } | null = null;
@@ -100,15 +98,13 @@ export class SyncCoordinator {
       this.coverage = createWasmSyncCoverage();
       const snapshot = await this.options.loadAcceptedMessageIds();
       if (!this.isRunActive(startEpoch)) return;
-      const ids = [...new Set(snapshot.ids)].sort().slice(0, MAX_SYNC_INVENTORY_IDS);
-      const limitReached = snapshot.truncated || snapshot.ids.length > MAX_SYNC_INVENTORY_IDS;
-      this.localLimitReached = limitReached;
-      this.localIds = new Set(ids);
+      if (snapshot.room !== this.options.room) throw new Error("Storage returned an inventory for another room.");
+      this.localInventory = createWasmLocalInventory(snapshot);
       this.localSyncId = this.options.makeId();
       this.publishInventory();
       if (this.inventoryRebroadcastPending) this.rebroadcastInventoryOnce();
       this.markLocalSnapshotReady();
-      if (limitReached) {
+      if (snapshot.acceptedIdOverflow) {
         if (!this.markIncomplete()) return;
         this.options.onState?.("partial", "The local inventory exceeded 4,096 IDs. This exchange can only report partial synchronization.");
       }
@@ -135,11 +131,11 @@ export class SyncCoordinator {
     this.retainedControlCount = 0;
     this.senderControlBudgets.clear();
     this.blockedSenders.clear();
-    this.localIds.clear();
+    this.localInventory?.free();
+    this.localInventory = null;
     this.localSyncId = "";
     this.inventoryRebroadcast = false;
     this.inventoryRebroadcastPending = false;
-    this.localLimitReached = false;
     this.nextMessageAt = 0;
     if (this.pendingMessageWait) {
       clearTimeout(this.pendingMessageWait.timer);
@@ -328,25 +324,12 @@ export class SyncCoordinator {
   }
 
   private publishInventory(): void {
-    if (this.stopped || !this.localSyncId) return;
-    const ids = [...this.localIds];
-    for (let offset = 0; offset < ids.length || offset === 0; offset += MAX_SYNC_PACKET_IDS) {
-      const messageIds = ids.slice(offset, offset + MAX_SYNC_PACKET_IDS);
-      const hasMore = offset + messageIds.length < ids.length;
-      const packet: SyncInventoryPagePacket = {
-        version: PROTOCOL_VERSION,
-        type: "sync_inventory_page",
-        room: this.options.room,
-        syncId: this.localSyncId,
-        sender: this.options.sender,
-        cursor: offset === 0 ? null : ids[offset - 1],
-        messageIds,
-        nextCursor: messageIds.at(-1) ?? null,
-        hasMore,
-        limitReached: this.localLimitReached && !hasMore,
-      };
+    if (this.stopped || !this.localSyncId || !this.localInventory) return;
+    for (let offset = 0; ; ) {
+      const packet: SyncInventoryPagePacket = this.localInventory.page(this.options.sender, this.localSyncId, offset);
       this.options.send(packet);
-      if (!hasMore) break;
+      if (!packet.hasMore) break;
+      offset += packet.messageIds.length;
     }
   }
 
@@ -363,30 +346,11 @@ export class SyncCoordinator {
 
   private async requestMissing(session: InventorySession, peerIds: string[]): Promise<void> {
     const requestEpoch = this.epoch;
-    let current: AcceptedMessageIdSnapshot;
-    try {
-      await this.localSnapshotReady;
-      if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
-      current = await this.options.loadAcceptedMessageIds();
-    } catch {
-      if (this.isRunActive(requestEpoch) && this.isSessionActive(session)) this.fail("The local storage check failed. Reconnect to restart synchronization from fresh inventories.");
-      return;
-    }
+    await this.localSnapshotReady;
     if (!this.isRunActive(requestEpoch) || !this.isSessionActive(session)) return;
-    let selector: ReturnType<typeof createWasmMissingIdSelector> | null = null;
     try {
-      selector = createWasmMissingIdSelector(peerIds);
-      let localChunk: string[] = [];
-      if (current.truncated && !this.markIncomplete()) return;
-      for (const id of current.ids) {
-        localChunk.push(id);
-        if (localChunk.length === MAX_SYNC_SELECTION_CHUNK_IDS) {
-          selector.observeLocalIds(localChunk);
-          localChunk = [];
-        }
-      }
-      if (localChunk.length > 0) selector.observeLocalIds(localChunk);
-      const missingIds = selector.finish();
+      if (!this.localInventory) throw new Error("Frozen local inventory is unavailable.");
+      const missingIds = this.localInventory.missingIds(peerIds);
       session.inventoryState.setMissingIds(missingIds);
       if (missingIds.length === 0) {
         this.finishCoveragePlan(session);
@@ -399,8 +363,6 @@ export class SyncCoordinator {
       this.sendNextRequest(session);
     } catch {
       if (this.isRunActive(requestEpoch) && this.isSessionActive(session)) this.fail("WASM could not compare the local snapshot with the peer inventory. Reconnect to restart synchronization.");
-    } finally {
-      selector?.free();
     }
   }
 
@@ -477,7 +439,7 @@ export class SyncCoordinator {
       const current = await this.options.loadRequestedMessages(request.messageIds);
       if (!this.isResponseActive(request, responseEpoch)) return;
       const available = new Map(current.filter((item) => request.messageIds.includes(item.packet.id)
-        && this.localIds.has(item.packet.id)
+        && this.localInventory?.contains(item.packet.id) === true
         && this.options.validateMessage(item.packet)).map((item) => [item.packet.id, item.packet]));
       const emitted: string[] = [];
       for (const id of request.messageIds) {

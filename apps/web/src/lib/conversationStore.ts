@@ -34,6 +34,9 @@ export interface ConversationStore {
 }
 
 export interface AcceptedMessageIdSnapshot {
+  version: 1;
+  room: string;
   ids: string[];
-  truncated: boolean;
+  scanComplete: boolean;
+  acceptedIdOverflow: boolean;
 }

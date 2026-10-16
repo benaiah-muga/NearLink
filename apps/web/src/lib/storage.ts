@@ -64,18 +64,20 @@ export const MAX_HUB_REPLAY_ORDER_IDS = 100;
 export class AcceptedMessageIdCollector {
   readonly ids: string[] = [];
   scanned = 0;
-  truncated = false;
+  scanComplete = false;
+  acceptedIdOverflow = false;
+  scanCapReached = false;
 
   record(row: StoredMessage, room: string, validate: (packet: MessagePacket) => boolean): boolean {
     if (this.scanned >= MAX_SYNC_STORAGE_ROWS_SCANNED) {
-      this.truncated = true;
+      this.scanCapReached = true;
       return false;
     }
     this.scanned += 1;
     if (row?.packet?.room !== room || row.delivery !== "sent" || row.failure !== undefined
       || !isProtocolIdentifier(row.packet.id) || !validate(row.packet)) return true;
     if (this.ids.length >= MAX_SYNC_STORAGE_IDS) {
-      this.truncated = true;
+      this.acceptedIdOverflow = true;
       return false;
     }
     this.ids.push(row.packet.id);
@@ -636,13 +638,20 @@ export async function loadAcceptedMessageIds(
       let cursorDone = false;
       let deletionDone = false;
       const finishIfReady = () => {
-        if (cursorDone && deletionDone) complete({ ids: collector.ids, truncated: collector.truncated });
+        if (cursorDone && deletionDone) complete({
+          version: 1,
+          room,
+          ids: collector.ids,
+          scanComplete: collector.scanComplete,
+          acceptedIdOverflow: collector.acceptedIdOverflow,
+        });
       };
       const deletionRequest = deletionStore.get(room);
       deletionRequest.onsuccess = () => {
         deletionDone = true;
         if (deletionRequest.result) {
           collector.ids.length = 0;
+          collector.scanComplete = true;
           cursorDone = true;
           finishIfReady();
           return;
@@ -656,6 +665,7 @@ export async function loadAcceptedMessageIds(
       request.onsuccess = () => {
         const cursor = request.result;
         if (!cursor) {
+          collector.scanComplete = true;
           cursorDone = true;
           finishIfReady();
           return;

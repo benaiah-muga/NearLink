@@ -32,6 +32,7 @@ const messageReadGate = vi.hoisted(() => ({
   rejectAckFallbackRead: false,
   failNextMessageLoads: 0,
   failNextSaveIds: [] as string[],
+  acceptedIdsSnapshot: null as { version: 1; room: string; ids: string[]; scanComplete: boolean; acceptedIdOverflow: boolean } | null,
   failDeleteRoomMessages: false,
   failCancelRoomDeletion: false,
   saveAttempts: new Map<string, number>(),
@@ -114,6 +115,22 @@ vi.mock("./lib/wasmProtocol", async () => {
         finishPlan: () => { activePlans = Math.max(0, activePlans - 1); },
         abandonPlan: () => { incomplete = true; activePlans = Math.max(0, activePlans - 1); },
         outcome: () => incomplete ? "partial" as const : activePlans > 0 ? "syncing" as const : "complete" as const,
+        free: () => undefined,
+      };
+    },
+    createWasmLocalInventory: (snapshot: import("./lib/wasmProtocol").SyncLocalInventorySnapshot) => {
+      if (snapshot.version !== 1 || snapshot.room === "" || (!snapshot.scanComplete && !snapshot.acceptedIdOverflow)) {
+        throw new Error("Invalid local inventory snapshot.");
+      }
+      const ids = [...snapshot.ids];
+      return {
+        contains: (id: string) => ids.includes(id),
+        missingIds: (peerIds: string[]) => peerIds.filter((id) => !ids.includes(id)),
+        page(sender: string, syncId: string, offset: number) {
+          const messageIds = ids.slice(offset, offset + 100);
+          const hasMore = offset + messageIds.length < ids.length;
+          return { version: 1, type: "sync_inventory_page", room: snapshot.room, syncId, sender, cursor: offset === 0 ? null : ids[offset - 1], messageIds, nextCursor: messageIds.at(-1) ?? null, hasMore, limitReached: snapshot.acceptedIdOverflow && !hasMore };
+        },
         free: () => undefined,
       };
     },
@@ -236,6 +253,8 @@ vi.mock("./lib/wasmProtocol", async () => {
 vi.mock("./lib/storage", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/storage")>();
   const overrides = {
+    loadAcceptedMessageIds: async (room: string, validate: (packet: MessagePacket) => boolean) =>
+      messageReadGate.acceptedIdsSnapshot ?? actual.loadAcceptedMessageIds(room, validate),
     loadIdentity: () => messageReadGate.identityPending ?? actual.loadIdentity(),
     saveIdentity: async (...args: Parameters<typeof actual.saveIdentity>) => {
       if (messageReadGate.identitySavePending) {
@@ -589,6 +608,7 @@ beforeEach(async () => {
   messageReadGate.rejectAckFallbackRead = false;
   messageReadGate.failNextMessageLoads = 0;
   messageReadGate.failNextSaveIds = [];
+  messageReadGate.acceptedIdsSnapshot = null;
   messageReadGate.failDeleteRoomMessages = false;
   messageReadGate.failCancelRoomDeletion = false;
   messageReadGate.saveAttempts = new Map();
@@ -1045,6 +1065,20 @@ describe("browser app messaging flow", () => {
     await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value))).toContainEqual(accepted.packet));
     act(() => socket.receive({ version: 1, type: "ack", id: accepted.packet.id }));
     await waitFor(() => expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_page_complete" && value.requestId === accepted.packet.id)).toBe(true));
+  });
+
+  it("fails an incomplete storage scan before publishing a local inventory", async () => {
+    messageReadGate.acceptedIdsSnapshot = {
+      version: 1,
+      room: ROOM,
+      ids: [],
+      scanComplete: false,
+      acceptedIdOverflow: false,
+    };
+    render(<App />);
+    const socket = await connectTestHub();
+    await screen.findByText(/Local storage could not provide an accepted-message snapshot/i);
+    expect(socket.sent.map((value) => JSON.parse(value)).some((value) => value.type === "sync_inventory_page")).toBe(false);
   });
 
   it("re-advertises once when a hub peer inventory arrives after local join readiness", async () => {

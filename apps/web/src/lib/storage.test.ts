@@ -96,7 +96,7 @@ afterEach(async () => {
 });
 
 describe("local IndexedDB storage", () => {
-  it("caps snapshots at exactly 4,096 accepted IDs and reports the 4,097th as truncated", () => {
+  it("distinguishes a verified 4,097th accepted ID from scan-cap exhaustion", () => {
     const collector = new AcceptedMessageIdCollector();
     for (let index = 0; index < MAX_SYNC_STORAGE_IDS; index += 1) {
       expect(collector.record(message(`id-${String(index).padStart(4, "0")}`, "2026-10-14T09:00:00.000Z", "sent"), "alpha", () => true)).toBe(true);
@@ -104,10 +104,12 @@ describe("local IndexedDB storage", () => {
     expect(collector.ids).toHaveLength(4096);
     expect(collector.ids[0]).toBe("id-0000");
     expect(collector.ids.at(-1)).toBe("id-4095");
-    expect(collector.truncated).toBe(false);
+    expect(collector.acceptedIdOverflow).toBe(false);
+    expect(collector.scanComplete).toBe(false);
     expect(collector.record(message("id-4096", "2026-10-14T09:00:00.000Z", "sent"), "alpha", () => true)).toBe(false);
     expect(collector.ids).toHaveLength(4096);
-    expect(collector.truncated).toBe(true);
+    expect(collector.acceptedIdOverflow).toBe(true);
+    expect(collector.scanCapReached).toBe(false);
   });
 
   it("bounds scanned rows and signals incomplete scans even when every row is rejected", () => {
@@ -117,10 +119,11 @@ describe("local IndexedDB storage", () => {
       expect(collector.record(queued, "alpha", () => true)).toBe(true);
     }
     expect(collector.scanned).toBe(MAX_SYNC_STORAGE_ROWS_SCANNED);
-    expect(collector.truncated).toBe(false);
+    expect(collector.scanCapReached).toBe(false);
     expect(collector.record(queued, "alpha", () => true)).toBe(false);
     expect(collector.scanned).toBe(MAX_SYNC_STORAGE_ROWS_SCANNED);
-    expect(collector.truncated).toBe(true);
+    expect(collector.scanCapReached).toBe(true);
+    expect(collector.acceptedIdOverflow).toBe(false);
     expect(collector.ids).toEqual([]);
   });
 
@@ -129,7 +132,7 @@ describe("local IndexedDB storage", () => {
     await saveMessage(message("alpha", "2026-10-14T09:00:00.000Z", "sent"));
     await saveMessage(message("queued", "2026-10-14T09:00:00.000Z"));
     await saveMessage({ ...message("other-room", "2026-10-14T09:00:00.000Z", "sent"), packet: packet("other-room", "2026-10-14T09:00:00.000Z", "beta") });
-    await expect(loadAcceptedMessageIds("alpha", () => true)).resolves.toEqual({ ids: ["alpha", "zulu"], truncated: false });
+    await expect(loadAcceptedMessageIds("alpha", () => true)).resolves.toEqual({ version: 1, room: "alpha", ids: ["alpha", "zulu"], scanComplete: true, acceptedIdOverflow: false });
   });
 
   it("reads only up to 100 requested accepted valid rows in request order", async () => {
@@ -160,7 +163,7 @@ describe("local IndexedDB storage", () => {
       beginRoomDeletion("alpha").then(() => deleteRoomMessages("alpha")),
     ]);
     expect([[], ["snapshot-race"]]).toContainEqual(deleteSnapshot.ids);
-    expect(await loadAcceptedMessageIds("alpha", () => true)).toEqual({ ids: [], truncated: false });
+    expect(await loadAcceptedMessageIds("alpha", () => true)).toEqual({ version: 1, room: "alpha", ids: [], scanComplete: true, acceptedIdOverflow: false });
   });
 
   it("persists and reloads an identity and ordered messages", async () => {

@@ -61,6 +61,20 @@ vi.mock("./lib/wasmProtocol", async () => {
         free: () => undefined,
       };
     },
+    createWasmLocalInventory: (snapshot: import("./lib/wasmProtocol").SyncLocalInventorySnapshot) => {
+      if (snapshot.version !== 1 || (!snapshot.scanComplete && !snapshot.acceptedIdOverflow)) throw new Error("Invalid local inventory snapshot.");
+      const ids = [...snapshot.ids];
+      return {
+        contains: (id: string) => ids.includes(id),
+        missingIds: (peerIds: string[]) => peerIds.filter((id) => !ids.includes(id)),
+        page(sender: string, syncId: string, offset: number) {
+          const messageIds = ids.slice(offset, offset + 100);
+          const hasMore = offset + messageIds.length < ids.length;
+          return { version: 1, type: "sync_inventory_page", room: snapshot.room, syncId, sender, cursor: offset === 0 ? null : ids[offset - 1], messageIds, nextCursor: messageIds.at(-1) ?? null, hasMore, limitReached: snapshot.acceptedIdOverflow && !hasMore };
+        },
+        free: () => undefined,
+      };
+    },
     MAX_SYNC_SELECTION_CHUNK_IDS: 4096,
     createWasmSyncInventoryReceiver: () => {
       const ids: string[] = [];
@@ -244,6 +258,7 @@ describe("direct peer app flow", () => {
     await saveMessage(accepted);
     render(<App />);
     await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false), { timeout: 5000 });
+    fireEvent.click(screen.getByText(/Optional advanced path: manual direct peer setup/));
     fireEvent.click(screen.getByRole("button", { name: "Create offer" }));
     await screen.findByLabelText("Your signaling JSON to share");
     fireEvent.change(screen.getByLabelText("Paste peer offer or answer JSON"), { target: { value: JSON.stringify({ version: 1, type: "answer", sdp: "test-answer" }) } });

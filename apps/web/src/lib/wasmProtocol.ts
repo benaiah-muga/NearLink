@@ -60,12 +60,34 @@ export interface SyncMissingIdSelector {
   free(): void;
 }
 
+export interface SyncLocalInventory {
+  contains(id: string): boolean;
+  missingIds(peerIds: string[]): string[];
+  page(sender: string, syncId: string, offset: number): SyncInventoryPagePacket;
+  free(): void;
+}
+
+export interface SyncLocalInventorySnapshot {
+  version: 1;
+  room: string;
+  ids: string[];
+  scanComplete: boolean;
+  acceptedIdOverflow: boolean;
+}
+
 interface WasmSyncModule {
   plan_missing_batch_json(missingIdsJson: string, offset: number): string;
   WasmMissingIdSelector: new (peerIdsJson: string) => {
     status_json(): string;
     observe_local_ids_json(localIdsJson: string): string;
     finish_json(): string;
+    free(): void;
+  };
+  WasmLocalInventory: new (snapshotJson: string) => {
+    status_json(): string;
+    contains(id: string): boolean;
+    missing_ids_json(peerIdsJson: string): string;
+    page_json(sender: string, syncId: string, offset: number): string;
     free(): void;
   };
   WasmSyncInventoryReceiver: {
@@ -133,6 +155,8 @@ export function initializeWasmProtocol(): Promise<boolean> {
         ? new wasm.WasmSyncRequestBook() : null;
       const coverageProbe = "WasmSyncCoverage" in wasm && typeof wasm.WasmSyncCoverage === "function"
         ? new wasm.WasmSyncCoverage() : null;
+      const localInventoryProbe = "WasmLocalInventory" in wasm && typeof wasm.WasmLocalInventory === "function"
+        ? new wasm.WasmLocalInventory(JSON.stringify({ version: 1, room: "probe", ids: [], scanComplete: true, acceptedIdOverflow: false })) : null;
       const inventoryApiReady = inventoryProbe !== null && typeof inventoryProbe.set_missing_ids_json === "function"
         && typeof inventoryProbe.next_missing_batch_json === "function"
         && typeof inventoryProbe.has_missing_plan === "function"
@@ -145,16 +169,21 @@ export function initializeWasmProtocol(): Promise<boolean> {
       const coverageApiReady = coverageProbe !== null && typeof coverageProbe.mark_incomplete === "function"
         && typeof coverageProbe.begin_plan === "function" && typeof coverageProbe.finish_plan === "function"
         && typeof coverageProbe.abandon_plan === "function" && typeof coverageProbe.outcome === "function";
+      const localInventoryApiReady = localInventoryProbe !== null && typeof localInventoryProbe.status_json === "function"
+        && typeof localInventoryProbe.contains === "function" && typeof localInventoryProbe.missing_ids_json === "function"
+        && typeof localInventoryProbe.page_json === "function";
       inventoryProbe?.free();
       requestProbe?.free();
       coverageProbe?.free();
+      localInventoryProbe?.free();
       wasmSyncModule = "WasmSyncInventoryReceiver" in wasm && "WasmSyncRequestBook" in wasm
-        && "WasmMissingIdSelector" in wasm && "WasmSyncCoverage" in wasm && "plan_missing_batch_json" in wasm
+        && "WasmMissingIdSelector" in wasm && "WasmSyncCoverage" in wasm && "WasmLocalInventory" in wasm && "plan_missing_batch_json" in wasm
         && typeof wasm.WasmSyncInventoryReceiver === "function"
         && typeof wasm.WasmSyncRequestBook === "function"
         && inventoryApiReady
         && requestApiReady
         && coverageApiReady
+        && localInventoryApiReady
         && typeof wasm.WasmMissingIdSelector === "function"
         && typeof wasm.plan_missing_batch_json === "function" ? wasm : null;
       return true;
@@ -167,6 +196,35 @@ export function initializeWasmProtocol(): Promise<boolean> {
     }
   })();
   return initialization;
+}
+
+export function createWasmLocalInventory(snapshot: SyncLocalInventorySnapshot): SyncLocalInventory {
+  if (!wasmSyncModule) throw new Error("WASM local inventory state is unavailable.");
+  const inventory = new wasmSyncModule.WasmLocalInventory(JSON.stringify(snapshot));
+  const status = parseSyncResult(inventory.status_json());
+  if (status.ok !== true || status.room !== snapshot.room) {
+    inventory.free();
+    const code = typeof status.code === "string" ? status.code : "invalid_result";
+    throw new Error(`WASM rejected local inventory snapshot (${code}).`);
+  }
+  return {
+    contains: (id) => inventory.contains(id),
+    missingIds(peerIds) {
+      const result = parseSyncResult(inventory.missing_ids_json(JSON.stringify(peerIds)));
+      if (result.ok !== true || !Array.isArray(result.missingIds) || !result.missingIds.every((id) => typeof id === "string")) {
+        throw new Error("WASM could not compare the frozen local inventory.");
+      }
+      return result.missingIds;
+    },
+    page(sender, syncId, offset) {
+      const result = parseSyncResult(inventory.page_json(sender, syncId, offset));
+      if (result.ok !== true || typeof result.packet !== "object" || result.packet === null) {
+        throw new Error("WASM could not generate local synchronization inventory page.");
+      }
+      return result.packet as SyncInventoryPagePacket;
+    },
+    free: () => inventory.free(),
+  };
 }
 
 export function createWasmSyncCoverage(): SyncCoverageState {

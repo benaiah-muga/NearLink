@@ -13,9 +13,9 @@
 //! identity, authentication, encryption, or transport behavior.
 
 use nearlink_protocol_core::sync::{
-    plan_missing_batch, InsertOutcome, InventoryPageOutcome, MessageIndex, MissingIdSelector,
-    SyncCoverage, SyncError, SyncInventoryReceiver, SyncMessageOutcome, SyncRequestBook,
-    SyncRequestOutcome, MAX_ENVELOPE_BYTES, MAX_SYNC_SELECTION_CHUNK_IDS,
+    plan_missing_batch, InsertOutcome, InventoryPageOutcome, LocalInventory, MessageIndex,
+    MissingIdSelector, SyncCoverage, SyncError, SyncInventoryReceiver, SyncMessageOutcome,
+    SyncRequestBook, SyncRequestOutcome, MAX_ENVELOPE_BYTES, MAX_SYNC_SELECTION_CHUNK_IDS,
 };
 use nearlink_protocol_core::{
     classify_inbound_acceptance, is_client_packet, is_history_page_complete_packet,
@@ -89,6 +89,8 @@ enum ErrorCode {
     InvalidInventorySequence,
     InventoryConflict,
     InventoryLimit,
+    InvalidLocalInventory,
+    IncompleteLocalInventory,
     InvalidSyncRequest,
     SyncRequestLimit,
     SyncRequestConflict,
@@ -117,6 +119,8 @@ impl ErrorCode {
             Self::InvalidInventorySequence => "invalid_inventory_sequence",
             Self::InventoryConflict => "inventory_conflict",
             Self::InventoryLimit => "inventory_limit",
+            Self::InvalidLocalInventory => "invalid_local_inventory",
+            Self::IncompleteLocalInventory => "incomplete_local_inventory",
             Self::InvalidSyncRequest => "invalid_sync_request",
             Self::SyncRequestLimit => "sync_request_limit",
             Self::SyncRequestConflict => "sync_request_conflict",
@@ -189,6 +193,8 @@ impl From<SyncError> for ErrorCode {
             SyncError::InvalidInventorySequence => Self::InvalidInventorySequence,
             SyncError::InventoryConflict => Self::InventoryConflict,
             SyncError::InventoryLimit => Self::InventoryLimit,
+            SyncError::InvalidLocalInventory => Self::InvalidLocalInventory,
+            SyncError::IncompleteLocalInventory => Self::IncompleteLocalInventory,
             SyncError::InvalidSyncRequest => Self::InvalidSyncRequest,
             SyncError::SyncRequestLimit => Self::SyncRequestLimit,
             SyncError::SyncRequestConflict => Self::SyncRequestConflict,
@@ -266,6 +272,118 @@ pub fn plan_missing_batch_json(missing_ids_json: &str, offset: usize) -> String 
             .to_string()
         }
         Err(error) => sync_error_json(error),
+    }
+}
+
+/// Frozen, versioned local inventory validated from a storage adapter snapshot.
+#[wasm_bindgen]
+pub struct WasmLocalInventory {
+    inner: Result<LocalInventory, ErrorCode>,
+}
+
+#[wasm_bindgen]
+impl WasmLocalInventory {
+    #[wasm_bindgen(constructor)]
+    pub fn new(snapshot_json: &str) -> WasmLocalInventory {
+        if snapshot_json.len() > MAX_KNOWN_IDS_JSON_BYTES {
+            return WasmLocalInventory {
+                inner: Err(ErrorCode::InputTooLarge),
+            };
+        }
+        let value: Value = match serde_json::from_str(snapshot_json) {
+            Ok(value) => value,
+            Err(_) => {
+                return WasmLocalInventory {
+                    inner: Err(ErrorCode::InvalidJson),
+                }
+            }
+        };
+        let exact_fields = value.as_object().is_some_and(|object| {
+            object.len() == 5
+                && [
+                    "version",
+                    "room",
+                    "ids",
+                    "scanComplete",
+                    "acceptedIdOverflow",
+                ]
+                .iter()
+                .all(|field| object.contains_key(*field))
+        });
+        if !exact_fields {
+            return WasmLocalInventory {
+                inner: Err(ErrorCode::InvalidLocalInventory),
+            };
+        }
+        let parsed = (|| {
+            let version = value.get("version")?.as_u64()?.try_into().ok()?;
+            let room = value.get("room")?.as_str()?;
+            let ids = serde_json::from_value::<Vec<String>>(value.get("ids")?.clone()).ok()?;
+            let scan_complete = value.get("scanComplete")?.as_bool()?;
+            let accepted_id_overflow = value.get("acceptedIdOverflow")?.as_bool()?;
+            Some((
+                version,
+                room.to_owned(),
+                ids,
+                scan_complete,
+                accepted_id_overflow,
+            ))
+        })();
+        let Some((version, room, ids, scan_complete, accepted_id_overflow)) = parsed else {
+            return WasmLocalInventory {
+                inner: Err(ErrorCode::InvalidLocalInventory),
+            };
+        };
+        WasmLocalInventory {
+            inner: LocalInventory::from_snapshot(
+                version,
+                &room,
+                ids,
+                scan_complete,
+                accepted_id_overflow,
+            )
+            .map_err(ErrorCode::from),
+        }
+    }
+
+    pub fn status_json(&self) -> String {
+        match &self.inner {
+            Ok(inventory) => json!({"ok": true, "room": inventory.room()}).to_string(),
+            Err(error) => error_json(*error),
+        }
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner
+            .as_ref()
+            .is_ok_and(|inventory| inventory.contains(id))
+    }
+
+    pub fn missing_ids_json(&self, peer_ids_json: &str) -> String {
+        if peer_ids_json.len() > MAX_KNOWN_IDS_JSON_BYTES {
+            return error_json(ErrorCode::InputTooLarge);
+        }
+        let peer_ids: Vec<String> = match serde_json::from_str(peer_ids_json) {
+            Ok(ids) => ids,
+            Err(_) => return error_json(ErrorCode::InvalidJson),
+        };
+        match &self.inner {
+            Ok(inventory) => match inventory.missing_ids(&peer_ids) {
+                Ok(missing_ids) => json!({"ok": true, "missingIds": missing_ids}).to_string(),
+                Err(error) => sync_error_json(error),
+            },
+            Err(error) => error_json(*error),
+        }
+    }
+
+    pub fn page_json(&self, sender: &str, sync_id: &str, offset: usize) -> String {
+        match &self.inner {
+            Ok(inventory) => match inventory.page(sender, sync_id, offset) {
+                Ok(packet) => json!({"ok": true, "packet": packet}).to_string(),
+                Err(error) => sync_error_json(error),
+            },
+            Err(error) => error_json(*error),
+        }
     }
 }
 
@@ -648,6 +766,35 @@ impl Default for WasmSyncRequestBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_inventory_facade_rejects_unproven_truncation_and_pages_frozen_snapshot() {
+        let incomplete = WasmLocalInventory::new(
+            r#"{"version":1,"room":"room1","ids":[],"scanComplete":false,"acceptedIdOverflow":false}"#,
+        );
+        assert_eq!(
+            parse_result(&incomplete.status_json())["code"],
+            "incomplete_local_inventory"
+        );
+        let mut ids = Vec::new();
+        ids.extend((0..4_096).map(|index| format!("id-{index:04}")));
+        let snapshot = json!({"version": 1, "room": "room1", "ids": ids, "scanComplete": false, "acceptedIdOverflow": true});
+        let inventory = WasmLocalInventory::new(&snapshot.to_string());
+        assert_eq!(parse_result(&inventory.status_json())["ok"], true);
+        assert!(inventory.contains("id-0042"));
+        assert!(!inventory.contains("missing"));
+        let page = parse_result(&inventory.page_json("sender", "session", 4_000));
+        assert_eq!(page["packet"]["limitReached"], true);
+        assert_eq!(page["packet"]["messageIds"].as_array().unwrap().len(), 96);
+        assert_eq!(
+            parse_result(&inventory.page_json("sender", "session", 0))["packet"]["limitReached"],
+            false
+        );
+        assert_eq!(
+            parse_result(&inventory.missing_ids_json(r#"["id-0042","id-9999"]"#))["missingIds"],
+            json!(["id-9999"])
+        );
+    }
 
     #[test]
     fn synchronization_coverage_facade_waits_and_persists_partial_outcome() {

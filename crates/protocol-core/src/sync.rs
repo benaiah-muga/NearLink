@@ -64,6 +64,91 @@ pub const MAX_PAGE_BYTES: usize = 512 * 1024;
 /// Maximum number of local IDs accepted in one missing-ID scan chunk.
 pub const MAX_SYNC_SELECTION_CHUNK_IDS: usize = 4_096;
 
+/// Frozen, validated local inventory for one synchronization session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalInventory {
+    room: String,
+    ids: Vec<String>,
+    limit_reached: bool,
+}
+
+impl LocalInventory {
+    /// Validate versioned storage output. IDs must already be sorted and unique.
+    pub fn from_snapshot(
+        version: u8,
+        room: &str,
+        ids: Vec<String>,
+        scan_complete: bool,
+        accepted_id_overflow: bool,
+    ) -> Result<Self, SyncError> {
+        if version != 1 || !crate::is_protocol_room(room) {
+            return Err(SyncError::InvalidLocalInventory);
+        }
+        if ids.len() > MAX_SYNC_INVENTORY_IDS
+            || ids.iter().any(|id| !is_protocol_identifier(id))
+            || ids.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(SyncError::InvalidLocalInventory);
+        }
+        if accepted_id_overflow {
+            if ids.len() != MAX_SYNC_INVENTORY_IDS {
+                return Err(SyncError::InvalidLocalInventory);
+            }
+        } else if !scan_complete {
+            return Err(SyncError::IncompleteLocalInventory);
+        }
+        Ok(Self {
+            room: room.to_owned(),
+            ids,
+            limit_reached: accepted_id_overflow,
+        })
+    }
+
+    pub fn room(&self) -> &str {
+        &self.room
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(id))
+            .is_ok()
+    }
+
+    pub fn missing_ids(&self, peer_ids: &[String]) -> Result<Vec<String>, SyncError> {
+        validate_ordered_ids(peer_ids)?;
+        Ok(peer_ids
+            .iter()
+            .filter(|id| !self.contains(id))
+            .cloned()
+            .collect())
+    }
+
+    /// Return one deterministic protocol inventory page as a packet value.
+    pub fn page(&self, sender: &str, sync_id: &str, offset: usize) -> Result<Value, SyncError> {
+        if !is_protocol_identifier(sender) || !is_protocol_identifier(sync_id) {
+            return Err(SyncError::InvalidIdentifier);
+        }
+        if offset > self.ids.len() || (offset != 0 && offset == self.ids.len()) {
+            return Err(SyncError::InvalidPageLimit);
+        }
+        let end = (offset + crate::MAX_SYNC_PACKET_IDS).min(self.ids.len());
+        let ids = &self.ids[offset..end];
+        let has_more = end < self.ids.len();
+        Ok(serde_json::json!({
+            "version": crate::PROTOCOL_VERSION,
+            "type": "sync_inventory_page",
+            "room": self.room,
+            "syncId": sync_id,
+            "sender": sender,
+            "cursor": if offset == 0 { None::<String> } else { Some(self.ids[offset - 1].clone()) },
+            "messageIds": ids,
+            "nextCursor": ids.last().cloned(),
+            "hasMore": has_more,
+            "limitReached": self.limit_reached && !has_more,
+        }))
+    }
+}
+
 /// Aggregates only the coverage outcome for one synchronization exchange.
 /// Storage, transport, and peer scheduling remain owned by the caller.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
@@ -234,6 +319,10 @@ pub enum SyncError {
     InventoryConflict,
     /// An inventory exceeded the 4,096 ID bound.
     InventoryLimit,
+    /// A versioned local inventory snapshot is malformed.
+    InvalidLocalInventory,
+    /// Storage stopped before complete enumeration without proving overflow.
+    IncompleteLocalInventory,
     /// A missing-message request failed structural validation.
     InvalidSyncRequest,
     /// The bounded set of outstanding sync requests is full.
@@ -264,6 +353,8 @@ impl fmt::Display for SyncError {
             Self::InvalidInventorySequence => "synchronization inventory sequence is invalid",
             Self::InventoryConflict => "synchronization inventory cursor conflicts",
             Self::InventoryLimit => "synchronization inventory exceeds count limit",
+            Self::InvalidLocalInventory => "local synchronization inventory snapshot is invalid",
+            Self::IncompleteLocalInventory => "local synchronization inventory scan is incomplete",
             Self::InvalidSyncRequest => "invalid synchronization request",
             Self::SyncRequestLimit => "outstanding synchronization requests exceed count limit",
             Self::SyncRequestConflict => "synchronization request ID conflicts",
@@ -1057,6 +1148,69 @@ impl MessageIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_inventory_validates_snapshot_and_freezes_pages_and_membership() {
+        assert_eq!(
+            LocalInventory::from_snapshot(2, "room", vec![], true, false),
+            Err(SyncError::InvalidLocalInventory)
+        );
+        assert_eq!(
+            LocalInventory::from_snapshot(1, "room", vec!["b".into(), "a".into()], true, false),
+            Err(SyncError::InvalidLocalInventory)
+        );
+        assert_eq!(
+            LocalInventory::from_snapshot(1, "room", vec![], false, false),
+            Err(SyncError::IncompleteLocalInventory)
+        );
+        assert_eq!(
+            LocalInventory::from_snapshot(1, "room", vec!["a".into()], false, true),
+            Err(SyncError::InvalidLocalInventory)
+        );
+
+        let empty = LocalInventory::from_snapshot(1, "room", vec![], true, false).unwrap();
+        let packet = empty.page("sender", "session", 0).unwrap();
+        assert!(crate::is_sync_inventory_page_packet(&packet));
+        assert_eq!(packet["messageIds"], serde_json::json!([]));
+        assert!(!packet["limitReached"].as_bool().unwrap());
+
+        let ids: Vec<String> = (0..101).map(|index| format!("id-{index:03}")).collect();
+        let inventory = LocalInventory::from_snapshot(1, "room", ids.clone(), true, false).unwrap();
+        assert!(inventory.contains("id-050"));
+        assert!(!inventory.contains("missing"));
+        let first = inventory.page("sender", "session", 0).unwrap();
+        let last = inventory.page("sender", "session", 100).unwrap();
+        assert!(crate::is_sync_inventory_page_packet(&first));
+        assert!(crate::is_sync_inventory_page_packet(&last));
+        assert_eq!(first["messageIds"].as_array().unwrap().len(), 100);
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(last["messageIds"], serde_json::json!(["id-100"]));
+        assert_eq!(
+            inventory
+                .missing_ids(&["id-050".into(), "id-101".into()])
+                .unwrap(),
+            vec!["id-101"]
+        );
+    }
+
+    #[test]
+    fn only_verified_4097th_accepted_id_sets_inventory_limit_flag() {
+        let ids: Vec<String> = (0..MAX_SYNC_INVENTORY_IDS)
+            .map(|index| format!("id-{index:04}"))
+            .collect();
+        assert_eq!(
+            LocalInventory::from_snapshot(1, "room", ids.clone(), false, false),
+            Err(SyncError::IncompleteLocalInventory)
+        );
+        let inventory = LocalInventory::from_snapshot(1, "room", ids, false, true).unwrap();
+        let final_page = inventory.page("sender", "session", 4_000).unwrap();
+        assert!(crate::is_sync_inventory_page_packet(&final_page));
+        assert_eq!(final_page["limitReached"], true);
+        assert_eq!(
+            inventory.page("sender", "session", 0).unwrap()["limitReached"],
+            false
+        );
+    }
 
     #[test]
     fn coverage_outcome_waits_for_every_active_plan_and_keeps_incompleteness() {

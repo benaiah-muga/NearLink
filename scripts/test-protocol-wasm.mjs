@@ -54,7 +54,7 @@ try {
     `<!doctype html>
 <meta charset="utf-8">
 <script type="module">
-  import init, { validate_json, classify_inbound_json, plan_missing_batch_json, WasmMessageIndex, WasmMissingIdSelector, WasmSyncCoverage, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
+  import init, { validate_json, classify_inbound_json, plan_missing_batch_json, WasmLocalInventory, WasmMessageIndex, WasmMissingIdSelector, WasmSyncCoverage, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
 
   const check = (condition, label) => {
     if (!condition) throw new Error(label);
@@ -78,6 +78,23 @@ try {
     coverage.abandon_plan();
     check(coverage.outcome() === "partial", "coverage did not preserve incomplete outcome");
     coverage.free();
+    const incompleteInventory = new WasmLocalInventory(JSON.stringify({ version: 1, room: "room1", ids: [], scanComplete: false, acceptedIdOverflow: false }));
+    check(result(incompleteInventory.status_json()).code === "incomplete_local_inventory", "unproven incomplete local inventory was accepted");
+    incompleteInventory.free();
+    const emptyInventory = new WasmLocalInventory(JSON.stringify({ version: 1, room: "room1", ids: [], scanComplete: true, acceptedIdOverflow: false }));
+    const emptyPage = result(emptyInventory.page_json("device1", "session1", 0));
+    check(result(emptyInventory.status_json()).ok && emptyPage.packet.messageIds.length === 0 && !emptyPage.packet.limitReached, "empty local inventory mismatch");
+    emptyInventory.free();
+    const localIds = Array.from({ length: 4096 }, (_, index) => "id-" + String(index).padStart(4, "0"));
+    const localInventory = new WasmLocalInventory(JSON.stringify({ version: 1, room: "room1", ids: localIds, scanComplete: false, acceptedIdOverflow: true }));
+    check(result(localInventory.status_json()).ok, "verified overflow snapshot rejected");
+    check(localInventory.contains("id-0042") && !localInventory.contains("missing"), "frozen local membership mismatch");
+    const missing = result(localInventory.missing_ids_json(JSON.stringify(["id-0042", "id-9999"])));
+    check(JSON.stringify(missing.missingIds) === JSON.stringify(["id-9999"]), "local inventory missing-ID comparison mismatch");
+    const boundedPage = result(localInventory.page_json("device1", "session1", 4000));
+    check(boundedPage.packet.messageIds.length === 96 && boundedPage.packet.limitReached, "verified overflow final page mismatch");
+    check(!result(localInventory.page_json("device1", "session1", 0)).packet.limitReached, "overflow flag appeared before final page");
+    localInventory.free();
     const vectors = await fetch("/vectors.json").then((response) => response.json());
     const syncVectors = await fetch("/sync-state-vectors.json").then((response) => response.json());
     const acceptanceVectors = await fetch("/inbound-acceptance-vectors.json").then((response) => response.json());
@@ -232,7 +249,7 @@ try {
   await page.waitForFunction(() => window.__protocolWasmResult !== undefined);
   const result = await page.evaluate(() => window.__protocolWasmResult);
   assert.equal(result.ok, true, result.error ?? "WebAssembly browser check failed");
-  console.log(`NEARLINK_PROTOCOL_WASM_BROWSER_OK vectors=${result.vectorCount} syncStateVectors=${result.syncVectorCount}`);
+    console.log(`NEARLINK_PROTOCOL_WASM_BROWSER_OK vectors=${result.vectorCount} syncStateVectors=${result.syncVectorCount} localInventory=ok`);
 } finally {
   await browser?.close();
   if (server) await new Promise((resolve) => server.close(resolve));

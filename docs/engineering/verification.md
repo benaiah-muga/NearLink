@@ -78,13 +78,21 @@ target, and `wasm-bindgen-cli` 0.2.103. It generates ignored files under
 first. The app fails closed if the generated module cannot initialize. The
 `test:wasm` command separately exercises the binding and shared protocol
 vectors in Chromium. In the browser synchronization flow, Rust/WASM owns
-bounded inventory sequence acceptance, the frozen missing-ID plan and
-batching, request replay/conflict checks, requested-message matching, and
-staged completion correlation and validation. It selects missing IDs against
-accepted-ID snapshots in bounded chunks. TypeScript keeps WASM handles and
-peer scheduling/async continuation. It owns bounded IndexedDB reads and durable message acceptance, validates
-loaded durable rows, and asks Rust/WASM to compare exact IDs and packets with
-tracked state. TypeScript records storage truncation, partial-page, and bounded-peer conditions through the Rust/WASM coverage aggregator. Rust/WASM reports the aggregate partial/final outcome; TypeScript presents it and owns transport sends, timers, and rate budgets. Rust exchange state and the `MessageIndex` are in-memory
+validation of the versioned room-scoped frozen local-ID snapshot, deterministic
+inventory page generation including empty inventories, frozen membership and
+missing-ID lookup, bounded inventory sequence acceptance, the frozen missing-ID
+plan and batching, request replay/conflict checks, requested-message matching,
+and staged completion correlation and validation. IndexedDB reports
+`scanComplete` and `acceptedIdOverflow` separately. Only observing the 4,097th
+accepted ID permits wire `limitReached`. If a 16,384-row scan cap is reached
+without proving overflow, sync fails before publishing inventory because the
+current wire format cannot express an unknown incomplete scan. TypeScript keeps
+WASM handles and peer scheduling/async continuation. It owns bounded IndexedDB
+reads and durable message acceptance, validates loaded durable rows, and asks
+Rust/WASM to compare exact packets with tracked state. TypeScript records
+partial-page and bounded-peer conditions through the Rust/WASM coverage
+aggregator. Rust/WASM reports the aggregate partial/final outcome; TypeScript
+presents it and owns transport sends, timers, and rate budgets. Rust exchange state and the `MessageIndex` are in-memory
 and are not the browser's persistent source of truth. These APIs do not
 provide peer authentication, encryption, guaranteed-complete synchronization,
 or a native mobile target, and there is no native app in the repository.
