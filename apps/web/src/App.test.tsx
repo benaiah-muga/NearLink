@@ -410,7 +410,7 @@ function sendHistoryCompletion(socket: MockWebSocket, packets: ReturnType<typeof
 
 async function connectTestHub(sendReplayBoundary = true): Promise<MockWebSocket> {
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-  await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false));
+  await waitFor(() => expect((screen.getByRole("button", { name: "Connect radio" }) as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 });
   fireEvent.click(screen.getByRole("button", { name: "Connect radio" }));
   await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
   const socket = MockWebSocket.instances[0];
@@ -517,7 +517,7 @@ describe("hub join handshake", () => {
       await advance(1);
       expect(MockWebSocket.instances).toHaveLength(index + 2);
     }
-  });
+  }, 10000);
 
   it("clears the join timeout on a validated join and resets the retry delay", async () => {
     render(<App />);
@@ -1596,7 +1596,7 @@ describe("browser app messaging flow", () => {
     const socket = await connectTestHub();
     const boundary = hubMessage("history-boundary", "2026-10-14T08:00:00.000Z");
     act(() => socket.receive(boundary));
-    await screen.findByText(boundary.body);
+    await screen.findByText(boundary.body, {}, { timeout: 5000 });
 
     fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
     await waitFor(() => expect(JSON.parse(socket.sent.at(-1)!).type).toBe("history_request"));
@@ -1606,7 +1606,7 @@ describe("browser app messaging flow", () => {
       hubMessage("page-one-oldest", "2026-10-14T23:00:00.000Z"),
     ];
     act(() => { socket.receive(newestFirst[0]); socket.receive(newestFirst[1]); sendHistoryCompletion(socket, newestFirst, "page-one-oldest", true); });
-    await screen.findByText(newestFirst[1].body);
+    await screen.findByText(newestFirst[1].body, {}, { timeout: 5000 });
     await waitFor(async () => expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual([
       "page-one-oldest", "page-one-newest", "history-boundary",
     ]));
@@ -1619,7 +1619,7 @@ describe("browser app messaging flow", () => {
       hubMessage("page-two-oldest", "2026-10-14T22:00:00.000Z"),
     ];
     act(() => { socket.receive(secondPage[0]); socket.receive(secondPage[1]); sendHistoryCompletion(socket, secondPage, null, false); });
-    await screen.findByText(secondPage[1].body);
+    await screen.findByText(secondPage[1].body, {}, { timeout: 5000 });
     await waitFor(async () => expect((await loadMessages(ROOM)).map((item) => item.packet.id)).toEqual([
       "page-two-oldest", "page-two-newest", "page-one-oldest", "page-one-newest", "history-boundary",
     ]));

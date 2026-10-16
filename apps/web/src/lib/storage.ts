@@ -262,6 +262,22 @@ function observe<T>(request: IDBRequest<T>, complete: (result: T) => void, setFa
   request.onerror = () => setFailure(request.error ?? new Error("IndexedDB request failed."));
 }
 
+function requestNextDisplayOrder(
+  index: IDBIndex,
+  room: string,
+  complete: (nextOrder: number) => void,
+  setFailure: (cause: unknown) => void,
+): void {
+  const range = IDBKeyRange.bound([room, -Number.MAX_VALUE], [room, Number.MAX_VALUE]);
+  const request = index.openCursor(range, "prev");
+  request.onsuccess = () => {
+    const last = request.result?.value as StoredMessage | undefined;
+    const maximum = Number.isFinite(last?.displayOrder) ? last!.displayOrder! : -1;
+    complete(maximum + 1);
+  };
+  request.onerror = () => setFailure(request.error ?? new Error("Could not read local message order."));
+}
+
 export async function loadIdentity(): Promise<LocalIdentity | null> {
   return withTransaction<{ key: string; sender: string; senderName: string } | undefined>(
     "Could not load the local identity",
@@ -493,20 +509,18 @@ export async function saveMessage(message: StoredMessage): Promise<boolean> {
       const tombstones = transaction.objectStore(ROOM_DELETION_STORE);
       const tombstoneRequest = tombstones.get(message.packet.room);
       const existingRequest = store.get([message.packet.room, message.packet.id]) as IDBRequest<StoredMessage | undefined>;
-      const range = IDBKeyRange.bound([message.packet.room, ""], [message.packet.room, "\uffff"]);
-      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
       let tombstoneReady = false;
       let deleted = false;
       let existingReady = false;
       let existing: StoredMessage | undefined;
-      let roomMessages: StoredMessage[] | undefined;
+      let nextOrderReady = false;
+      let nextOrder = 0;
       const maybeSave = () => {
-        if (!tombstoneReady || !existingReady || !roomMessages) return;
+        if (!tombstoneReady || !existingReady || !nextOrderReady) return;
         if (deleted) {
           complete(false);
           return;
         }
-        const nextOrder = roomMessages.reduce((maximum, item) => Math.max(maximum, Number.isFinite(item.displayOrder) ? item.displayOrder! : -1), -1) + 1;
         const displayOrder = Number.isFinite(message.displayOrder)
           ? message.displayOrder
           : existing?.displayOrder ?? nextOrder;
@@ -520,10 +534,9 @@ export async function saveMessage(message: StoredMessage): Promise<boolean> {
       };
       tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeSave(); };
       existingRequest.onsuccess = () => { existingReady = true; existing = existingRequest.result; maybeSave(); };
-      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeSave(); };
+      requestNextDisplayOrder(store.index(ROOM_DISPLAY_ORDER_INDEX), message.packet.room, (order) => { nextOrderReady = true; nextOrder = order; maybeSave(); }, setFailure);
       tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
       existingRequest.onerror = () => setFailure(existingRequest.error ?? new Error("Could not read the existing local message."));
-      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read local message order."));
     },
   );
 }
@@ -538,15 +551,14 @@ export async function acceptInboundMessage(message: StoredMessage): Promise<Inbo
     (store, complete, setFailure, transaction) => {
       const tombstoneRequest = transaction.objectStore(ROOM_DELETION_STORE).get(message.packet.room);
       const existingRequest = store.get([message.packet.room, message.packet.id]) as IDBRequest<StoredMessage | undefined>;
-      const range = IDBKeyRange.bound([message.packet.room, ""], [message.packet.room, "\uffff"]);
-      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
       let tombstoneReady = false;
       let deleted = false;
       let existingReady = false;
       let existing: StoredMessage | undefined;
-      let roomMessages: StoredMessage[] | undefined;
+      let nextOrderReady = false;
+      let nextOrder = 0;
       const maybeAccept = () => {
-        if (!tombstoneReady || !existingReady || !roomMessages) return;
+        if (!tombstoneReady || !existingReady || !nextOrderReady) return;
         let decision: ReturnType<typeof classifyInboundAcceptance>;
         try {
           decision = classifyInboundAcceptance(message.packet.room, deleted, message.packet, existing?.packet);
@@ -573,7 +585,6 @@ export async function acceptInboundMessage(message: StoredMessage): Promise<Inbo
           }
           return;
         }
-        const nextOrder = roomMessages.reduce((maximum, item) => Math.max(maximum, Number.isFinite(item.displayOrder) ? item.displayOrder! : -1), -1) + 1;
         const accepted: StoredMessage = { ...message, delivery: "sent", displayOrder: nextOrder };
         try {
           observe(store.add(accepted), () => complete("saved"), setFailure);
@@ -584,10 +595,9 @@ export async function acceptInboundMessage(message: StoredMessage): Promise<Inbo
       };
       tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeAccept(); };
       existingRequest.onsuccess = () => { existingReady = true; existing = existingRequest.result; maybeAccept(); };
-      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeAccept(); };
+      requestNextDisplayOrder(store.index(ROOM_DISPLAY_ORDER_INDEX), message.packet.room, (order) => { nextOrderReady = true; nextOrder = order; maybeAccept(); }, setFailure);
       tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
       existingRequest.onerror = () => setFailure(existingRequest.error ?? new Error("Could not read the existing local message."));
-      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read local message order."));
     },
   );
 }

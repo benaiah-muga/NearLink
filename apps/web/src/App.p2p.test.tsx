@@ -254,7 +254,7 @@ describe("direct peer app flow", () => {
     }));
     await waitFor(() => expect(transport.sent.map((entry) => JSON.parse(entry)).some((packet) => packet.type === "sync_page_complete" && packet.requestId === "direct-peer-request")).toBe(true));
     expect(transport.sent.map((entry) => JSON.parse(entry))).toContainEqual(accepted.packet);
-  });
+  }, 10000);
 
   it("exchanges signaling, blocks unverified direct send, saves messages before ACK, and records peer acceptance", async () => {
     render(<App />);

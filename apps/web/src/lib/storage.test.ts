@@ -51,6 +51,27 @@ function message(id: string, createdAt: string, delivery: StoredMessage["deliver
   return { packet: packet(id, createdAt), direction: "outgoing", delivery };
 }
 
+async function seedLargeRoom(rowCount: number, includeLegacyRow = false): Promise<void> {
+  await saveIdentity({ sender: "device-1", senderName: "Ada" });
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = openRequest();
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+  });
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction("messages", "readwrite");
+    const store = transaction.objectStore("messages");
+    for (let index = 0; index < rowCount; index += 1) {
+      store.put({ ...message(`large-${String(index).padStart(4, "0")}`, "2026-10-14T09:00:00.000Z"), displayOrder: index });
+    }
+    if (includeLegacyRow) store.put(message("legacy-no-order", "2026-10-14T09:00:01.000Z"));
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error);
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
 afterEach(async () => {
   classifierGate.failNext = false;
   vi.restoreAllMocks();
@@ -139,6 +160,49 @@ describe("local IndexedDB storage", () => {
       { ...message("incoming", "2026-10-14T09:30:00.000Z", "sent"), direction: "incoming", displayOrder: 2 },
     ]);
     await expect(loadMessages("missing")).resolves.toEqual([]);
+  });
+
+  it("uses one reverse max cursor for large-room saves and inbound acceptance", async () => {
+    const existingRows = 512;
+    await seedLargeRoom(existingRows, true);
+
+    let materializedRoomRows = 0;
+    const cursorDirections: IDBCursorDirection[] = [];
+    let cursorContinues = 0;
+    const originalGetAll = IDBIndex.prototype.getAll;
+    const originalOpenCursor = IDBIndex.prototype.openCursor;
+    const originalContinue = IDBCursor.prototype.continue;
+    vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+      if (this.name === "roomCreatedAt") materializedRoomRows += 1;
+      return originalGetAll.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["openCursor"]>) {
+      if (this.name === "roomDisplayOrder") cursorDirections.push(args[1] ?? "next");
+      return originalOpenCursor.apply(this, args);
+    });
+    vi.spyOn(IDBCursor.prototype, "continue").mockImplementation(function (this: IDBCursor, ...args: Parameters<IDBCursor["continue"]>) {
+      if ((this.source as IDBIndex).name === "roomDisplayOrder") cursorContinues += 1;
+      return originalContinue.apply(this, args);
+    });
+
+    await expect(saveMessage(message("large-room-save", "2026-10-14T09:01:00.000Z"))).resolves.toBe(true);
+    const incoming: StoredMessage = {
+      packet: packet("large-room-inbound", "2026-10-14T09:02:00.000Z"),
+      direction: "incoming",
+      delivery: "sent",
+      transport: "direct",
+    };
+    await expect(acceptInboundMessage(incoming)).resolves.toBe("saved");
+
+    expect(materializedRoomRows).toBe(0);
+    expect(cursorDirections).toEqual(["prev", "prev"]);
+    expect(cursorContinues).toBe(0);
+    vi.restoreAllMocks();
+
+    const rows = await loadMessages("alpha");
+    expect(rows.find((row) => row.packet.id === "large-room-save")?.displayOrder).toBe(existingRows);
+    expect(rows.find((row) => row.packet.id === "large-room-inbound")?.displayOrder).toBe(existingRows + 1);
+    expect(rows.find((row) => row.packet.id === "legacy-no-order")?.displayOrder).toBe(existingRows + 2);
   });
 
   it("loads identity, room messages, and deletion status concurrently", async () => {
