@@ -56,13 +56,17 @@ independent review. The `proc-macro-error2` unmaintained warning is also in the
 active selected dependency graph through `hax-lib-macros`, `libcrux-sha3`, and
 `hpke-rs`, which is used by `openmls_rust_crypto`.
 
-The current research workflow checks formatting, runs the native compatibility
-test, and compiles the tests for `wasm32-unknown-unknown`. It does not rerun
-RustSec. These audit findings are a snapshot from 2026-10-15, not continuous
-audit coverage. Any `Cargo.lock` change or dependency feature-graph change must
-trigger a fresh RustSec review of both the complete lockfile and the active
-selected graph. An independent review of that evidence is required before
-selecting OpenMLS. See [RUSTSEC-2026-0330](https://rustsec.org/advisories/RUSTSEC-2026-0330),
+CI now runs RustSec against this isolated lockfile on every push and pull
+request. The tracked `audit.toml` records narrow exceptions for the two known
+`libcrux-kem` advisories only. The complete lockfile remains in scope; the
+exceptions do not establish that the backend is safe or approved. The
+`proc-macro-error2` unmaintained warning is not ignored. These findings were
+recorded on 2026-10-15. The repository owner named in `GOVERNANCE.md` is
+accountable for the exception and records each reassessment in this README.
+Any `Cargo.lock` change or dependency feature-graph change must trigger a fresh
+RustSec review of both the complete lockfile and the active selected graph. An
+independent review of that evidence is required before selecting OpenMLS. See
+[RUSTSEC-2026-0330](https://rustsec.org/advisories/RUSTSEC-2026-0330),
 [RUSTSEC-2026-0331](https://rustsec.org/advisories/RUSTSEC-2026-0331), and
 [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173).
 

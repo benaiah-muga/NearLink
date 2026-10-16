@@ -14,7 +14,7 @@ The current prototype provides browser messaging through an optional local hub a
 
 ## Development
 
-Web development requires Node.js 20 or newer, npm, Python 3.11 or newer, and a browser with IndexedDB and WebSocket support. Working on the Rust protocol core also requires the toolchain pinned in `rust-toolchain.toml`.
+For full repository development and tests, use Node.js 22.22.2 or newer in the 22.x line, Node.js 24.15.0 or newer in the 24.x line, or Node.js 26 or newer. These versions meet the declared engine ranges of the locked application and test dependencies. CI verifies with Node.js 24.18.0. Node.js 22.16 can run the local checks but emits unsupported engine warnings for some locked test dependencies. Also install npm, Python 3.11 or newer, and use a browser with IndexedDB and WebSocket support. Working on the Rust protocol core requires the toolchain pinned in `rust-toolchain.toml`.
 
 ```sh
 npm ci
@@ -55,3 +55,5 @@ For direct communication, both browser clients can exchange WebRTC offer and ans
 This is an early development project. Local network communication depends on users being able to reach the same hub. The hub stores and relays plaintext in its bounded local history. Direct WebRTC data is also not end-to-end encrypted by an application messaging protocol. Browser storage can be cleared or evicted. Do not use NearLink for sensitive communication or emergency coordination.
 
 See [the architecture overview](docs/architecture/overview.md), [protocol draft](docs/protocol/v1-draft.md), [threat model](docs/security/threat-model.md), [project roadmap](docs/roadmap.md), [governance policy](GOVERNANCE.md), and [contributing guide](CONTRIBUTING.md).
+
+See the [dependency policy](docs/dependency-policy.md) for dependency ownership, updates, and security review.

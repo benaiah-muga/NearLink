@@ -1,0 +1,14 @@
+# Research-lock-only exception list. CI copies this file to Cargo's user config
+# only after auditing the product lockfiles without exceptions.
+[advisories]
+ignore = [
+  # libcrux-kem 0.0.9 is reachable only through the optional hpke-rs-libcrux
+  # backend in this full research lock. The selected provider and tested
+  # targets do not activate that backend. Keep the complete-lock finding
+  # visible in the research README and recheck before any lock or feature
+  # graph change, or before considering OpenMLS for product use.
+# The repository owner named in GOVERNANCE.md is accountable for this
+# exception and must record each reassessment in the research README.
+  "RUSTSEC-2026-0330",
+  "RUSTSEC-2026-0331",
+]

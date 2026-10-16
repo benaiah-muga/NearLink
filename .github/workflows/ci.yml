@@ -66,7 +66,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: npm ci
-      - run: npm audit --audit-level=high
+      - run: npm audit
       - uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266
         with:
           inputs: services/local-hub/requirements-dev.lock
@@ -84,3 +84,14 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: crates/protocol-wasm
+      - name: Install research-only RustSec exception config
+        run: |
+          mkdir -p ~/.cargo
+          cp research/openmls-compat-spike/audit.toml ~/.cargo/audit.toml
+          echo "Research lock exceptions: RUSTSEC-2026-0330, RUSTSEC-2026-0331"
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: research/openmls-compat-spike
