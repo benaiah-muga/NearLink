@@ -2,6 +2,7 @@ import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_HISTORY_PAGE_MESSAGES, type MessagePacket } from "@nearlink/protocol";
 import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadQueuedMessagePage, loadRequestedMessages, loadSyncAcceptedMessageBatch, MAX_HUB_REPLAY_ORDER_IDS, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { installLazyCursorDatabase } from "../../test-support/lazyIndexedDb";
 
 const classifierGate = vi.hoisted(() => ({ failNext: false }));
 
@@ -142,6 +143,54 @@ describe("local IndexedDB storage", () => {
     expect(collector.scanCapReached).toBe(true);
     expect(collector.acceptedIdOverflow).toBe(false);
     expect(collector.ids).toEqual([]);
+  });
+
+  it("completes the storage scan when EOF follows exactly the cursor row cap", async () => {
+    let emittedRows = 0;
+    const restore = installLazyCursorDatabase({
+      room: "alpha",
+      rowCount: MAX_SYNC_STORAGE_ROWS_SCANNED,
+      rowAt: (index) => {
+        emittedRows += 1;
+        return { packet: { room: "alpha", id: `queued-${String(index).padStart(5, "0")}` }, delivery: "queued" };
+      },
+    });
+    try {
+      await expect(loadAcceptedMessageIds("alpha", () => true)).resolves.toEqual({
+        version: 1,
+        room: "alpha",
+        ids: [],
+        scanComplete: true,
+        acceptedIdOverflow: false,
+      });
+      expect(emittedRows).toBe(MAX_SYNC_STORAGE_ROWS_SCANNED);
+    } finally {
+      restore();
+    }
+  });
+
+  it("recognizes the first accepted ID beyond the inventory bound before the scan cap", async () => {
+    let emittedRows = 0;
+    const restore = installLazyCursorDatabase({
+      room: "alpha",
+      rowCount: MAX_SYNC_STORAGE_IDS + 1,
+      rowAt: (index) => {
+        emittedRows += 1;
+        const id = `accepted-${String(index).padStart(4, "0")}`;
+        return { packet: packet(id, "2026-10-14T09:00:00.000Z"), delivery: "sent" };
+      },
+    });
+    try {
+      const snapshot = await loadAcceptedMessageIds("alpha", () => true);
+      expect(snapshot.ids).toHaveLength(MAX_SYNC_STORAGE_IDS);
+      expect(snapshot.ids[0]).toBe("accepted-0000");
+      expect(snapshot.ids.at(-1)).toBe("accepted-4095");
+      expect(snapshot.scanComplete).toBe(false);
+      expect(snapshot.acceptedIdOverflow).toBe(true);
+      expect(emittedRows).toBe(MAX_SYNC_STORAGE_IDS + 1);
+    } finally {
+      restore();
+    }
   });
 
   it("uses a primary-key cursor for deterministic accepted-only room IDs", async () => {

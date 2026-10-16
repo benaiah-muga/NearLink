@@ -2,7 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket, SyncPacket } from "@nearlink/protocol";
 import { SyncCoordinator, type SyncState } from "./sync";
 import { initializeWasmProtocol } from "./wasmProtocol";
-import type { StoredMessage } from "./storage";
+import { loadAcceptedMessageIds, MAX_SYNC_STORAGE_ROWS_SCANNED, type StoredMessage } from "./storage";
+import type { AcceptedMessageIdSnapshot } from "./conversationStore";
+import { installLazyCursorDatabase } from "../../test-support/lazyIndexedDb";
 
 const wasmState = vi.hoisted(() => ({ ready: true, frees: 0, acceptAfterFree: 0, registeredRequests: [] as string[] }));
 
@@ -497,25 +499,43 @@ describe("SyncCoordinator", () => {
     coordinator.stop();
   });
 
-  it("fails before publishing when the row scan is incomplete without proven ID overflow", async () => {
+  it("fails before publishing when the cursor passes the scan cap without proven ID overflow", async () => {
     const sent: Array<SyncPacket | MessagePacket> = [];
     let state: SyncState = "idle";
+    let snapshot: AcceptedMessageIdSnapshot | undefined;
+    let emittedRows = 0;
+    const restore = installLazyCursorDatabase({
+      room,
+      rowCount: MAX_SYNC_STORAGE_ROWS_SCANNED + 1,
+      rowAt: (index) => {
+        emittedRows += 1;
+        return { packet: { room, id: `queued-${String(index).padStart(5, "0")}` }, delivery: "queued" };
+      },
+    });
     const coordinator = new SyncCoordinator({
       room,
       sender: "local-a",
       makeId: () => "truncated-session",
       send: (value) => sent.push(value),
-      loadAcceptedMessageIds: async () => ({ version: 1, room, ids: [], scanComplete: false, acceptedIdOverflow: false }),
+      loadAcceptedMessageIds: async () => {
+        snapshot = await loadAcceptedMessageIds(room, () => true);
+        return snapshot;
+      },
       loadSyncAcceptedMessageBatch: async (ids) => ({ version: 1, room, requestedIds: [...ids], roomState: "available", messages: [] }),
       validateMessage: () => true,
       onState: (next) => { state = next; },
     });
-    await coordinator.start();
-    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "remote", sender: "local-b", cursor: null, messageIds: [], nextCursor: null, hasMore: false, limitReached: false });
-    expect(state).toBe("error");
-    expect(sent.some((item) => item.type === "sync_inventory_page")).toBe(false);
-    expect(sent.some((item) => item.type === "sync_page_complete")).toBe(false);
-    coordinator.stop();
+    try {
+      await coordinator.start();
+      expect(snapshot).toMatchObject({ ids: [], scanComplete: false, acceptedIdOverflow: false });
+      expect(emittedRows).toBe(MAX_SYNC_STORAGE_ROWS_SCANNED + 1);
+      expect(state).toBe("error");
+      expect(sent.some((item) => item.type === "sync_inventory_page")).toBe(false);
+      expect(sent.some((item) => item.type === "sync_page_complete")).toBe(false);
+    } finally {
+      coordinator.stop();
+      restore();
+    }
   });
 
   it("fails storage reads without sending completion or claiming a complete exchange", async () => {
