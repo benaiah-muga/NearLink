@@ -36,6 +36,7 @@ pub const MAX_KNOWN_IDS_JSON_BYTES: usize = 600 * 1024;
 
 /// Stateful coverage outcome aggregator for one caller-managed sync exchange.
 #[wasm_bindgen]
+#[derive(Default)]
 pub struct WasmSyncCoverage {
     inner: SyncCoverage,
 }
@@ -44,9 +45,7 @@ pub struct WasmSyncCoverage {
 impl WasmSyncCoverage {
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmSyncCoverage {
-        WasmSyncCoverage {
-            inner: SyncCoverage::default(),
-        }
+        WasmSyncCoverage::default()
     }
 
     pub fn mark_incomplete(&mut self) {
