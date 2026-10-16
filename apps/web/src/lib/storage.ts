@@ -46,13 +46,14 @@ export async function requestStoragePersistence(): Promise<StoragePersistenceRes
 }
 
 const DATABASE_NAME = "nearlink-local";
-const DATABASE_VERSION = 6;
+const DATABASE_VERSION = 7;
 const MESSAGE_STORE = "messages";
 const IDENTITY_STORE = "identity";
 const ROOM_DELETION_STORE = "roomDeletions";
 const ROOM_CREATED_INDEX = "roomCreatedAt";
 const ROOM_DELIVERY_CREATED_INDEX = "roomDeliveryCreatedAt";
 const ROOM_DISPLAY_ORDER_INDEX = "roomDisplayOrder";
+const ROOM_QUEUED_TRANSPORT_ORDER_INDEX = "roomQueuedTransportOrder";
 const LOCAL_MESSAGE_PAGE_SIZE = 50;
 export const MAX_SYNC_STORAGE_IDS = 4096;
 export const MAX_SYNC_STORAGE_ROWS_SCANNED = 16384;
@@ -144,12 +145,37 @@ function migrate(database: IDBDatabase, transaction: IDBTransaction, oldVersion:
     messages.deleteIndex(ROOM_DISPLAY_ORDER_INDEX);
   }
   ensureIndex(messages, ROOM_DISPLAY_ORDER_INDEX, displayOrderKeyPath);
+  const queuedTransportOrderKeyPath = ["packet.room", "direction", "delivery", "transport", "displayOrder", "packet.createdAt", "packet.id"];
+  if (messages.indexNames.contains(ROOM_QUEUED_TRANSPORT_ORDER_INDEX)
+    && !equalKeyPath(messages.index(ROOM_QUEUED_TRANSPORT_ORDER_INDEX).keyPath as string[], queuedTransportOrderKeyPath)) {
+    messages.deleteIndex(ROOM_QUEUED_TRANSPORT_ORDER_INDEX);
+  }
+  ensureIndex(messages, ROOM_QUEUED_TRANSPORT_ORDER_INDEX, queuedTransportOrderKeyPath);
   ensureStore(database, transaction, IDENTITY_STORE, IDENTITY_KEY_PATH);
   ensureStore(database, transaction, ROOM_DELETION_STORE, "room");
 
   // Version 4 introduced displayOrder. Backfill only databases that predate it.
   // Version 4 and later contain user-visible ordering that must survive upgrades.
-  if (oldVersion >= 6) return;
+  if (oldVersion >= 6) {
+    const normalize = messages.openCursor();
+    normalize.onsuccess = () => {
+      const cursor = normalize.result;
+      if (!cursor) return;
+      const row = cursor.value as StoredMessage;
+      if (row.transport === undefined) {
+        row.transport = "hub";
+        const update = cursor.update(row);
+        update.onerror = () => {
+          try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
+        };
+      }
+      cursor.continue();
+    };
+    normalize.onerror = () => {
+      try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
+    };
+    return;
+  }
 
   if (oldVersion >= 4) {
     // Upgrade once, before bounded reads rely on the display-order index.
@@ -164,10 +190,18 @@ function migrate(database: IDBDatabase, transaction: IDBTransaction, oldVersion:
           const rowCursor = backfill.result;
           if (!rowCursor) return;
           const row = rowCursor.value as StoredMessage;
+          let changed = false;
           if (!Number.isFinite(row.displayOrder)) {
             const nextOrder = nextOrderByRoom.get(row.packet.room) ?? 0;
             row.displayOrder = nextOrder;
             nextOrderByRoom.set(row.packet.room, nextOrder + 1);
+            changed = true;
+          }
+          if (row.transport === undefined) {
+            row.transport = "hub";
+            changed = true;
+          }
+          if (changed) {
             const update = rowCursor.update(row);
             update.onerror = () => {
               try { transaction.abort(); } catch { /* The version change transaction may already be aborting. */ }
@@ -205,6 +239,7 @@ function migrate(database: IDBDatabase, transaction: IDBTransaction, oldVersion:
       nextOrder = 0;
     }
     message.displayOrder = nextOrder;
+    if (message.transport === undefined) message.transport = "hub";
     nextOrder += 1;
     const update = cursor.update(message);
     update.onerror = () => {
@@ -411,6 +446,15 @@ export interface LocalMessagePage {
   deleted: boolean;
 }
 
+export interface QueuedMessagePageCursor extends LocalMessagePageCursor {}
+
+export interface QueuedMessagePage {
+  messages: StoredMessage[];
+  cursor: QueuedMessagePageCursor | null;
+  hasMore: boolean;
+  deleted: boolean;
+}
+
 /** Read a bounded newest page or continue toward older local rows. */
 export async function loadMessagePage(
   room: string,
@@ -467,6 +511,87 @@ export async function loadMessagePage(
       request.onsuccess = () => {
         const cursor = request.result;
         if (!cursor || deleted) {
+          cursorDone = true;
+          finishIfReady();
+          return;
+        }
+        if (messages.length === limit) {
+          hasMore = true;
+          cursorDone = true;
+          finishIfReady();
+          return;
+        }
+        messages.push(cursor.value as StoredMessage);
+        cursor.continue();
+      };
+    },
+  );
+}
+
+/** Read queued outgoing messages for one transport in stable, bounded display order. */
+export async function loadQueuedMessagePage(
+  room: string,
+  transport: "hub" | "direct",
+  after: QueuedMessagePageCursor | null = null,
+  limit = 64,
+): Promise<QueuedMessagePage> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 256) {
+    throw new Error("A queued message page must contain between 1 and 256 rows.");
+  }
+  return withTransaction<QueuedMessagePage>(
+    "Could not load a queued message page",
+    [MESSAGE_STORE, ROOM_DELETION_STORE],
+    "readonly",
+    (_store, complete, setFailure, transaction) => {
+      const messages: StoredMessage[] = [];
+      const messageStore = transaction.objectStore(MESSAGE_STORE);
+      const index = messageStore.index(ROOM_QUEUED_TRANSPORT_ORDER_INDEX);
+      const prefix = [room, "outgoing", "queued", transport];
+      const lower = after
+        ? [...prefix, after.displayOrder, after.createdAt, after.id]
+        : [...prefix, -Number.MAX_VALUE];
+      const upper = [...prefix, []];
+      const range = after
+        ? IDBKeyRange.bound(lower, upper, true, false)
+        : IDBKeyRange.bound(lower, upper);
+      const deletionRequest = transaction.objectStore(ROOM_DELETION_STORE).get(room);
+      let deleted: { room: string } | undefined;
+      let deletionDone = false;
+      let cursorDone = false;
+      let hasMore = false;
+      const finishIfReady = () => {
+        if (!deletionDone || !cursorDone) return;
+        if (deleted) {
+          complete({ messages: [], cursor: null, hasMore: false, deleted: true });
+          return;
+        }
+        const last = messages[messages.length - 1];
+        complete({
+          messages,
+          cursor: last && Number.isFinite(last.displayOrder)
+            ? { displayOrder: last.displayOrder!, createdAt: last.packet.createdAt, id: last.packet.id }
+            : null,
+          hasMore,
+          deleted: false,
+        });
+      };
+      deletionRequest.onsuccess = () => {
+        deleted = deletionRequest.result as { room: string } | undefined;
+        deletionDone = true;
+        finishIfReady();
+      };
+      deletionRequest.onerror = () => setFailure(deletionRequest.error ?? new Error("Could not read the room deletion state."));
+      const request = index.openCursor(range, "next");
+      request.onerror = () => setFailure(request.error ?? new Error("Could not read a queued message page."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || deleted) {
+          cursorDone = true;
+          finishIfReady();
+          return;
+        }
+        const key = cursor.key as IDBValidKey[];
+        if (!Array.isArray(key) || key.length !== 7 || prefix.some((part, indexPart) => key[indexPart] !== part)) {
           cursorDone = true;
           finishIfReady();
           return;
@@ -682,7 +807,11 @@ export async function saveMessage(message: StoredMessage): Promise<boolean> {
         const displayOrder = Number.isFinite(message.displayOrder)
           ? message.displayOrder
           : existing?.displayOrder ?? nextOrder;
-        const savedMessage = { ...message, displayOrder };
+        const savedMessage = {
+          ...message,
+          ...(message.direction === "outgoing" && message.transport === undefined ? { transport: "hub" as const } : {}),
+          displayOrder,
+        };
         try {
           observe(store.put(savedMessage), () => complete(true), setFailure);
         } catch (error) {
@@ -1023,6 +1152,7 @@ export const browserConversationStore: ConversationStore = {
   loadMessages,
   loadMessage,
   loadMessagePage,
+  loadQueuedMessagePage,
   loadAcceptedMessageIds,
   loadRequestedMessages,
   saveMessage,

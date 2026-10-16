@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { isProtocolRoom, MAX_HISTORY_PAGE_MESSAGES, PROTOCOL_VERSION, type AcknowledgmentPacket, type ClientPacket, type HistoryPageCompletePacket, type HistoryRequestPacket, type MessagePacket, type SyncPageCompletePacket, type SyncPacket } from "@nearlink/protocol";
-import { browserConversationStore as conversationStore, type InboundAcceptanceResult, type LocalIdentity, type LocalMessagePageCursor, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
+import { browserConversationStore as conversationStore, type InboundAcceptanceResult, type LocalIdentity, type LocalMessagePageCursor, type QueuedMessagePageCursor, type StoragePersistenceResult, type StoredMessage } from "./lib/storage";
 import { DirectWebRtcTransport, WebRtcTransportError, type TransportState } from "./lib/webrtc";
 import { SyncCoordinator, type SyncState } from "./lib/sync";
 import { createSecureUuid, SecureRandomUnavailableError } from "./lib/secureId";
@@ -203,6 +203,7 @@ function App() {
   const currentDisplayNameRef = useRef(displayName.trim());
   const fingerprintConfirmedRef = useRef(fingerprintConfirmed);
   const directInFlightRef = useRef(new Set<string>());
+  const directQueueFlushRef = useRef<{ transport: DirectWebRtcTransport; room: string; cursor: QueuedMessagePageCursor | null; cancelled: boolean } | null>(null);
   const directInboundOperationsRef = useRef(new Map<string, Promise<void>>());
   const directInboundTailRef = useRef<Promise<void>>(Promise.resolve());
   const hubInboundOperationsRef = useRef(new Map<string, Promise<void>>());
@@ -224,6 +225,8 @@ function App() {
     loaded: boolean;
     refillInProgress: boolean;
     hasPersistedBacklog: boolean;
+    persistedCursor: QueuedMessagePageCursor | null;
+    deferredPersistedMessages: HubOutboundQueueItem[];
     deferredPersistedMessageIds: Set<string>;
     invalidMessageIds: Set<string>;
     nextIndex: number;
@@ -403,6 +406,8 @@ function App() {
   }
 
   function closeDirectTransport() {
+    if (directQueueFlushRef.current) directQueueFlushRef.current.cancelled = true;
+    directQueueFlushRef.current = null;
     directSyncRef.current?.stop();
     directSyncRef.current = null;
     directRef.current?.close();
@@ -483,7 +488,11 @@ function App() {
     queue.nextIndex = 0;
   }
 
-  function mergeHubOutboundBatch(queue: NonNullable<typeof hubOutboundQueueRef.current>, persisted: StoredMessage[]) {
+  function mergeHubOutboundBatch(queue: NonNullable<typeof hubOutboundQueueRef.current>, page: Awaited<ReturnType<typeof conversationStore.loadQueuedMessagePage>>) {
+    const persisted = [...queue.deferredPersistedMessages
+      .filter((item): item is HubOutboundQueueItem & { packet: MessagePacket } => item.packet.type === "message")
+      .map((item) => ({ ...item, direction: "outgoing" as const, delivery: "queued" as const, transport: "hub" as const })), ...page.messages];
+    queue.deferredPersistedMessages = [];
     const persistedMessageIds = new Set(persisted
       .filter((saved) => saved.direction === "outgoing"
         && saved.delivery === "queued"
@@ -516,7 +525,9 @@ function App() {
       return true;
     });
     const persistedCapacity = Math.max(0, MAX_HUB_OUTBOUND_QUEUE_ENTRIES - uniqueEphemeral.length);
-    queue.hasPersistedBacklog = persistedItems.length > persistedCapacity || queue.deferredPersistedMessageIds.size > 0;
+    queue.persistedCursor = page.cursor;
+    queue.deferredPersistedMessages = persistedItems.slice(persistedCapacity);
+    queue.hasPersistedBacklog = page.hasMore || queue.deferredPersistedMessages.length > 0 || queue.deferredPersistedMessageIds.size > 0;
     queue.items = [...persistedItems.slice(0, persistedCapacity), ...uniqueEphemeral];
     queue.nextIndex = 0;
   }
@@ -524,10 +535,11 @@ function App() {
   function refillHubOutboundQueue(queue: NonNullable<typeof hubOutboundQueueRef.current>) {
     if (hubOutboundQueueRef.current !== queue || queue.stopped || !queue.loaded || queue.refillInProgress || queue.items.length > 0) return;
     queue.refillInProgress = true;
-    void conversationStore.loadMessages(queue.room).then((persisted) => {
+    void conversationStore.loadQueuedMessagePage(queue.room, "hub", queue.persistedCursor).then((page) => {
       if (hubOutboundQueueRef.current !== queue || socketRef.current !== queue.socket || currentRoomRef.current !== queue.room) return;
       queue.refillInProgress = false;
-      mergeHubOutboundBatch(queue, persisted);
+      if (page.deleted) { queue.stopped = true; return; }
+      mergeHubOutboundBatch(queue, page);
       if (queue.items.length > 0 || queue.hasPersistedBacklog) pumpHubOutboundQueue(queue);
     }).catch(() => {
       if (hubOutboundQueueRef.current !== queue || socketRef.current !== queue.socket || currentRoomRef.current !== queue.room) return;
@@ -604,6 +616,8 @@ function App() {
       loaded: false,
       refillInProgress: false,
       hasPersistedBacklog: false,
+      persistedCursor: null,
+      deferredPersistedMessages: [],
       deferredPersistedMessageIds: new Set(),
       invalidMessageIds: new Set(),
       nextIndex: 0,
@@ -615,10 +629,11 @@ function App() {
       stopped: false,
     };
     hubOutboundQueueRef.current = queue;
-    void conversationStore.loadMessages(selectedRoom).then((persisted) => {
+    void conversationStore.loadQueuedMessagePage(selectedRoom, "hub").then((page) => {
       if (hubOutboundQueueRef.current !== queue || socketRef.current !== socket || currentRoomRef.current !== selectedRoom) return;
+      if (page.deleted) { queue!.stopped = true; return; }
       queue!.loaded = true;
-      mergeHubOutboundBatch(queue!, persisted);
+      mergeHubOutboundBatch(queue!, page);
       pumpHubOutboundQueue(queue!);
     }).catch(() => {
       if (hubOutboundQueueRef.current === queue && socketRef.current === socket && currentRoomRef.current === selectedRoom) {
@@ -672,6 +687,8 @@ function App() {
       loaded: false,
       refillInProgress: false,
       hasPersistedBacklog: false,
+      persistedCursor: null,
+      deferredPersistedMessages: [],
       deferredPersistedMessageIds: new Set<string>(),
       invalidMessageIds: new Set<string>(),
       nextIndex: 0,
@@ -683,10 +700,11 @@ function App() {
       stopped: false,
     };
     hubOutboundQueueRef.current = queue;
-    void conversationStore.loadMessages(selectedRoom).then((persisted) => {
+    void conversationStore.loadQueuedMessagePage(selectedRoom, "hub").then((page) => {
       if (hubOutboundQueueRef.current !== queue || socketRef.current !== socket || currentRoomRef.current !== selectedRoom) return;
+      if (page.deleted) { queue.stopped = true; return; }
       queue.loaded = true;
-      mergeHubOutboundBatch(queue, persisted);
+      mergeHubOutboundBatch(queue, page);
       pumpHubOutboundQueue(queue);
     }).catch(() => {
       if (hubOutboundQueueRef.current === queue && socketRef.current === socket && currentRoomRef.current === selectedRoom) {
@@ -1798,10 +1816,26 @@ function App() {
     const transport = directRef.current;
     const flushRoom = currentRoomRef.current;
     if (!transport || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
-    const savedMessages = await conversationStore.loadMessages(flushRoom).catch(() => null);
-    if (!savedMessages || directRef.current !== transport || currentRoomRef.current !== flushRoom || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
-    for (const item of savedMessages) {
-      if (item.direction === "outgoing" && item.delivery === "queued" && item.transport === "direct") sendDirectMessage(item);
+    const existing = directQueueFlushRef.current;
+    if (existing?.transport === transport && existing.room === flushRoom && !existing.cancelled) return;
+    const flush = { transport, room: flushRoom, cursor: null as QueuedMessagePageCursor | null, cancelled: false };
+    directQueueFlushRef.current = flush;
+    try {
+      while (!flush.cancelled && directQueueFlushRef.current === flush) {
+        const page = await conversationStore.loadQueuedMessagePage(flushRoom, "direct", flush.cursor).catch(() => null);
+        if (!page || flush.cancelled || directQueueFlushRef.current !== flush
+          || directRef.current !== transport || currentRoomRef.current !== flushRoom
+          || transport.currentState !== "connected" || !fingerprintConfirmedRef.current) return;
+        if (page.deleted) return;
+        flush.cursor = page.cursor;
+        for (const item of page.messages) {
+          if (flush.cancelled || directQueueFlushRef.current !== flush) return;
+          sendDirectMessage(item);
+        }
+        if (!page.hasMore) return;
+      }
+    } finally {
+      if (directQueueFlushRef.current === flush) directQueueFlushRef.current = null;
     }
   }
 

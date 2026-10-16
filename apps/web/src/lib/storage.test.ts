@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
-import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadRequestedMessages, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadQueuedMessagePage, loadRequestedMessages, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const classifierGate = vi.hoisted(() => ({ failNext: false }));
 
@@ -62,7 +62,7 @@ async function seedLargeRoom(rowCount: number, includeLegacyRow = false): Promis
     const transaction = database.transaction("messages", "readwrite");
     const store = transaction.objectStore("messages");
     for (let index = 0; index < rowCount; index += 1) {
-      store.put({ ...message(`large-${String(index).padStart(4, "0")}`, "2026-10-14T09:00:00.000Z"), displayOrder: index });
+      store.put({ ...message(`large-${String(index).padStart(4, "0")}`, "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: index });
     }
     if (includeLegacyRow) store.put(message("legacy-no-order", "2026-10-14T09:00:01.000Z"));
     transaction.oncomplete = () => resolve();
@@ -155,8 +155,8 @@ describe("local IndexedDB storage", () => {
 
     await expect(loadIdentity()).resolves.toEqual({ sender: "device-1", senderName: "Ada" });
     await expect(loadMessages("alpha")).resolves.toEqual([
-      { ...message("later", "2026-10-14T10:00:00.000Z"), displayOrder: 0 },
-      { ...message("earlier", "2026-10-14T09:00:00.000Z"), displayOrder: 1 },
+      { ...message("later", "2026-10-14T10:00:00.000Z"), transport: "hub", displayOrder: 0 },
+      { ...message("earlier", "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: 1 },
       { ...message("incoming", "2026-10-14T09:30:00.000Z", "sent"), direction: "incoming", displayOrder: 2 },
     ]);
     await expect(loadMessages("missing")).resolves.toEqual([]);
@@ -224,6 +224,92 @@ describe("local IndexedDB storage", () => {
     const second = await loadMessagePage("alpha", first.cursor, 2);
     expect(second.messages.map((row) => row.packet.id)).toEqual(["tie-a"]);
     expect(second.hasMore).toBe(false);
+  });
+
+  it("reads queued transport pages in stable bounded order across identical keys", async () => {
+    const rowCount = 137;
+    await saveIdentity({ sender: "device-1", senderName: "Ada" });
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = openRequest();
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("messages", "readwrite");
+      const store = transaction.objectStore("messages");
+      for (let index = 0; index < rowCount; index += 1) {
+        const id = index === 0 ? "a_" : index === 1 ? "a-" : `queue-${String(index).padStart(3, "0")}`;
+        store.put({ ...message(id, "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: 4 });
+      }
+      store.put({ ...message("queue-max-order", "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: Number.MAX_VALUE });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    let cursorReads = 0;
+    let materializedRows = 0;
+    const originalOpenCursor = IDBIndex.prototype.openCursor;
+    const originalGetAll = IDBIndex.prototype.getAll;
+    vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["openCursor"]>) {
+      if (this.name === "roomQueuedTransportOrder") cursorReads += 1;
+      return originalOpenCursor.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+      if (this.name === "roomQueuedTransportOrder") materializedRows += 1;
+      return originalGetAll.apply(this, args);
+    });
+    const collected: string[] = [];
+    let page = await loadQueuedMessagePage("alpha", "hub", null, 17);
+    while (true) {
+      expect(page.messages.length).toBeLessThanOrEqual(17);
+      collected.push(...page.messages.map((row) => row.packet.id));
+      if (!page.hasMore) break;
+      expect(page.cursor).not.toBeNull();
+      page = await loadQueuedMessagePage("alpha", "hub", page.cursor, 17);
+    }
+    expect(cursorReads).toBe(9);
+    expect(materializedRows).toBe(0);
+    expect(collected).toHaveLength(rowCount + 1);
+    expect(new Set(collected).size).toBe(rowCount + 1);
+    expect(collected.slice(0, 2)).toEqual(["a-", "a_"]);
+    expect(collected.at(-1)).toBe("queue-max-order");
+    expect((await loadQueuedMessagePage("alpha", "direct", null, 17)).messages).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
+  it("normalizes missing transport to hub when upgrading the v6 queue index", async () => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(DATABASE_NAME, 6);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        const messages = db.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
+        messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
+        messages.createIndex("roomDeliveryCreatedAt", ["packet.room", "delivery", "packet.createdAt"]);
+        messages.createIndex("roomDisplayOrder", ["packet.room", "displayOrder", "packet.createdAt", "packet.id"]);
+        db.createObjectStore("identity", { keyPath: "key" });
+        db.createObjectStore("roomDeletions", { keyPath: "room" });
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("messages", "readwrite");
+      transaction.objectStore("messages").put({ ...message("legacy-hub", "2026-10-14T09:00:00.000Z"), displayOrder: 2 });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    const page = await loadQueuedMessagePage("alpha", "hub");
+    expect(page.messages.map((row) => [row.packet.id, row.transport])).toEqual([["legacy-hub", "hub"]]);
+  });
+
+  it("stops queued page reads after a room deletion marker is written", async () => {
+    await saveMessage({ ...message("delete-queued", "2026-10-14T09:00:00.000Z"), transport: "direct" });
+    await beginRoomDeletion("alpha");
+    const page = await loadQueuedMessagePage("alpha", "direct");
+    expect(page).toEqual({ messages: [], cursor: null, hasMore: false, deleted: true });
   });
 
   it("includes Number.MAX_VALUE display orders in newest reads and max lookup", async () => {
@@ -342,7 +428,7 @@ describe("local IndexedDB storage", () => {
     await saveMessage(message("parallel-read", "2026-10-14T09:00:00.000Z"));
     await expect(Promise.all([loadIdentity(), loadMessages("alpha"), isRoomMessagesDeleted("alpha")])).resolves.toEqual([
       { sender: "device-1", senderName: "Ada" },
-      [{ ...message("parallel-read", "2026-10-14T09:00:00.000Z"), displayOrder: 0 }],
+      [{ ...message("parallel-read", "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: 0 }],
       false,
     ]);
   });
@@ -353,7 +439,7 @@ describe("local IndexedDB storage", () => {
     duplicate.packet.body = "updated duplicate";
     await saveMessage(duplicate);
 
-    await expect(loadMessages("alpha")).resolves.toEqual([{ ...duplicate, displayOrder: 0 }]);
+    await expect(loadMessages("alpha")).resolves.toEqual([{ ...duplicate, transport: "hub", displayOrder: 0 }]);
   });
 
   it("atomically accepts a new inbound packet and recognizes an exact duplicate", async () => {
@@ -438,7 +524,7 @@ describe("local IndexedDB storage", () => {
 
     const saved = await loadMessages("alpha");
     expect(saved.find((item) => item.packet.id === "direct-row")?.transport).toBe("direct");
-    expect(saved.find((item) => item.packet.id === "legacy-row")?.transport).toBeUndefined();
+    expect(saved.find((item) => item.packet.id === "legacy-row")?.transport).toBe("hub");
   });
 
   it("persists delivery transitions and treats an unknown message as a no-op", async () => {
@@ -447,7 +533,7 @@ describe("local IndexedDB storage", () => {
     await updateDelivery("alpha", "delivery", "failed");
     await updateDelivery("alpha", "does-not-exist", "sent");
 
-    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("delivery", "2026-10-14T09:00:00.000Z", "failed"), displayOrder: 0 }]);
+    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("delivery", "2026-10-14T09:00:00.000Z", "failed"), transport: "hub", displayOrder: 0 }]);
   });
 
   it("places newest-to-oldest history IDs before the boundary in hub acceptance order", async () => {
@@ -599,12 +685,13 @@ describe("local IndexedDB storage", () => {
 
     await expect(loadIdentity()).resolves.toEqual({ sender: "legacy-device", senderName: "Legacy" });
     await expect(loadMessages("alpha")).resolves.toEqual([
-      { ...message("legacy-earlier", "2026-10-14T09:00:00.000Z"), displayOrder: 0 },
-      { ...message("legacy-later", "2026-10-14T10:00:00.000Z"), displayOrder: 1 },
+      { ...message("legacy-earlier", "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: 0 },
+      { ...message("legacy-later", "2026-10-14T10:00:00.000Z"), transport: "hub", displayOrder: 1 },
     ]);
     await expect(loadMessages("beta")).resolves.toEqual([{
       ...message("legacy-other-room", "2026-10-14T08:00:00.000Z"),
       packet: packet("legacy-other-room", "2026-10-14T08:00:00.000Z", "beta"),
+      transport: "hub",
       displayOrder: 0,
     }]);
 
@@ -613,7 +700,7 @@ describe("local IndexedDB storage", () => {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
-    expect(upgraded.version).toBe(6);
+    expect(upgraded.version).toBe(7);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDeliveryCreatedAt")).toBe(true);
     expect(upgraded.transaction("messages").objectStore("messages").indexNames.contains("roomDisplayOrder")).toBe(true);
     expect(upgraded.objectStoreNames.contains("roomDeletions")).toBe(true);
@@ -628,6 +715,7 @@ describe("local IndexedDB storage", () => {
         ...message("beta-only", "2026-10-14T08:00:00.000Z", "sent"),
         packet: packet("beta-only", "2026-10-14T08:00:00.000Z", "beta"),
         direction: "incoming",
+        transport: "hub",
         displayOrder: 17,
       },
     ];
@@ -658,7 +746,7 @@ describe("local IndexedDB storage", () => {
     database.close();
 
     await expect(loadMessages("alpha")).resolves.toEqual([rows[0], rows[1]]);
-    await expect(loadMessages("beta")).resolves.toEqual([rows[2]]);
+    await expect(loadMessages("beta")).resolves.toEqual([{ ...rows[2], transport: "hub" }]);
     await expect(loadIdentity()).resolves.toEqual({ sender: identity.sender, senderName: identity.senderName });
     await expect(isRoomMessagesDeleted("alpha")).resolves.toBe(true);
 
@@ -667,11 +755,12 @@ describe("local IndexedDB storage", () => {
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
-    expect(upgraded.version).toBe(6);
+    expect(upgraded.version).toBe(7);
     const transaction = upgraded.transaction(["messages", "identity", "roomDeletions"], "readonly");
     const messages = transaction.objectStore("messages");
-    expect([...messages.indexNames].sort()).toEqual(["roomCreatedAt", "roomDeliveryCreatedAt", "roomDisplayOrder"]);
+    expect([...messages.indexNames].sort()).toEqual(["roomCreatedAt", "roomDeliveryCreatedAt", "roomDisplayOrder", "roomQueuedTransportOrder"]);
     expect(messages.index("roomDisplayOrder").keyPath).toEqual(["packet.room", "displayOrder", "packet.createdAt", "packet.id"]);
+    expect(messages.index("roomQueuedTransportOrder").keyPath).toEqual(["packet.room", "direction", "delivery", "transport", "displayOrder", "packet.createdAt", "packet.id"]);
     const persistedRows = await new Promise<StoredMessage[]>((resolve, reject) => {
       const request = messages.getAll() as IDBRequest<StoredMessage[]>;
       request.onsuccess = () => resolve(request.result);
@@ -729,7 +818,7 @@ describe("local IndexedDB storage", () => {
       cause: expect.objectContaining({ name: "QuotaExceededError" }),
     });
     vi.restoreAllMocks();
-    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("preserved", "2026-10-14T09:00:00.000Z"), displayOrder: 0 }]);
+    await expect(loadMessages("alpha")).resolves.toEqual([{ ...message("preserved", "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: 0 }]);
   });
 
   it("reports a transaction abort even after the write request succeeds", async () => {

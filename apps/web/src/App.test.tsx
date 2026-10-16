@@ -20,8 +20,13 @@ const messageReadGate = vi.hoisted(() => ({
   pagePending: null as Promise<import("./lib/storage").LocalMessagePage> | null,
   pageStarted: false,
   releasePage: null as (() => void) | null,
+  queuedPageRoom: null as string | null,
+  queuedPageTransport: null as "hub" | "direct" | null,
+  queuedPagePending: null as Promise<import("./lib/storage").QueuedMessagePage> | null,
+  queuedPageStarted: false,
   releaseRead: null as ((rows?: StoredMessage[]) => void) | null,
   requestedRooms: [] as string[],
+  queuedReads: [] as Array<{ room: string; transport: "hub" | "direct"; after: import("./lib/storage").QueuedMessagePageCursor | null; limit: number | undefined }>,
   ackDispatching: false,
   ackDispatchRoomReads: 0,
   rejectAckFallbackRead: false,
@@ -41,6 +46,34 @@ const messageReadGate = vi.hoisted(() => ({
   resumeStarted: false,
 }));
 const wasmGate = vi.hoisted(() => ({ fail: false }));
+const directMock = vi.hoisted(() => ({ instances: [] as Array<{ sent: string[]; receive: (packet: unknown) => void }> }));
+
+vi.mock("./lib/webrtc", () => {
+  class MockDirectWebRtcTransport {
+    currentState = "new";
+    peerFingerprint = `sha-256 ${Array.from({ length: 32 }, () => "AA").join(":")}`;
+    onStateChange: ((state: string) => void) | null = null;
+    onError: ((error: Error) => void) | null = null;
+    onMessage: ((data: unknown) => void) | null = null;
+    sent: string[] = [];
+    constructor() { directMock.instances.push(this); }
+    async acceptOffer() {
+      this.currentState = "connected";
+      this.onStateChange?.("connected");
+      return JSON.stringify({ type: "answer" });
+    }
+    async createOffer() { return JSON.stringify({ type: "offer" }); }
+    async acceptAnswer() {
+      this.currentState = "connected";
+      this.onStateChange?.("connected");
+    }
+    send(data: string) { this.sent.push(data); }
+    receive(packet: unknown) { this.onMessage?.(JSON.stringify(packet)); }
+    close() { this.currentState = "closed"; this.onStateChange?.("closed"); }
+  }
+  class MockWebRtcTransportError extends Error { code = "outbound_queue_full"; }
+  return { DirectWebRtcTransport: MockDirectWebRtcTransport, WebRtcTransportError: MockWebRtcTransportError };
+});
 
 vi.mock("./lib/wasmProtocol", async () => {
   const protocol = await import("@nearlink/protocol");
@@ -271,6 +304,29 @@ vi.mock("./lib/storage", async (importOriginal) => {
       }
       return actual.loadMessagePage(room, before, limit);
     },
+    loadQueuedMessagePage: async (room: string, transport: "hub" | "direct", after?: import("./lib/storage").QueuedMessagePageCursor | null, limit?: number) => {
+      messageReadGate.requestedRooms.push(room);
+      messageReadGate.queuedReads.push({ room, transport, after: after ?? null, limit });
+      if (messageReadGate.failNextMessageLoads > 0) {
+        messageReadGate.failNextMessageLoads -= 1;
+        throw new Error("Injected message read failure.");
+      }
+      const roomReadCount = messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === room).length;
+      if (after && room === messageReadGate.queuedPageRoom && transport === messageReadGate.queuedPageTransport && messageReadGate.queuedPagePending) {
+        messageReadGate.queuedPageStarted = true;
+        return messageReadGate.queuedPagePending;
+      }
+      if (room === messageReadGate.room && messageReadGate.pending && (messageReadGate.readGateAfter === null || roomReadCount >= messageReadGate.readGateAfter)) {
+        const rows = await messageReadGate.pending as StoredMessage[];
+        const pendingRows = rows.filter((row) => row.packet.room === room && row.direction === "outgoing" && row.delivery === "queued" && (row.transport ?? "hub") === transport)
+          .sort((left, right) => (left.displayOrder ?? 0) - (right.displayOrder ?? 0) || (left.packet.createdAt < right.packet.createdAt ? -1 : left.packet.createdAt > right.packet.createdAt ? 1 : 0) || (left.packet.id < right.packet.id ? -1 : left.packet.id > right.packet.id ? 1 : 0))
+          .filter((row) => !after || (row.displayOrder ?? 0) > after.displayOrder || ((row.displayOrder ?? 0) === after.displayOrder && (row.packet.createdAt > after.createdAt || (row.packet.createdAt === after.createdAt && row.packet.id > after.id))));
+        const pageRows = pendingRows.slice(0, limit ?? 64);
+        const last = pageRows.at(-1);
+        return { messages: pageRows, cursor: last ? { displayOrder: last.displayOrder ?? 0, createdAt: last.packet.createdAt, id: last.packet.id } : null, hasMore: pendingRows.length > (limit ?? 64), deleted: false };
+      }
+      return actual.loadQueuedMessagePage(room, transport, after, limit);
+    },
     loadRequestedMessages: (room: string, ids: string[], validate: (packet: MessagePacket) => boolean) => {
       messageReadGate.requestedRooms.push(room);
       if (messageReadGate.failNextMessageLoads > 0) {
@@ -427,13 +483,14 @@ async function resetDatabase(): Promise<void> {
     request.onblocked = () => reject(new Error("Test database deletion was blocked."));
   });
   const createCurrentDatabase = () => new Promise<void>((resolve, reject) => {
-    const request = indexedDB.open("nearlink-local", 6);
+    const request = indexedDB.open("nearlink-local", 7);
     request.onupgradeneeded = () => {
       const database = request.result;
       const messages = database.createObjectStore("messages", { keyPath: ["packet.room", "packet.id"] });
       messages.createIndex("roomCreatedAt", ["packet.room", "packet.createdAt"]);
       messages.createIndex("roomDeliveryCreatedAt", ["packet.room", "delivery", "packet.createdAt"]);
       messages.createIndex("roomDisplayOrder", ["packet.room", "displayOrder", "packet.createdAt", "packet.id"]);
+      messages.createIndex("roomQueuedTransportOrder", ["packet.room", "direction", "delivery", "transport", "displayOrder", "packet.createdAt", "packet.id"]);
       database.createObjectStore("identity", { keyPath: "key" });
       database.createObjectStore("roomDeletions", { keyPath: "room" });
     };
@@ -492,6 +549,7 @@ async function connectTestHub(sendReplayBoundary = true, room = ROOM): Promise<M
 beforeEach(async () => {
   wasmGate.fail = false;
   MockWebSocket.instances = [];
+  directMock.instances = [];
   messageReadGate.room = null;
   messageReadGate.readGateAfter = null;
   messageReadGate.identityPending = null;
@@ -506,9 +564,14 @@ beforeEach(async () => {
   messageReadGate.pageRoom = null;
   messageReadGate.pagePending = null;
   messageReadGate.pageStarted = false;
+  messageReadGate.queuedPageRoom = null;
+  messageReadGate.queuedPageTransport = null;
+  messageReadGate.queuedPagePending = null;
+  messageReadGate.queuedPageStarted = false;
   messageReadGate.releasePage = null;
   messageReadGate.releaseRead = null;
   messageReadGate.requestedRooms = [];
+  messageReadGate.queuedReads = [];
   messageReadGate.ackDispatching = false;
   messageReadGate.ackDispatchRoomReads = 0;
   messageReadGate.rejectAckFallbackRead = false;
@@ -843,6 +906,9 @@ describe("browser app messaging flow", () => {
     fireEvent.change(draft, { target: { value: "Local newer message" } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await screen.findByText("Local newer message");
+    await waitFor(async () => {
+      expect((await loadMessages(ROOM)).some((item) => item.packet.body === "Local newer message")).toBe(true);
+    });
     expect(screen.getByText("Saved local 0")).toBeTruthy();
     expect(screen.getByText("Saved local 54")).toBeTruthy();
 
@@ -1575,6 +1641,13 @@ describe("browser app messaging flow", () => {
     messageReadGate.pending = new Promise<StoredMessage[]>((resolve) => { releaseRefill = resolve; });
     act(() => socket.receive({ version: 1, type: "ack", id: packets[63].id }));
     await waitFor(() => expect(messageReadGate.requestedRooms.filter((room) => room === ROOM).length).toBeGreaterThan(roomReadsBeforeRefill));
+    const hubQueueReads = messageReadGate.queuedReads.filter((read) => read.room === ROOM && read.transport === "hub");
+    expect(hubQueueReads[0].after).toBeNull();
+    expect(hubQueueReads[1].after).toEqual({
+      displayOrder: 63,
+      createdAt: packets[63].createdAt,
+      id: packets[63].id,
+    });
     const refillSnapshot = await actualStorage.loadMessages(ROOM);
 
     fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), { target: { value: "Saved while replay refills" } });
@@ -1620,6 +1693,64 @@ describe("browser app messaging flow", () => {
     expect(socket.sent.filter((raw) => JSON.parse(raw).type === "message")).toHaveLength(0);
     expect((await loadMessages(ROOM)).find((item) => item.packet.id === invalidPacket.id)?.delivery).toBe("queued");
   });
+
+  it("flushes direct backlog by cursor pages, handles ACKs by exact ID, and cancels a pending page on deletion", async () => {
+    const rows: StoredMessage[] = [];
+    for (let index = 0; index < 70; index += 1) {
+      const row: StoredMessage = {
+        packet: { ...hubMessage(`direct-queue-${String(index).padStart(3, "0")}`, `2026-10-14T09:${String(index % 60).padStart(2, "0")}:${String(Math.floor(index / 60)).padStart(2, "0")}.000Z`), body: `Direct queued ${index}` },
+        direction: "outgoing",
+        delivery: "queued",
+        transport: "direct",
+        displayOrder: index,
+      };
+      rows.push(row);
+    }
+    await seedRoomMessages(rows);
+    let releaseSecondPage!: (page: import("./lib/storage").QueuedMessagePage) => void;
+    messageReadGate.queuedPageRoom = ROOM;
+    messageReadGate.queuedPageTransport = "direct";
+    messageReadGate.queuedPagePending = new Promise((resolve) => { releaseSecondPage = resolve; });
+
+    render(<App />);
+    await waitFor(() => expect((screen.getByRole("textbox", { name: "Write a message" }) as HTMLTextAreaElement).disabled).toBe(false));
+    fireEvent.change(screen.getByLabelText("Message transport"), { target: { value: "direct" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save profile for direct link" }));
+    await waitFor(() => expect(screen.getByText("Direct messages remain queued until session confirmation")).toBeTruthy());
+    fireEvent.click(screen.getByText("Optional advanced path: manual direct peer setup"));
+    fireEvent.change(screen.getByLabelText("Paste peer offer or answer JSON"), { target: { value: "{}" } });
+    fireEvent.click(screen.getByRole("button", { name: "Accept offer" }));
+    await screen.findByLabelText("Fingerprint compared in person or through the separate authenticated channel");
+    fireEvent.change(screen.getByLabelText("Fingerprint compared in person or through the separate authenticated channel"), { target: { value: directMock.instances[0] ? `sha-256 ${Array.from({ length: 32 }, () => "AA").join(":")}` : "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Compare fingerprints" }));
+
+    await screen.findByText("Session fingerprint compared");
+    await waitFor(() => expect(messageReadGate.queuedReads.some((read) => read.transport === "direct")).toBe(true));
+    await waitFor(() => expect(directMock.instances[0]?.sent.filter((data) => JSON.parse(data).type === "message")).toHaveLength(64));
+    await waitFor(() => expect(messageReadGate.queuedPageStarted).toBe(true));
+    const sentMessages = directMock.instances[0].sent.map((data) => JSON.parse(data)).filter((packet) => packet.type === "message");
+    expect(sentMessages.map((packet) => packet.id)).toEqual(rows.slice(0, 64).map((row) => row.packet.id));
+    expect(messageReadGate.queuedReads.filter((read) => read.transport === "direct").map((read) => read.after === null)).toEqual([true, false]);
+
+    await act(async () => {
+      directMock.instances[0].receive({ version: 1, type: "ack", id: sentMessages[63].id });
+      directMock.instances[0].receive({ version: 1, type: "ack", id: sentMessages[0].id });
+    });
+    await waitFor(async () => {
+      const stored = await loadMessages(ROOM);
+      expect(stored.find((row) => row.packet.id === sentMessages[63].id)?.delivery).toBe("sent");
+      expect(stored.find((row) => row.packet.id === sentMessages[0].id)?.delivery).toBe("sent");
+    });
+    expect((await loadMessages(ROOM)).filter((row) => sentMessages.slice(1, 63).some((packet) => packet.id === row.packet.id && row.delivery === "queued")).length).toBe(62);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear this device's saved conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete local messages" }));
+    await waitFor(async () => expect(await loadMessages(ROOM)).toEqual([]));
+    releaseSecondPage({ messages: rows.slice(64), cursor: { displayOrder: 69, createdAt: rows[69].packet.createdAt, id: rows[69].packet.id }, hasMore: false, deleted: false });
+    messageReadGate.queuedPagePending = null;
+    await act(async () => { await Promise.resolve(); });
+    expect(directMock.instances[0].sent.map((data) => JSON.parse(data)).filter((packet) => packet.type === "message")).toHaveLength(64);
+  }, 15000);
 
   it("reconnects and replays after the initial hub outbox load fails", async () => {
     const packet = hubMessage("replay-after-load-failure", "2026-10-15T08:04:30.000Z");

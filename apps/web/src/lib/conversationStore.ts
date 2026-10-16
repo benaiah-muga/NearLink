@@ -6,6 +6,8 @@ import type {
   InboundAcceptanceResult,
   LocalMessagePage,
   LocalMessagePageCursor,
+  QueuedMessagePage,
+  QueuedMessagePageCursor,
 } from "./storage";
 
 /** Persistence operations used by the browser application layer. */
@@ -15,6 +17,7 @@ export interface ConversationStore {
   loadMessages(room: string): Promise<StoredMessage[]>;
   loadMessage(room: string, id: string): Promise<StoredMessage | null>;
   loadMessagePage(room: string, before?: LocalMessagePageCursor | null, limit?: number): Promise<LocalMessagePage>;
+  loadQueuedMessagePage(room: string, transport: "hub" | "direct", after?: QueuedMessagePageCursor | null, limit?: number): Promise<QueuedMessagePage>;
   loadAcceptedMessageIds(room: string, validate: (packet: StoredMessage["packet"]) => boolean): Promise<AcceptedMessageIdSnapshot>;
   loadRequestedMessages(room: string, ids: string[], validate: (packet: StoredMessage["packet"]) => boolean): Promise<StoredMessage[]>;
   saveMessage(message: StoredMessage): Promise<boolean>;
