@@ -96,3 +96,13 @@ presents it and owns transport sends, timers, and rate budgets. Rust exchange st
 and are not the browser's persistent source of truth. These APIs do not
 provide peer authentication, encryption, guaranteed-complete synchronization,
 or a native mobile target, and there is no native app in the repository.
+
+Sync reads of accepted packets return a versioned adapter DTO with the exact
+room and request IDs, room availability, and an ordered subset of valid
+packets. The Rust/WASM validator checks the result before the coordinator uses
+it. Requests are bounded to 100 unique IDs. The WASM boundary caps each raw
+UTF-8 JSON argument at 2 MiB. This result is not an IndexedDB schema or a
+durability guarantee, and hub history continues to use its existing
+`loadRequestedMessages` operation.
+If a serving peer sees an unavailable room, it fails the active exchange and
+withholds page completion because sync wire v1 has no room-unavailable signal.

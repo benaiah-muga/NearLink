@@ -48,6 +48,20 @@ vi.mock("./lib/wasmProtocol", async () => {
       if (validator === "room") return protocol.isProtocolRoom(value);
       return protocol.isProtocolIdentifier(value);
     },
+    validateWasmSyncAcceptedMessageBatch: (batch: import("./lib/conversationStore").SyncAcceptedMessageBatch, expectedRoom: string, expectedIds: string[]) => {
+      if (batch.version !== 1 || batch.room !== expectedRoom
+        || JSON.stringify(batch.requestedIds) !== JSON.stringify(expectedIds)
+        || new Set(expectedIds).size !== expectedIds.length
+        || (batch.roomState !== "available" && batch.roomState !== "unavailable")
+        || (batch.roomState === "unavailable" && batch.messages.length > 0)) return false;
+      let previousIndex = -1;
+      return batch.messages.every((packet) => {
+        const index = expectedIds.indexOf(packet.id);
+        if (index <= previousIndex || packet.room !== expectedRoom || !protocol.isMessagePacket(packet)) return false;
+        previousIndex = index;
+        return true;
+      });
+    },
     isWasmSyncStateReady: () => true,
     createWasmSyncCoverage: () => {
       let incomplete = false;

@@ -105,6 +105,20 @@ vi.mock("./lib/wasmProtocol", async () => {
       if (validator === "room") return protocol.isProtocolRoom(value);
       return protocol.isProtocolIdentifier(value);
     },
+    validateWasmSyncAcceptedMessageBatch: (batch: import("./lib/conversationStore").SyncAcceptedMessageBatch, expectedRoom: string, expectedIds: string[]) => {
+      if (wasmGate.fail || batch.version !== 1 || batch.room !== expectedRoom
+        || JSON.stringify(batch.requestedIds) !== JSON.stringify(expectedIds)
+        || new Set(expectedIds).size !== expectedIds.length
+        || (batch.roomState !== "available" && batch.roomState !== "unavailable")
+        || (batch.roomState === "unavailable" && batch.messages.length > 0)) return false;
+      let previousIndex = -1;
+      return batch.messages.every((packet) => {
+        const index = expectedIds.indexOf(packet.id);
+        if (index <= previousIndex || packet.room !== expectedRoom || !protocol.isMessagePacket(packet)) return false;
+        previousIndex = index;
+        return true;
+      });
+    },
     isWasmSyncStateReady: () => !wasmGate.fail,
     createWasmSyncCoverage: () => {
       let incomplete = false;
@@ -369,6 +383,25 @@ vi.mock("./lib/storage", async (importOriginal) => {
         return messageReadGate.pending.then((rows) => (rows as StoredMessage[]).filter((row) => ids.includes(row.packet.id) && validate(row.packet)));
       }
       return actual.loadRequestedMessages(room, ids, validate);
+    },
+    loadSyncAcceptedMessageBatch: async (room: string, ids: string[], validate: (packet: MessagePacket) => boolean) => {
+      messageReadGate.requestedRooms.push(room);
+      if (messageReadGate.failNextMessageLoads > 0) {
+        messageReadGate.failNextMessageLoads -= 1;
+        throw new Error("Injected message read failure.");
+      }
+      const roomReadCount = messageReadGate.requestedRooms.filter((requestedRoom) => requestedRoom === room).length;
+      if (room === messageReadGate.room && messageReadGate.pending && (messageReadGate.readGateAfter === null || roomReadCount >= messageReadGate.readGateAfter)) {
+        const rows = await messageReadGate.pending as StoredMessage[];
+        return {
+          version: 1 as const,
+          room,
+          requestedIds: [...ids],
+          roomState: "available" as const,
+          messages: rows.filter((row) => ids.includes(row.packet.id) && row.packet.room === room && row.delivery === "sent" && row.failure === undefined && validate(row.packet)).map((row) => row.packet),
+        };
+      }
+      return actual.loadSyncAcceptedMessageBatch(room, ids, validate);
     },
     saveMessage: async (message: Parameters<typeof actual.saveMessage>[0]) => {
       const id = message.packet.id;

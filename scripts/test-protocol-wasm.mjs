@@ -54,7 +54,7 @@ try {
     `<!doctype html>
 <meta charset="utf-8">
 <script type="module">
-  import init, { validate_json, classify_inbound_json, plan_missing_batch_json, WasmLocalInventory, WasmMessageIndex, WasmMissingIdSelector, WasmSyncCoverage, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
+  import init, { validate_json, validate_sync_accepted_message_batch_json, classify_inbound_json, plan_missing_batch_json, WasmLocalInventory, WasmMessageIndex, WasmMissingIdSelector, WasmSyncCoverage, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
 
   const check = (condition, label) => {
     if (!condition) throw new Error(label);
@@ -97,6 +97,7 @@ try {
     localInventory.free();
     const vectors = await fetch("/vectors.json").then((response) => response.json());
     const syncVectors = await fetch("/sync-state-vectors.json").then((response) => response.json());
+    const acceptedBatchVectors = await fetch("/sync-accepted-message-batch-vectors.json").then((response) => response.json());
     const acceptanceVectors = await fetch("/inbound-acceptance-vectors.json").then((response) => response.json());
     for (const vector of vectors) {
       const actual = result(validate_json(vector.validator, JSON.stringify(vector.value)));
@@ -112,6 +113,23 @@ try {
       check(JSON.stringify(stable(actual)) === JSON.stringify(stable(expected)), "acceptance vector mismatch: " + vector.name);
       if (!actual.ok) check(Object.keys(actual).sort().join(",") === "code,ok", "acceptance error leaked packet data");
     }
+    for (const vector of acceptedBatchVectors) {
+      const batch = JSON.parse(JSON.stringify(vector.batch));
+      const expectedIds = vector.largeRequestedIdCount === undefined
+        ? vector.expectedIds
+        : Array.from({ length: vector.largeRequestedIdCount }, (_, index) => "id" + String(index).padStart(3, "0"));
+      if (vector.largeRequestedIdCount !== undefined) batch.requestedIds = expectedIds;
+      if (vector.largeBodyChars !== undefined) batch.messages[0].body = "x".repeat(vector.largeBodyChars);
+      const actual = result(validate_sync_accepted_message_batch_json(
+        JSON.stringify(batch),
+        vector.expectedRoom,
+        JSON.stringify(expectedIds),
+      ));
+      check(actual.ok && actual.valid === vector.valid, "accepted-message batch vector mismatch: " + vector.name);
+    }
+    const acceptedBatch = { version: 1, room: "room1", requestedIds: [], roomState: "available", messages: [] };
+    const oversizedRawBatch = JSON.stringify(acceptedBatch) + " ".repeat(2 * 1024 * 1024 + 1);
+    check(result(validate_sync_accepted_message_batch_json(oversizedRawBatch, "room1", "[]")).code === "input_too_large", "accepted-message batch raw UTF-8 bound missing");
 
     const packet = (id, body) => JSON.stringify({
       version: 1,
@@ -191,7 +209,7 @@ try {
     check(result(plan_missing_batch_json(oversized, 0)).code === "input_too_large", "batch planner byte limit missing");
     check(result(new WasmMissingIdSelector(JSON.stringify(Array(4097).fill("peer"))).status_json()).code === "known_id_limit", "peer inventory count limit missing");
     boundedSelector.free();
-    window.__protocolWasmResult = { ok: true, vectorCount: vectors.length, syncVectorCount: syncVectors.length };
+    window.__protocolWasmResult = { ok: true, vectorCount: vectors.length, syncVectorCount: syncVectors.length, acceptedBatchVectorCount: acceptedBatchVectors.length };
   } catch (error) {
     window.__protocolWasmResult = { ok: false, error: String(error) };
   }
@@ -201,6 +219,8 @@ try {
   await writeFile(path.join(temp, "vectors.json"), vectors);
   const syncVectors = await readFile(path.join(root, "packages/protocol/vectors/sync-state-v1.json"));
   await writeFile(path.join(temp, "sync-state-vectors.json"), syncVectors);
+  const acceptedBatchVectors = await readFile(path.join(root, "packages/protocol/vectors/sync-accepted-message-batch-v1.json"));
+  await writeFile(path.join(temp, "sync-accepted-message-batch-vectors.json"), acceptedBatchVectors);
   const acceptanceVectors = await readFile(path.join(root, "packages/protocol/vectors/inbound-acceptance-v1.json"));
   await writeFile(path.join(temp, "inbound-acceptance-vectors.json"), acceptanceVectors);
 
@@ -210,12 +230,14 @@ try {
       ? "vectors.json"
       : requested === "/sync-state-vectors.json"
         ? "sync-state-vectors.json"
+        : requested === "/sync-accepted-message-batch-vectors.json"
+          ? "sync-accepted-message-batch-vectors.json"
         : requested === "/inbound-acceptance-vectors.json"
           ? "inbound-acceptance-vectors.json"
         : requested === "/"
           ? "index.html"
           : path.basename(requested);
-    if (filename !== "index.html" && filename !== "vectors.json" && filename !== "sync-state-vectors.json" && filename !== "inbound-acceptance-vectors.json" && !/^[\w.-]+$/.test(filename)) {
+    if (filename !== "index.html" && filename !== "vectors.json" && filename !== "sync-state-vectors.json" && filename !== "sync-accepted-message-batch-vectors.json" && filename !== "inbound-acceptance-vectors.json" && !/^[\w.-]+$/.test(filename)) {
       response.writeHead(404);
       response.end();
       return;
@@ -249,7 +271,7 @@ try {
   await page.waitForFunction(() => window.__protocolWasmResult !== undefined);
   const result = await page.evaluate(() => window.__protocolWasmResult);
   assert.equal(result.ok, true, result.error ?? "WebAssembly browser check failed");
-    console.log(`NEARLINK_PROTOCOL_WASM_BROWSER_OK vectors=${result.vectorCount} syncStateVectors=${result.syncVectorCount} localInventory=ok`);
+    console.log(`NEARLINK_PROTOCOL_WASM_BROWSER_OK vectors=${result.vectorCount} syncStateVectors=${result.syncVectorCount} acceptedBatchVectors=${result.acceptedBatchVectorCount} localInventory=ok`);
 } finally {
   await browser?.close();
   if (server) await new Promise((resolve) => server.close(resolve));

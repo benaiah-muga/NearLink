@@ -13,6 +13,7 @@ describe("WASM protocol validator bridge", () => {
       default: initialize,
       validate_json: validateJson,
       classify_inbound_json: () => JSON.stringify({ ok: true, outcome: "saved" }),
+      validate_sync_accepted_message_batch_json: () => JSON.stringify({ ok: true, valid: true }),
     }));
     const bridge = await import("./wasmProtocol");
 
@@ -52,6 +53,7 @@ describe("WASM protocol validator bridge", () => {
       default: initialize,
       validate_json: validateJson,
       classify_inbound_json: () => JSON.stringify({ ok: true, outcome: "saved" }),
+      validate_sync_accepted_message_batch_json: () => JSON.stringify({ ok: true, valid: true }),
     }));
     const bridge = await import("./wasmProtocol");
 
@@ -113,6 +115,7 @@ describe("WASM protocol validator bridge", () => {
     const planMissingBatch = vi.fn(() => JSON.stringify({ ok: true, ids: ["b"], nextOffset: 1, hasMore: false }));
     const observeLocalIds = vi.fn(() => JSON.stringify({ ok: true }));
     const finishMissingIds = vi.fn(() => JSON.stringify({ ok: true, missingIds: ["b"] }));
+    const validateAcceptedBatch = vi.fn(() => JSON.stringify({ ok: true, valid: true }));
     class WasmMissingIdSelector {
       status_json = vi.fn(() => JSON.stringify({ ok: true }));
       observe_local_ids_json = observeLocalIds;
@@ -136,6 +139,7 @@ describe("WASM protocol validator bridge", () => {
       WasmMissingIdSelector,
       WasmLocalInventory,
       plan_missing_batch_json: planMissingBatch,
+      validate_sync_accepted_message_batch_json: validateAcceptedBatch,
     }));
     const bridge = await import("./wasmProtocol");
 
@@ -183,6 +187,19 @@ describe("WASM protocol validator bridge", () => {
     expect(bridge.planWasmMissingBatch(["b"], 0)).toEqual({ ids: ["b"], nextOffset: 1, hasMore: false });
     expect(observeLocalIds).toHaveBeenCalledWith('["a"]');
     expect(planMissingBatch).toHaveBeenCalledWith('["b"]', 0);
+    const acceptedBatch = {
+      version: 1 as const,
+      room: "room1",
+      requestedIds: ["a"],
+      roomState: "available" as const,
+      messages: [],
+    };
+    expect(bridge.validateWasmSyncAcceptedMessageBatch(acceptedBatch, "room1", ["a"])).toBe(true);
+    expect(validateAcceptedBatch).toHaveBeenCalledWith(JSON.stringify(acceptedBatch), "room1", '["a"]');
+    const callsBeforeOversized = validateAcceptedBatch.mock.calls.length;
+    const oversizedBatch = { ...acceptedBatch, extra: "x".repeat(2 * 1024 * 1024) } as typeof acceptedBatch & { extra: string };
+    expect(bridge.validateWasmSyncAcceptedMessageBatch(oversizedBatch, "room1", ["a"])).toBe(false);
+    expect(validateAcceptedBatch).toHaveBeenCalledTimes(callsBeforeOversized);
     expect(inventoryFree).toHaveBeenCalledTimes(2);
     expect(requestFree).toHaveBeenCalledTimes(2);
     expect(coverageFree).toHaveBeenCalledTimes(2);

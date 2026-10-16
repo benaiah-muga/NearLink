@@ -368,7 +368,7 @@ function App() {
         send(packet);
       },
       loadAcceptedMessageIds: () => conversationStore.loadAcceptedMessageIds(connectionRoom, (packet) => validateWithWasm("message", packet)),
-      loadRequestedMessages: (ids) => conversationStore.loadRequestedMessages(connectionRoom, ids, (packet) => validateWithWasm("message", packet)),
+      loadSyncAcceptedMessageBatch: (ids) => conversationStore.loadSyncAcceptedMessageBatch(connectionRoom, ids, (packet) => validateWithWasm("message", packet)),
       validateMessage: (packet) => validateWithWasm("message", packet),
       rebroadcastOnPeerInventory: true,
       messageIntervalMs: transport === "hub" ? 700 : 0,

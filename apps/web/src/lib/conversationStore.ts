@@ -9,6 +9,7 @@ import type {
   QueuedMessagePage,
   QueuedMessagePageCursor,
 } from "./storage";
+import type { MessagePacket } from "@nearlink/protocol";
 
 /** Persistence operations used by the browser application layer. */
 export interface ConversationStore {
@@ -19,6 +20,7 @@ export interface ConversationStore {
   loadMessagePage(room: string, before?: LocalMessagePageCursor | null, limit?: number): Promise<LocalMessagePage>;
   loadQueuedMessagePage(room: string, transport: "hub" | "direct", after?: QueuedMessagePageCursor | null, limit?: number): Promise<QueuedMessagePage>;
   loadAcceptedMessageIds(room: string, validate: (packet: StoredMessage["packet"]) => boolean): Promise<AcceptedMessageIdSnapshot>;
+  loadSyncAcceptedMessageBatch(room: string, ids: string[], validate: (packet: StoredMessage["packet"]) => boolean): Promise<SyncAcceptedMessageBatch>;
   loadRequestedMessages(room: string, ids: string[], validate: (packet: StoredMessage["packet"]) => boolean): Promise<StoredMessage[]>;
   saveMessage(message: StoredMessage): Promise<boolean>;
   acceptInboundMessage(message: StoredMessage): Promise<InboundAcceptanceResult>;
@@ -39,4 +41,13 @@ export interface AcceptedMessageIdSnapshot {
   ids: string[];
   scanComplete: boolean;
   acceptedIdOverflow: boolean;
+}
+
+/** Versioned adapter result for one bounded sync read of accepted messages. */
+export interface SyncAcceptedMessageBatch {
+  version: 1;
+  room: string;
+  requestedIds: string[];
+  roomState: "available" | "unavailable";
+  messages: MessagePacket[];
 }

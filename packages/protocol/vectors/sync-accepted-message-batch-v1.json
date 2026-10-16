@@ -1,0 +1,166 @@
+[
+  {
+    "name": "available full batch",
+    "expectedRoom": "room1",
+    "expectedIds": ["a", "b"],
+    "batch": {
+      "version": 1,
+      "room": "room1",
+      "requestedIds": ["a", "b"],
+      "roomState": "available",
+      "messages": [
+        {"version": 1, "type": "message", "id": "a", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": "alpha"},
+        {"version": 1, "type": "message", "id": "b", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:01Z", "body": "bravo"}
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "available empty batch",
+    "expectedRoom": "room1",
+    "expectedIds": [],
+    "batch": {"version": 1, "room": "room1", "requestedIds": [], "roomState": "available", "messages": []},
+    "valid": true
+  },
+  {
+    "name": "available partial batch preserves request order",
+    "expectedRoom": "room1",
+    "expectedIds": ["a", "b", "c"],
+    "batch": {
+      "version": 1,
+      "room": "room1",
+      "requestedIds": ["a", "b", "c"],
+      "roomState": "available",
+      "messages": [
+        {"version": 1, "type": "message", "id": "a", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": "alpha"},
+        {"version": 1, "type": "message", "id": "c", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:02Z", "body": "charlie"}
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "unavailable empty batch",
+    "expectedRoom": "room1",
+    "expectedIds": ["a"],
+    "batch": {"version": 1, "room": "room1", "requestedIds": ["a"], "roomState": "unavailable", "messages": []},
+    "valid": true
+  },
+  {
+    "name": "invalid version",
+    "expectedRoom": "room1",
+    "expectedIds": [],
+    "batch": {"version": 2, "room": "room1", "requestedIds": [], "roomState": "available", "messages": []},
+    "valid": false
+  },
+  {
+    "name": "extra field",
+    "expectedRoom": "room1",
+    "expectedIds": [],
+    "batch": {"version": 1, "room": "room1", "requestedIds": [], "roomState": "available", "messages": [], "extra": true},
+    "valid": false
+  },
+  {
+    "name": "missing field",
+    "expectedRoom": "room1",
+    "expectedIds": [],
+    "batch": {"version": 1, "room": "room1", "requestedIds": [], "roomState": "available"},
+    "valid": false
+  },
+  {
+    "name": "invalid room",
+    "expectedRoom": "bad room",
+    "expectedIds": [],
+    "batch": {"version": 1, "room": "bad room", "requestedIds": [], "roomState": "available", "messages": []},
+    "valid": false
+  },
+  {
+    "name": "room mismatch",
+    "expectedRoom": "room2",
+    "expectedIds": [],
+    "batch": {"version": 1, "room": "room1", "requestedIds": [], "roomState": "available", "messages": []},
+    "valid": false
+  },
+  {
+    "name": "request IDs mismatch",
+    "expectedRoom": "room1",
+    "expectedIds": ["a", "b"],
+    "batch": {"version": 1, "room": "room1", "requestedIds": ["b", "a"], "roomState": "available", "messages": []},
+    "valid": false
+  },
+  {
+    "name": "duplicate requested IDs",
+    "expectedRoom": "room1",
+    "expectedIds": ["a", "a"],
+    "batch": {"version": 1, "room": "room1", "requestedIds": ["a", "a"], "roomState": "available", "messages": []},
+    "valid": false
+  },
+  {
+    "name": "request exceeds the 100 ID bound",
+    "expectedRoom": "room1",
+    "expectedIds": [],
+    "largeRequestedIdCount": 101,
+    "batch": {"version": 1, "room": "room1", "requestedIds": [], "roomState": "available", "messages": []},
+    "valid": false
+  },
+  {
+    "name": "malformed returned packet",
+    "expectedRoom": "room1",
+    "expectedIds": ["a"],
+    "batch": {"version": 1, "room": "room1", "requestedIds": ["a"], "roomState": "available", "messages": [{"version": 1, "type": "message", "id": "a"}]},
+    "valid": false
+  },
+  {
+    "name": "oversized message packet",
+    "expectedRoom": "room1",
+    "expectedIds": ["a"],
+    "batch": {"version": 1, "room": "room1", "requestedIds": ["a"], "roomState": "available", "messages": [{"version": 1, "type": "message", "id": "a", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": ""}]},
+    "largeBodyChars": 20000,
+    "valid": false
+  },
+  {
+    "name": "duplicate returned IDs",
+    "expectedRoom": "room1",
+    "expectedIds": ["a", "b"],
+    "batch": {
+      "version": 1,
+      "room": "room1",
+      "requestedIds": ["a", "b"],
+      "roomState": "available",
+      "messages": [
+        {"version": 1, "type": "message", "id": "a", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": "alpha"},
+        {"version": 1, "type": "message", "id": "a", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": "alpha"}
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "unrequested returned ID",
+    "expectedRoom": "room1",
+    "expectedIds": ["a"],
+    "batch": {"version": 1, "room": "room1", "requestedIds": ["a"], "roomState": "available", "messages": [{"version": 1, "type": "message", "id": "b", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": "bravo"}]},
+    "valid": false
+  },
+  {
+    "name": "out of request order",
+    "expectedRoom": "room1",
+    "expectedIds": ["a", "b"],
+    "batch": {
+      "version": 1,
+      "room": "room1",
+      "requestedIds": ["a", "b"],
+      "roomState": "available",
+      "messages": [
+        {"version": 1, "type": "message", "id": "b", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:01Z", "body": "bravo"},
+        {"version": 1, "type": "message", "id": "a", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": "alpha"}
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "unavailable room has messages",
+    "expectedRoom": "room1",
+    "expectedIds": ["a"],
+    "batch": {"version": 1, "room": "room1", "requestedIds": ["a"], "roomState": "unavailable", "messages": [{"version": 1, "type": "message", "id": "a", "room": "room1", "sender": "device1", "senderName": "Amina", "createdAt": "2026-10-14T12:00:00Z", "body": "alpha"}]},
+    "valid": false
+  }
+]

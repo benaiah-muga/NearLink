@@ -63,6 +63,123 @@ pub const MAX_PAGE_MESSAGES: usize = 128;
 pub const MAX_PAGE_BYTES: usize = 512 * 1024;
 /// Maximum number of local IDs accepted in one missing-ID scan chunk.
 pub const MAX_SYNC_SELECTION_CHUNK_IDS: usize = 4_096;
+/// Maximum requested IDs in one browser accepted-message adapter result.
+pub const MAX_SYNC_ACCEPTED_MESSAGE_BATCH_IDS: usize = 100;
+/// Maximum UTF-8 JSON input size enforced by the WASM adapter.
+pub const MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES: usize = 2 * 1024 * 1024;
+
+/// Room state observed by one accepted-message storage read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncAcceptedMessageRoomState {
+    Available,
+    Unavailable,
+}
+
+/// Versioned packet-only result for a bounded synchronization storage read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncAcceptedMessageBatch {
+    pub version: u8,
+    pub room: String,
+    pub requested_ids: Vec<String>,
+    pub room_state: SyncAcceptedMessageRoomState,
+    pub messages: Vec<Value>,
+}
+
+/// Validate the untrusted result of a bounded accepted-message storage read.
+/// `expected_ids` is the exact request context and must match the DTO unchanged.
+pub fn validate_sync_accepted_message_batch(
+    value: &Value,
+    expected_room: &str,
+    expected_ids: &[String],
+) -> Result<SyncAcceptedMessageBatch, SyncError> {
+    if !is_protocol_room(expected_room) {
+        return Err(SyncError::InvalidRoom);
+    }
+    if expected_ids.len() > MAX_SYNC_ACCEPTED_MESSAGE_BATCH_IDS
+        || expected_ids.iter().any(|id| !is_protocol_identifier(id))
+        || expected_ids.iter().collect::<BTreeSet<_>>().len() != expected_ids.len()
+    {
+        return Err(SyncError::InvalidSyncRequest);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(SyncError::InvalidSyncAcceptedMessageBatch);
+    };
+    let fields = ["version", "room", "requestedIds", "roomState", "messages"];
+    if object.len() != fields.len() || object.keys().any(|field| !fields.contains(&field.as_str()))
+    {
+        return Err(SyncError::InvalidSyncAcceptedMessageBatch);
+    }
+    if value.get("version").and_then(Value::as_f64) != Some(1.0) {
+        return Err(SyncError::InvalidSyncAcceptedMessageBatch);
+    }
+    let room = value
+        .get("room")
+        .and_then(Value::as_str)
+        .ok_or(SyncError::InvalidSyncAcceptedMessageBatch)?;
+    if !is_protocol_room(room) {
+        return Err(SyncError::InvalidRoom);
+    }
+    if room != expected_room {
+        return Err(SyncError::RoomMismatch);
+    }
+    let requested_ids = value
+        .get("requestedIds")
+        .and_then(Value::as_array)
+        .ok_or(SyncError::InvalidSyncAcceptedMessageBatch)?
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .map(str::to_owned)
+                .ok_or(SyncError::InvalidSyncAcceptedMessageBatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if requested_ids != expected_ids {
+        return Err(SyncError::InvalidSyncRequest);
+    }
+    let room_state = match value.get("roomState").and_then(Value::as_str) {
+        Some("available") => SyncAcceptedMessageRoomState::Available,
+        Some("unavailable") => SyncAcceptedMessageRoomState::Unavailable,
+        _ => return Err(SyncError::InvalidSyncAcceptedMessageBatch),
+    };
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or(SyncError::InvalidSyncAcceptedMessageBatch)?;
+    if messages.len() > MAX_SYNC_ACCEPTED_MESSAGE_BATCH_IDS || messages.len() > expected_ids.len() {
+        return Err(SyncError::InvalidSyncAcceptedMessageBatch);
+    }
+    if room_state == SyncAcceptedMessageRoomState::Unavailable && !messages.is_empty() {
+        return Err(SyncError::InvalidSyncAcceptedMessageBatch);
+    }
+    let mut previous_index = None;
+    for message in messages {
+        if !is_message_packet(message) {
+            return Err(SyncError::InvalidMessage);
+        }
+        if message.get("room").and_then(Value::as_str) != Some(expected_room) {
+            return Err(SyncError::RoomMismatch);
+        }
+        let id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(SyncError::InvalidMessage)?;
+        let index = expected_ids
+            .iter()
+            .position(|requested| requested == id)
+            .ok_or(SyncError::InvalidSyncAcceptedMessageBatch)?;
+        if previous_index.is_some_and(|previous| previous >= index) {
+            return Err(SyncError::InvalidSyncAcceptedMessageBatch);
+        }
+        previous_index = Some(index);
+    }
+    Ok(SyncAcceptedMessageBatch {
+        version: 1,
+        room: room.to_owned(),
+        requested_ids,
+        room_state,
+        messages: messages.clone(),
+    })
+}
 
 /// Frozen, validated local inventory for one synchronization session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +450,8 @@ pub enum SyncError {
     SyncObservedLimit,
     /// A completion did not match its request or contained unrequested IDs.
     InvalidSyncCompletion,
+    /// A versioned accepted-message batch did not match its request context.
+    InvalidSyncAcceptedMessageBatch,
 }
 
 impl fmt::Display for SyncError {
@@ -362,6 +481,9 @@ impl fmt::Display for SyncError {
                 "retained synchronization messages exceed the exchange limit"
             }
             Self::InvalidSyncCompletion => "synchronization completion does not match its request",
+            Self::InvalidSyncAcceptedMessageBatch => {
+                "synchronization accepted-message batch is invalid"
+            }
         };
         formatter.write_str(message)
     }
@@ -1148,6 +1270,41 @@ impl MessageIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_accepted_message_batch_vectors_match_core_validation() {
+        let vectors: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../packages/protocol/vectors/sync-accepted-message-batch-v1.json"
+        ))
+        .expect("shared accepted-message batch vectors are valid JSON");
+        for vector in vectors {
+            let mut batch = vector["batch"].clone();
+            let mut expected_ids = vector["expectedIds"].clone();
+            if let Some(id_count) = vector["largeRequestedIdCount"].as_u64() {
+                let ids = (0..id_count)
+                    .map(|index| format!("id{index:03}"))
+                    .collect::<Vec<_>>();
+                batch["requestedIds"] = serde_json::to_value(&ids).unwrap();
+                expected_ids = serde_json::to_value(ids).unwrap();
+            }
+            if let Some(body_length) = vector["largeBodyChars"].as_u64() {
+                batch["messages"][0]["body"] = Value::String("x".repeat(body_length as usize));
+            }
+            let expected_ids = expected_ids
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            let actual = validate_sync_accepted_message_batch(
+                &batch,
+                vector["expectedRoom"].as_str().unwrap(),
+                &expected_ids,
+            )
+            .is_ok();
+            assert_eq!(actual, vector["valid"], "vector: {}", vector["name"]);
+        }
+    }
 
     #[test]
     fn local_inventory_validates_snapshot_and_freezes_pages_and_membership() {

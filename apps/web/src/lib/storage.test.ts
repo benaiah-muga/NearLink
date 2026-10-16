@@ -1,23 +1,40 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_HISTORY_PAGE_MESSAGES, type MessagePacket } from "@nearlink/protocol";
-import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadQueuedMessagePage, loadRequestedMessages, MAX_HUB_REPLAY_ORDER_IDS, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadQueuedMessagePage, loadRequestedMessages, loadSyncAcceptedMessageBatch, MAX_HUB_REPLAY_ORDER_IDS, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const classifierGate = vi.hoisted(() => ({ failNext: false }));
 
-vi.mock("./wasmProtocol", () => ({
-  initializeWasmProtocol: async () => true,
-  classifyInboundAcceptance: (expectedRoom: string, roomDeleted: boolean, candidate: MessagePacket, existing?: MessagePacket) => {
-    if (classifierGate.failNext) {
-      classifierGate.failNext = false;
-      throw new Error("WASM inbound acceptance is unavailable.");
-    }
-    if (candidate.room !== expectedRoom) throw new Error("WASM rejected inbound acceptance (room_mismatch).");
-    if (roomDeleted) return "room_deleted";
-    if (!existing) return "saved";
-    return JSON.stringify(candidate) === JSON.stringify(existing) ? "duplicate" : "conflict";
-  },
-}));
+vi.mock("./wasmProtocol", async () => {
+  const protocol = await import("@nearlink/protocol");
+  return {
+    initializeWasmProtocol: async () => true,
+    classifyInboundAcceptance: (expectedRoom: string, roomDeleted: boolean, candidate: MessagePacket, existing?: MessagePacket) => {
+      if (classifierGate.failNext) {
+        classifierGate.failNext = false;
+        throw new Error("WASM inbound acceptance is unavailable.");
+      }
+      if (candidate.room !== expectedRoom) throw new Error("WASM rejected inbound acceptance (room_mismatch).");
+      if (roomDeleted) return "room_deleted";
+      if (!existing) return "saved";
+      return JSON.stringify(candidate) === JSON.stringify(existing) ? "duplicate" : "conflict";
+    },
+    validateWasmSyncAcceptedMessageBatch: (batch: import("./conversationStore").SyncAcceptedMessageBatch, expectedRoom: string, expectedIds: string[]) => {
+      if (batch.version !== 1 || batch.room !== expectedRoom
+        || JSON.stringify(batch.requestedIds) !== JSON.stringify(expectedIds)
+        || new Set(expectedIds).size !== expectedIds.length
+        || (batch.roomState !== "available" && batch.roomState !== "unavailable")
+        || (batch.roomState === "unavailable" && batch.messages.length > 0)) return false;
+      let previousIndex = -1;
+      return batch.messages.every((packet) => {
+        const index = expectedIds.indexOf(packet.id);
+        if (index <= previousIndex || packet.room !== expectedRoom || !protocol.isMessagePacket(packet)) return false;
+        previousIndex = index;
+        return true;
+      });
+    },
+  };
+});
 
 const DATABASE_NAME = "nearlink-local";
 
@@ -144,6 +161,33 @@ describe("local IndexedDB storage", () => {
     const found = await loadRequestedMessages("alpha", ids, (candidate) => candidate.id !== "id-000");
     expect(found.map((row) => row.packet.id)).toEqual(acceptedIds.filter((id) => id !== "id-000"));
     await expect(loadRequestedMessages("alpha", [...ids, "one-too-many"], () => true)).rejects.toThrow("at most 100");
+  });
+
+  it("returns a versioned bounded accepted-message result with request context", async () => {
+    await saveMessage(message("a", "2026-10-14T09:00:00.000Z", "sent"));
+    await saveMessage(message("b", "2026-10-14T09:00:00.000Z", "sent"));
+    await saveMessage(message("queued", "2026-10-14T09:00:00.000Z"));
+
+    await expect(loadSyncAcceptedMessageBatch("alpha", ["b", "a", "missing", "queued"], () => true)).resolves.toEqual({
+      version: 1,
+      room: "alpha",
+      requestedIds: ["b", "a", "missing", "queued"],
+      roomState: "available",
+      messages: [packet("b", "2026-10-14T09:00:00.000Z"), packet("a", "2026-10-14T09:00:00.000Z")],
+    });
+    await expect(loadSyncAcceptedMessageBatch("alpha", ["a", "a"], () => true)).rejects.toThrow("unique valid message IDs");
+    await expect(loadSyncAcceptedMessageBatch("alpha", [], () => true)).resolves.toMatchObject({
+      version: 1, room: "alpha", requestedIds: [], roomState: "available", messages: [],
+    });
+  });
+
+  it("returns unavailable with no messages while room deletion is marked", async () => {
+    await saveMessage(message("saved", "2026-10-14T09:00:00.000Z", "sent"));
+    await beginRoomDeletion("alpha");
+
+    await expect(loadSyncAcceptedMessageBatch("alpha", ["saved"], () => true)).resolves.toEqual({
+      version: 1, room: "alpha", requestedIds: ["saved"], roomState: "unavailable", messages: [],
+    });
   });
 
   it("fails the bounded snapshot if the injected validator throws", async () => {

@@ -10,19 +10,20 @@ import {
   type SyncPacket,
   type SyncPageCompletePacket,
 } from "@nearlink/protocol";
+import type { SyncAcceptedMessageBatch } from "./conversationStore";
 import {
   createWasmSyncInventoryReceiver,
   createWasmSyncRequestBook,
   createWasmSyncCoverage,
   createWasmLocalInventory,
   isWasmSyncStateReady,
+  validateWasmSyncAcceptedMessageBatch,
   type SyncInventoryState,
   type SyncRequestState,
   type SyncCoverageState,
   type SyncLocalInventory,
 } from "./wasmProtocol";
 import { SecureRandomUnavailableError } from "./secureId";
-import type { StoredMessage } from "./storage";
 import type { AcceptedMessageIdSnapshot } from "./conversationStore";
 
 export type SyncState = "idle" | "syncing" | "partial" | "complete" | "error";
@@ -35,7 +36,7 @@ export interface SyncCoordinatorOptions {
   makeId: () => string;
   send: (packet: SyncPacket | MessagePacket) => void;
   loadAcceptedMessageIds: () => Promise<AcceptedMessageIdSnapshot>;
-  loadRequestedMessages: (ids: string[]) => Promise<StoredMessage[]>;
+  loadSyncAcceptedMessageBatch: (ids: string[]) => Promise<SyncAcceptedMessageBatch>;
   validateMessage: (packet: MessagePacket) => boolean;
   rebroadcastOnPeerInventory?: boolean;
   messageIntervalMs?: number;
@@ -436,11 +437,17 @@ export class SyncCoordinator {
     if (!this.isResponseActive(request, responseEpoch)) return;
     if (request.targetSender !== this.options.sender || request.syncId !== this.localSyncId || this.localSyncId === "") return;
     try {
-      const current = await this.options.loadRequestedMessages(request.messageIds);
+      const current = await this.options.loadSyncAcceptedMessageBatch(request.messageIds);
       if (!this.isResponseActive(request, responseEpoch)) return;
-      const available = new Map(current.filter((item) => request.messageIds.includes(item.packet.id)
-        && this.localInventory?.contains(item.packet.id) === true
-        && this.options.validateMessage(item.packet)).map((item) => [item.packet.id, item.packet]));
+      if (!validateWasmSyncAcceptedMessageBatch(current, this.options.room, request.messageIds)) {
+        throw new Error("WASM rejected the synchronization accepted-message result.");
+      }
+      if (current.roomState !== "available") {
+        this.fail("The local room became unavailable during synchronization. Reconnect to restart synchronization from fresh inventories.");
+        return;
+      }
+      const available = new Map(current.messages.filter((packet) => this.localInventory?.contains(packet.id) === true
+        && this.options.validateMessage(packet)).map((packet) => [packet.id, packet]));
       const emitted: string[] = [];
       for (const id of request.messageIds) {
         const message = available.get(id);
@@ -520,10 +527,12 @@ export class SyncCoordinator {
     const observedIds = staged.observedIds;
     const incompletePage = staged.completedIds.length < staged.requestedIds.length || observedIds.length < staged.completedIds.length;
     try {
-      const stored = await this.options.loadRequestedMessages(observedIds);
+      const stored = await this.options.loadSyncAcceptedMessageBatch(observedIds);
       if (!this.isRunActive(completeEpoch) || this.remote.get(key(packet.sender, packet.syncId)) !== session) return;
-      const validStored = stored.filter((item) => this.options.validateMessage(item.packet)).map((item) => item.packet);
-      if (!book.verifyDurableMessages(packet.requestId, validStored)) {
+      if (!validateWasmSyncAcceptedMessageBatch(stored, this.options.room, observedIds)) {
+        throw new Error("WASM rejected the synchronization accepted-message result.");
+      }
+      if (stored.roomState !== "available" || !book.verifyDurableMessages(packet.requestId, stored.messages)) {
         book.finishCompletion(packet.requestId, false);
         this.fail("A requested message was not durably saved before page completion. Reconnect to retry with a fresh exchange.");
         return;

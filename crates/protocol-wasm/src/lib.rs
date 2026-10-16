@@ -15,7 +15,8 @@
 use nearlink_protocol_core::sync::{
     plan_missing_batch, InsertOutcome, InventoryPageOutcome, LocalInventory, MessageIndex,
     MissingIdSelector, SyncCoverage, SyncError, SyncInventoryReceiver, SyncMessageOutcome,
-    SyncRequestBook, SyncRequestOutcome, MAX_ENVELOPE_BYTES, MAX_SYNC_SELECTION_CHUNK_IDS,
+    SyncRequestBook, SyncRequestOutcome, MAX_ENVELOPE_BYTES, MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES,
+    MAX_SYNC_SELECTION_CHUNK_IDS,
 };
 use nearlink_protocol_core::{
     classify_inbound_acceptance, is_client_packet, is_history_page_complete_packet,
@@ -96,6 +97,7 @@ enum ErrorCode {
     SyncRequestConflict,
     SyncObservedLimit,
     InvalidSyncCompletion,
+    InvalidSyncAcceptedMessageBatch,
 }
 
 impl ErrorCode {
@@ -126,6 +128,7 @@ impl ErrorCode {
             Self::SyncRequestConflict => "sync_request_conflict",
             Self::SyncObservedLimit => "sync_observed_limit",
             Self::InvalidSyncCompletion => "invalid_sync_completion",
+            Self::InvalidSyncAcceptedMessageBatch => "invalid_sync_accepted_message_batch",
         }
     }
 }
@@ -200,6 +203,7 @@ impl From<SyncError> for ErrorCode {
             SyncError::SyncRequestConflict => Self::SyncRequestConflict,
             SyncError::SyncObservedLimit => Self::SyncObservedLimit,
             SyncError::InvalidSyncCompletion => Self::InvalidSyncCompletion,
+            SyncError::InvalidSyncAcceptedMessageBatch => Self::InvalidSyncAcceptedMessageBatch,
         }
     }
 }
@@ -247,6 +251,36 @@ pub fn validate_json(validator: &str, value_json: &str) -> String {
         "room" => value.as_str().is_some_and(is_protocol_room),
         _ => return error_json(ErrorCode::UnknownValidator),
     };
+    json!({"ok": true, "valid": valid}).to_string()
+}
+
+/// Validate a versioned accepted-message storage result against its request.
+/// The JSON string is measured as raw UTF-8 bytes before parsing.
+#[wasm_bindgen]
+pub fn validate_sync_accepted_message_batch_json(
+    value_json: &str,
+    expected_room: &str,
+    expected_ids_json: &str,
+) -> String {
+    if value_json.len() > MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES
+        || expected_ids_json.len() > MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES
+    {
+        return error_json(ErrorCode::InputTooLarge);
+    }
+    let value: Value = match serde_json::from_str(value_json) {
+        Ok(value) => value,
+        Err(_) => return error_json(ErrorCode::InvalidJson),
+    };
+    let expected_ids: Vec<String> = match serde_json::from_str(expected_ids_json) {
+        Ok(ids) => ids,
+        Err(_) => return error_json(ErrorCode::InvalidJson),
+    };
+    let valid = nearlink_protocol_core::sync::validate_sync_accepted_message_batch(
+        &value,
+        expected_room,
+        &expected_ids,
+    )
+    .is_ok();
     json!({"ok": true, "valid": valid}).to_string()
 }
 
@@ -1168,5 +1202,53 @@ mod tests {
                 assert_eq!(actual, operation["expected"], "vector: {}", vector["name"]);
             }
         }
+    }
+
+    #[test]
+    fn shared_accepted_message_batch_vectors_match_through_wasm_facade() {
+        let vectors: Vec<Value> = serde_json::from_str(include_str!(
+            "../../../packages/protocol/vectors/sync-accepted-message-batch-v1.json"
+        ))
+        .expect("shared accepted-message batch vectors are valid JSON");
+        for vector in vectors {
+            let mut batch = vector["batch"].clone();
+            let mut expected_ids = vector["expectedIds"].clone();
+            if let Some(id_count) = vector["largeRequestedIdCount"].as_u64() {
+                let ids = (0..id_count)
+                    .map(|index| format!("id{index:03}"))
+                    .collect::<Vec<_>>();
+                batch["requestedIds"] = serde_json::to_value(&ids).unwrap();
+                expected_ids = serde_json::to_value(ids).unwrap();
+            }
+            if let Some(body_length) = vector["largeBodyChars"].as_u64() {
+                batch["messages"][0]["body"] = Value::String("x".repeat(body_length as usize));
+            }
+            let actual = parse_result(&validate_sync_accepted_message_batch_json(
+                &batch.to_string(),
+                vector["expectedRoom"].as_str().unwrap(),
+                &expected_ids.to_string(),
+            ));
+            assert_eq!(
+                actual,
+                json!({"ok": true, "valid": vector["valid"]}),
+                "vector: {}",
+                vector["name"]
+            );
+        }
+
+        let batch = json!({"version": 1, "room": "room1", "requestedIds": [], "roomState": "available", "messages": []});
+        let oversized_raw_json = format!(
+            "{}{}",
+            batch,
+            " ".repeat(MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES + 1)
+        );
+        assert_eq!(
+            parse_result(&validate_sync_accepted_message_batch_json(
+                &oversized_raw_json,
+                "room1",
+                "[]",
+            )),
+            json!({"ok": false, "code": "input_too_large"})
+        );
     }
 }

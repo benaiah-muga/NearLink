@@ -11,6 +11,18 @@ vi.mock("./wasmProtocol", async () => {
   return {
     initializeWasmProtocol: async () => true,
     isWasmSyncStateReady: () => wasmState.ready,
+    validateWasmSyncAcceptedMessageBatch: (batch: import("./conversationStore").SyncAcceptedMessageBatch, expectedRoom: string, expectedIds: string[]) => {
+      if (batch.version !== 1 || batch.room !== expectedRoom || JSON.stringify(batch.requestedIds) !== JSON.stringify(expectedIds)
+        || (batch.roomState !== "available" && batch.roomState !== "unavailable")
+        || (batch.roomState === "unavailable" && batch.messages.length > 0)) return false;
+      let previousIndex = -1;
+      for (const message of batch.messages) {
+        const index = expectedIds.indexOf(message.id);
+        if (index <= previousIndex || message.room !== expectedRoom || !protocol.isMessagePacket(message)) return false;
+        previousIndex = index;
+      }
+      return true;
+    },
     createWasmSyncCoverage: () => {
       let incomplete = false;
       let activePlans = 0;
@@ -199,8 +211,14 @@ function boundedStorage(load: () => Promise<StoredMessage[]>) {
       const allIds = [...new Set(rows.filter((row) => row.packet.room === room && row.delivery === "sent" && row.failure === undefined).map((row) => row.packet.id))].sort();
       return { version: 1 as const, room, ids: allIds.slice(0, 4096), scanComplete: true, acceptedIdOverflow: allIds.length > 4096 };
     },
-    loadRequestedMessages: async (ids: string[]) => (await load()).filter((row) => ids.includes(row.packet.id)
-      && row.packet.room === room && row.delivery === "sent" && row.failure === undefined),
+    loadSyncAcceptedMessageBatch: async (ids: string[]) => ({
+      version: 1 as const,
+      room,
+      requestedIds: [...ids],
+      roomState: "available" as const,
+      messages: (await load()).filter((row) => ids.includes(row.packet.id)
+        && row.packet.room === room && row.delivery === "sent" && row.failure === undefined).map((row) => row.packet),
+    }),
   };
 }
 
@@ -488,7 +506,7 @@ describe("SyncCoordinator", () => {
       makeId: () => "truncated-session",
       send: (value) => sent.push(value),
       loadAcceptedMessageIds: async () => ({ version: 1, room, ids: [], scanComplete: false, acceptedIdOverflow: false }),
-      loadRequestedMessages: async () => [],
+      loadSyncAcceptedMessageBatch: async (ids) => ({ version: 1, room, requestedIds: [...ids], roomState: "available", messages: [] }),
       validateMessage: () => true,
       onState: (next) => { state = next; },
     });
@@ -509,12 +527,33 @@ describe("SyncCoordinator", () => {
       makeId: () => "storage-failure-session",
       send: (value) => sent.push(value),
       loadAcceptedMessageIds: async () => ({ version: 1, room, ids: [], scanComplete: true, acceptedIdOverflow: false }),
-      loadRequestedMessages: async () => { throw new Error("storage unavailable"); },
+      loadSyncAcceptedMessageBatch: async () => { throw new Error("storage unavailable"); },
       validateMessage: () => true,
       onState: (next) => { state = next; },
     });
     await coordinator.start();
     await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "storage-failure-session", requestId: "failed-request", sender: "local-b", targetSender: "local-a", messageIds: ["wanted"] });
+    expect(state).toBe("error");
+    expect(sent.some((item) => item.type === "sync_page_complete")).toBe(false);
+    coordinator.stop();
+  });
+
+  it("withholds completion when the requested local room is unavailable", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    let state: SyncState = "idle";
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: () => "deleted-room-session",
+      send: (value) => sent.push(value),
+      loadAcceptedMessageIds: async () => ({ version: 1, room, ids: [], scanComplete: true, acceptedIdOverflow: false }),
+      loadSyncAcceptedMessageBatch: async (ids) => ({ version: 1, room, requestedIds: [...ids], roomState: "unavailable", messages: [] }),
+      validateMessage: () => true,
+      onState: (next) => { state = next; },
+    });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_missing_request", room, syncId: "deleted-room-session", requestId: "unavailable-request", sender: "local-b", targetSender: "local-a", messageIds: ["wanted"] });
+
     expect(state).toBe("error");
     expect(sent.some((item) => item.type === "sync_page_complete")).toBe(false);
     coordinator.stop();
@@ -681,8 +720,8 @@ describe("SyncCoordinator", () => {
   it("frees exchange state on stop and prevents stale async completion from reviving after restart", async () => {
     const sent: Array<SyncPacket | MessagePacket> = [];
     let requestId = 0;
-    let releaseDurableCheck!: (rows: StoredMessage[]) => void;
-    const pendingDurableCheck = new Promise<StoredMessage[]>((resolve) => { releaseDurableCheck = resolve; });
+    let releaseDurableCheck!: (batch: import("./conversationStore").SyncAcceptedMessageBatch) => void;
+    const pendingDurableCheck = new Promise<import("./conversationStore").SyncAcceptedMessageBatch>((resolve) => { releaseDurableCheck = resolve; });
     let durableLoads = 0;
     let state: SyncState = "idle";
     const coordinator = new SyncCoordinator({
@@ -691,12 +730,12 @@ describe("SyncCoordinator", () => {
       makeId: () => `lifecycle-${++requestId}`,
       send: (value) => sent.push(value),
       ...boundedStorage(async () => []),
-      loadRequestedMessages: async (ids: string[]) => {
+      loadSyncAcceptedMessageBatch: async (ids: string[]) => {
         if (ids.length > 0) {
           durableLoads += 1;
           return pendingDurableCheck;
         }
-        return [];
+        return { version: 1, room, requestedIds: [...ids], roomState: "available", messages: [] };
       },
       validateMessage: () => true,
       onState: (next) => { state = next; },
@@ -714,7 +753,7 @@ describe("SyncCoordinator", () => {
     expect(wasmState.frees).toBeGreaterThan(freedBeforeRestart);
     await coordinator.start();
     const freshSentCount = sent.length;
-    releaseDurableCheck([stored("pending", "local-b")]);
+    releaseDurableCheck({ version: 1, room, requestedIds: ["pending"], roomState: "available", messages: [packet("pending", "local-b")] });
     await completing;
     await Promise.resolve();
     expect(state).toBe("syncing");

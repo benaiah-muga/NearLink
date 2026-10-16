@@ -6,6 +6,7 @@ import type {
   SyncMissingRequestPacket,
   SyncPageCompletePacket,
 } from "@nearlink/protocol";
+import type { SyncAcceptedMessageBatch } from "./conversationStore";
 
 type Validator = "client" | "message" | "server" | "identifier" | "room";
 
@@ -77,6 +78,7 @@ export interface SyncLocalInventorySnapshot {
 
 interface WasmSyncModule {
   plan_missing_batch_json(missingIdsJson: string, offset: number): string;
+  validate_sync_accepted_message_batch_json(valueJson: string, expectedRoom: string, expectedIdsJson: string): string;
   WasmMissingIdSelector: new (peerIdsJson: string) => {
     status_json(): string;
     observe_local_ids_json(localIdsJson: string): string;
@@ -130,6 +132,7 @@ type WasmModule = WasmSyncModule & {
 
 export const MAX_PROTOCOL_ENVELOPE_BYTES = 18 * 1024;
 export const MAX_SYNC_SELECTION_CHUNK_IDS = 4_096;
+export const MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES = 2 * 1024 * 1024;
 
 let wasmValidator: WasmValidator | null = null;
 let wasmSyncModule: WasmSyncModule | null = null;
@@ -172,6 +175,7 @@ export function initializeWasmProtocol(): Promise<boolean> {
       const localInventoryApiReady = localInventoryProbe !== null && typeof localInventoryProbe.status_json === "function"
         && typeof localInventoryProbe.contains === "function" && typeof localInventoryProbe.missing_ids_json === "function"
         && typeof localInventoryProbe.page_json === "function";
+      const acceptedBatchApiReady = typeof wasm.validate_sync_accepted_message_batch_json === "function";
       inventoryProbe?.free();
       requestProbe?.free();
       coverageProbe?.free();
@@ -184,6 +188,7 @@ export function initializeWasmProtocol(): Promise<boolean> {
         && requestApiReady
         && coverageApiReady
         && localInventoryApiReady
+        && acceptedBatchApiReady
         && typeof wasm.WasmMissingIdSelector === "function"
         && typeof wasm.plan_missing_batch_json === "function" ? wasm : null;
       return true;
@@ -196,6 +201,26 @@ export function initializeWasmProtocol(): Promise<boolean> {
     }
   })();
   return initialization;
+}
+
+/** Validate one adapter result against the exact room and request context in Rust/WASM. */
+export function validateWasmSyncAcceptedMessageBatch(
+  batch: SyncAcceptedMessageBatch,
+  expectedRoom: string,
+  expectedIds: string[],
+): boolean {
+  if (!wasmSyncModule) return false;
+  try {
+    const batchJson = JSON.stringify(batch);
+    const expectedIdsJson = JSON.stringify(expectedIds);
+    if (typeof batchJson !== "string" || typeof expectedIdsJson !== "string"
+      || new TextEncoder().encode(batchJson).byteLength > MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES
+      || new TextEncoder().encode(expectedIdsJson).byteLength > MAX_SYNC_ACCEPTED_MESSAGE_BATCH_BYTES) return false;
+    const result = parseSyncResult(wasmSyncModule.validate_sync_accepted_message_batch_json(batchJson, expectedRoom, expectedIdsJson));
+    return result.ok === true && result.valid === true;
+  } catch {
+    return false;
+  }
 }
 
 export function createWasmLocalInventory(snapshot: SyncLocalInventorySnapshot): SyncLocalInventory {

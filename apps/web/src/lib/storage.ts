@@ -1,7 +1,7 @@
 import type { MessagePacket } from "@nearlink/protocol";
 import { isProtocolIdentifier, MAX_HISTORY_PAGE_MESSAGES } from "@nearlink/protocol";
-import type { AcceptedMessageIdSnapshot, ConversationStore } from "./conversationStore";
-import { classifyInboundAcceptance, initializeWasmProtocol } from "./wasmProtocol";
+import type { AcceptedMessageIdSnapshot, ConversationStore, SyncAcceptedMessageBatch } from "./conversationStore";
+import { classifyInboundAcceptance, initializeWasmProtocol, validateWasmSyncAcceptedMessageBatch } from "./wasmProtocol";
 
 export type DeliveryState = "queued" | "sent" | "failed";
 
@@ -695,10 +695,48 @@ export async function loadRequestedMessages(
   ids: string[],
   validate: (packet: MessagePacket) => boolean,
 ): Promise<StoredMessage[]> {
+  return (await readAcceptedMessageRows(room, ids, validate)).messages;
+}
+
+/** Read a versioned packet-only result for one bounded sync request. */
+export async function loadSyncAcceptedMessageBatch(
+  room: string,
+  ids: string[],
+  validate: (packet: MessagePacket) => boolean,
+): Promise<SyncAcceptedMessageBatch> {
+  if (ids.length > MAX_SYNC_REQUESTED_STORAGE_IDS) throw new Error("A synchronization read may request at most 100 message IDs.");
+  if (ids.some((id) => !isProtocolIdentifier(id)) || new Set(ids).size !== ids.length) {
+    throw new Error("A synchronization result request must contain unique valid message IDs.");
+  }
+  const result = await readAcceptedMessageRows(room, ids, validate);
+  const batch: SyncAcceptedMessageBatch = {
+    version: 1,
+    room,
+    requestedIds: [...ids],
+    roomState: result.roomState,
+    messages: result.messages.map((item) => item.packet),
+  };
+  if (!validateWasmSyncAcceptedMessageBatch(batch, room, ids)) {
+    throw new Error("WASM rejected the synchronization accepted-message result.");
+  }
+  return batch;
+}
+
+interface AcceptedMessageReadResult {
+  roomState: "available" | "unavailable";
+  messages: StoredMessage[];
+}
+
+/** Shared readonly tombstone check and bounded keyed message reads for sync adapters. */
+async function readAcceptedMessageRows(
+  room: string,
+  ids: string[],
+  validate: (packet: MessagePacket) => boolean,
+): Promise<AcceptedMessageReadResult> {
   if (ids.length > MAX_SYNC_REQUESTED_STORAGE_IDS) throw new Error("A synchronization read may request at most 100 message IDs.");
   if (ids.some((id) => !isProtocolIdentifier(id))) throw new Error("A synchronization read contains an invalid message ID.");
   const uniqueIds = [...new Set(ids)];
-  return withTransaction<StoredMessage[]>(
+  return withTransaction<AcceptedMessageReadResult>(
     "Could not read requested synchronization messages",
     [MESSAGE_STORE, ROOM_DELETION_STORE],
     "readonly",
@@ -709,12 +747,15 @@ export async function loadRequestedMessages(
       let remaining = uniqueIds.length + 1;
       const finishOne = () => {
         remaining -= 1;
-        if (remaining === 0) complete(ids.flatMap((id) => results.has(id) ? [results.get(id)!] : []));
+        if (remaining === 0) complete({
+          roomState: "available",
+          messages: ids.flatMap((id) => results.has(id) ? [results.get(id)!] : []),
+        });
       };
       const deletionRequest = deletionStore.get(room);
       deletionRequest.onsuccess = () => {
         if (deletionRequest.result) {
-          complete([]);
+          complete({ roomState: "unavailable", messages: [] });
           return;
         }
         for (const id of uniqueIds) {
@@ -1420,6 +1461,7 @@ export const browserConversationStore: ConversationStore = {
   loadMessagePage,
   loadQueuedMessagePage,
   loadAcceptedMessageIds,
+  loadSyncAcceptedMessageBatch,
   loadRequestedMessages,
   saveMessage,
   acceptInboundMessage,
