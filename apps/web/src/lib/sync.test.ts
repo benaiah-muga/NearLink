@@ -11,6 +11,18 @@ vi.mock("./wasmProtocol", async () => {
   return {
     initializeWasmProtocol: async () => true,
     isWasmSyncStateReady: () => wasmState.ready,
+    createWasmSyncCoverage: () => {
+      let incomplete = false;
+      let activePlans = 0;
+      return {
+        markIncomplete: () => { incomplete = true; },
+        beginPlan: () => { activePlans += 1; },
+        finishPlan: () => { activePlans = Math.max(0, activePlans - 1); },
+        abandonPlan: () => { incomplete = true; activePlans = Math.max(0, activePlans - 1); },
+        outcome: () => incomplete ? "partial" as const : activePlans > 0 ? "syncing" as const : "complete" as const,
+        free: () => undefined,
+      };
+    },
     MAX_SYNC_SELECTION_CHUNK_IDS: 4096,
     createWasmMissingIdSelector: (peerIds: string[]) => {
       const local = new Set<string>();
@@ -413,6 +425,34 @@ describe("SyncCoordinator", () => {
     expect(states).toContain("complete");
     a.stop();
     b.stop();
+  });
+
+  it("waits for interleaved multi-page peer plans before reporting complete", async () => {
+    const sent: Array<SyncPacket | MessagePacket> = [];
+    const states: SyncState[] = [];
+    const coordinator = new SyncCoordinator({
+      room,
+      sender: "local-a",
+      makeId: (() => { let id = 0; return () => `coverage-${++id}`; })(),
+      send: (value) => sent.push(value),
+      ...boundedStorage(async () => []),
+      validateMessage: () => true,
+      onState: (state) => states.push(state),
+    });
+    await coordinator.start();
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "streaming-peer", sender: "local-c", cursor: null, messageIds: ["alpha"], nextCursor: "alpha", hasMore: true, limitReached: false });
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "empty-peer", sender: "local-b", cursor: null, messageIds: [], nextCursor: null, hasMore: false, limitReached: false });
+    expect(states).not.toContain("complete");
+    await coordinator.receive({ version: 1, type: "sync_inventory_page", room, syncId: "streaming-peer", sender: "local-c", cursor: "alpha", messageIds: ["missing"], nextCursor: "missing", hasMore: false, limitReached: false });
+    await vi.waitFor(() => expect(sent.some((value) => value.type === "sync_missing_request")).toBe(true));
+
+    expect(states).not.toContain("complete");
+    const request = sent.find((value): value is Extract<SyncPacket, { type: "sync_missing_request" }> => value.type === "sync_missing_request");
+    expect(request).toBeDefined();
+    await coordinator.receive({ version: 1, type: "sync_page_complete", room, syncId: request!.syncId, requestId: request!.requestId, sender: "local-c", targetSender: "local-a", messageIds: [] });
+    expect(states).toContain("partial");
+    expect(states).not.toContain("complete");
+    coordinator.stop();
   });
 
   it("caps a frozen inventory at 4,096 IDs and marks its final page partial", async () => {

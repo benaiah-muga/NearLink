@@ -49,6 +49,18 @@ vi.mock("./lib/wasmProtocol", async () => {
       return protocol.isProtocolIdentifier(value);
     },
     isWasmSyncStateReady: () => true,
+    createWasmSyncCoverage: () => {
+      let incomplete = false;
+      let activePlans = 0;
+      return {
+        markIncomplete: () => { incomplete = true; },
+        beginPlan: () => { activePlans += 1; },
+        finishPlan: () => { activePlans = Math.max(0, activePlans - 1); },
+        abandonPlan: () => { incomplete = true; activePlans = Math.max(0, activePlans - 1); },
+        outcome: () => incomplete ? "partial" as const : activePlans > 0 ? "syncing" as const : "complete" as const,
+        free: () => undefined,
+      };
+    },
     MAX_SYNC_SELECTION_CHUNK_IDS: 4096,
     createWasmSyncInventoryReceiver: () => {
       const ids: string[] = [];

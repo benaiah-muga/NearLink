@@ -14,8 +14,8 @@
 
 use nearlink_protocol_core::sync::{
     plan_missing_batch, InsertOutcome, InventoryPageOutcome, MessageIndex, MissingIdSelector,
-    SyncError, SyncInventoryReceiver, SyncMessageOutcome, SyncRequestBook, SyncRequestOutcome,
-    MAX_ENVELOPE_BYTES, MAX_SYNC_SELECTION_CHUNK_IDS,
+    SyncCoverage, SyncError, SyncInventoryReceiver, SyncMessageOutcome, SyncRequestBook,
+    SyncRequestOutcome, MAX_ENVELOPE_BYTES, MAX_SYNC_SELECTION_CHUNK_IDS,
 };
 use nearlink_protocol_core::{
     classify_inbound_acceptance, is_client_packet, is_history_page_complete_packet,
@@ -33,6 +33,42 @@ use wasm_bindgen::prelude::*;
 /// with room for some whitespace and escaping. Arrays that use extensive JSON
 /// escaping may exceed the byte limit even if they decode to valid IDs.
 pub const MAX_KNOWN_IDS_JSON_BYTES: usize = 600 * 1024;
+
+/// Stateful coverage outcome aggregator for one caller-managed sync exchange.
+#[wasm_bindgen]
+pub struct WasmSyncCoverage {
+    inner: SyncCoverage,
+}
+
+#[wasm_bindgen]
+impl WasmSyncCoverage {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmSyncCoverage {
+        WasmSyncCoverage {
+            inner: SyncCoverage::default(),
+        }
+    }
+
+    pub fn mark_incomplete(&mut self) {
+        self.inner.mark_incomplete();
+    }
+
+    pub fn begin_plan(&mut self) {
+        self.inner.begin_plan();
+    }
+
+    pub fn finish_plan(&mut self) {
+        self.inner.finish_plan();
+    }
+
+    pub fn abandon_plan(&mut self) {
+        self.inner.abandon_plan();
+    }
+
+    pub fn outcome(&self) -> String {
+        self.inner.outcome().to_owned()
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ErrorCode {
@@ -613,6 +649,22 @@ impl Default for WasmSyncRequestBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronization_coverage_facade_waits_and_persists_partial_outcome() {
+        let mut coverage = WasmSyncCoverage::new();
+        assert_eq!(coverage.outcome(), "complete");
+        coverage.begin_plan();
+        coverage.begin_plan();
+        assert_eq!(coverage.outcome(), "syncing");
+        coverage.finish_plan();
+        assert_eq!(coverage.outcome(), "syncing");
+        coverage.mark_incomplete();
+        coverage.abandon_plan();
+        assert_eq!(coverage.outcome(), "partial");
+        coverage.finish_plan();
+        assert_eq!(coverage.outcome(), "partial");
+    }
 
     fn packet(id: &str, body: &str) -> String {
         json!({

@@ -64,6 +64,47 @@ pub const MAX_PAGE_BYTES: usize = 512 * 1024;
 /// Maximum number of local IDs accepted in one missing-ID scan chunk.
 pub const MAX_SYNC_SELECTION_CHUNK_IDS: usize = 4_096;
 
+/// Aggregates only the coverage outcome for one synchronization exchange.
+/// Storage, transport, and peer scheduling remain owned by the caller.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct SyncCoverage {
+    incomplete: bool,
+    active_plans: usize,
+}
+
+impl SyncCoverage {
+    pub fn mark_incomplete(&mut self) {
+        self.incomplete = true;
+    }
+
+    pub fn begin_plan(&mut self) {
+        self.active_plans = self.active_plans.saturating_add(1);
+    }
+
+    pub fn finish_plan(&mut self) {
+        self.active_plans = self.active_plans.saturating_sub(1);
+    }
+
+    pub fn abandon_plan(&mut self) {
+        self.mark_incomplete();
+        self.finish_plan();
+    }
+
+    pub fn outcome(&self) -> &'static str {
+        if self.incomplete {
+            "partial"
+        } else if self.active_plans > 0 {
+            "syncing"
+        } else {
+            "complete"
+        }
+    }
+
+    pub fn active_plan_count(&self) -> usize {
+        self.active_plans
+    }
+}
+
 /// Bounded selector for a peer inventory and a streaming local-ID scan.
 /// Only the peer's bounded inventory and one membership bit per peer ID are
 /// retained. Local IDs may be supplied in any number of bounded chunks.
@@ -1016,6 +1057,24 @@ impl MessageIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_outcome_waits_for_every_active_plan_and_keeps_incompleteness() {
+        let mut coverage = SyncCoverage::default();
+        assert_eq!(coverage.outcome(), "complete");
+        coverage.begin_plan();
+        coverage.begin_plan();
+        assert_eq!(coverage.outcome(), "syncing");
+        coverage.finish_plan();
+        assert_eq!(coverage.outcome(), "syncing");
+        coverage.abandon_plan();
+        assert_eq!(coverage.active_plan_count(), 0);
+        assert_eq!(coverage.outcome(), "partial");
+        coverage.begin_plan();
+        assert_eq!(coverage.outcome(), "partial");
+        coverage.finish_plan();
+        assert_eq!(coverage.outcome(), "partial");
+    }
 
     fn inventory_page(
         sync_id: &str,

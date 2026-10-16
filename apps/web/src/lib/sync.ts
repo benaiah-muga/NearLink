@@ -14,11 +14,13 @@ import {
 import {
   createWasmSyncInventoryReceiver,
   createWasmSyncRequestBook,
+  createWasmSyncCoverage,
   isWasmSyncStateReady,
   createWasmMissingIdSelector,
   MAX_SYNC_SELECTION_CHUNK_IDS,
   type SyncInventoryState,
   type SyncRequestState,
+  type SyncCoverageState,
 } from "./wasmProtocol";
 import { SecureRandomUnavailableError } from "./secureId";
 import type { StoredMessage } from "./storage";
@@ -46,6 +48,7 @@ interface InventorySession {
   syncId: string;
   activeRequestId: string | null;
   inventoryState: SyncInventoryState;
+  coverageActive: boolean;
 }
 
 interface SenderControlBudget {
@@ -65,12 +68,12 @@ export class SyncCoordinator {
   private remote = new Map<string, InventorySession>();
   private wasmInventoryReceivers = new Set<SyncInventoryState>();
   private wasmRequestBooks = new Map<string, SyncRequestState>();
+  private coverage: SyncCoverageState | null = null;
   private retainedControlBytes = 0;
   private retainedControlCount = 0;
   private senderControlBudgets = new Map<string, SenderControlBudget>();
   private blockedSenders = new Set<string>();
   private failed = false;
-  private partial = false;
   private inventoryRebroadcast = false;
   private inventoryRebroadcastPending = false;
   private localLimitReached = false;
@@ -94,6 +97,7 @@ export class SyncCoordinator {
     this.options.onState?.("syncing", "Exchanging bounded local message inventories.");
     try {
       if (!isWasmSyncStateReady()) throw new Error("WASM synchronization state is unavailable.");
+      this.coverage = createWasmSyncCoverage();
       const snapshot = await this.options.loadAcceptedMessageIds();
       if (!this.isRunActive(startEpoch)) return;
       const ids = [...new Set(snapshot.ids)].sort().slice(0, MAX_SYNC_INVENTORY_IDS);
@@ -105,7 +109,7 @@ export class SyncCoordinator {
       if (this.inventoryRebroadcastPending) this.rebroadcastInventoryOnce();
       this.markLocalSnapshotReady();
       if (limitReached) {
-        this.partial = true;
+        if (!this.markIncomplete()) return;
         this.options.onState?.("partial", "The local inventory exceeded 4,096 IDs. This exchange can only report partial synchronization.");
       }
     } catch (error) {
@@ -125,6 +129,8 @@ export class SyncCoordinator {
     this.wasmInventoryReceivers.clear();
     for (const book of this.wasmRequestBooks.values()) book.free();
     this.wasmRequestBooks.clear();
+    this.coverage?.free();
+    this.coverage = null;
     this.retainedControlBytes = 0;
     this.retainedControlCount = 0;
     this.senderControlBudgets.clear();
@@ -171,7 +177,7 @@ export class SyncCoordinator {
 
   notePartial(detail: string): void {
     if (this.stopped || this.failed) return;
-    this.partial = true;
+    if (!this.markIncomplete()) return;
     this.options.onState?.("partial", detail);
   }
 
@@ -188,9 +194,9 @@ export class SyncCoordinator {
 
   noteControlRateLimited(detail: string): void {
     if (this.stopped || this.failed) return;
-    this.partial = true;
-    this.stop();
+    if (!this.markIncomplete()) return;
     this.options.onState?.("partial", detail);
+    this.stop();
   }
 
   async receive(packet: SyncPacket): Promise<void> {
@@ -249,13 +255,15 @@ export class SyncCoordinator {
   private blockSender(sender: string): void {
     if (this.blockedSenders.has(sender)) return;
     if (this.blockedSenders.size >= MAX_BLOCKED_SENDERS) {
+      if (!this.markIncomplete()) return;
+      for (const session of this.remote.values()) this.abandonCoveragePlan(session);
+      if (this.failed || this.stopped) return;
       this.stop();
-      this.partial = true;
       this.options.onState?.("partial", "Too many peers exceeded the bounded synchronization control budget. This exchange stopped; reconnect to retry from saved messages.");
       return;
     }
     this.blockedSenders.add(sender);
-    this.partial = true;
+    if (!this.markIncomplete()) return;
     const budget = this.senderControlBudgets.get(sender);
     if (budget) {
       this.retainedControlBytes -= budget.bytes;
@@ -264,6 +272,7 @@ export class SyncCoordinator {
     }
     for (const [sessionKey, session] of this.remote) {
       if (session.sender !== sender) continue;
+      this.abandonCoveragePlan(session);
       session.inventoryState.free();
       this.wasmInventoryReceivers.delete(session.inventoryState);
       this.remote.delete(sessionKey);
@@ -294,8 +303,10 @@ export class SyncCoordinator {
         return this.fail("WASM could not start synchronization inventory state. Reconnect to retry.");
       }
       this.wasmInventoryReceivers.add(inventoryState);
-      session = { sender: packet.sender, syncId: packet.syncId, activeRequestId: null, inventoryState };
+      session = { sender: packet.sender, syncId: packet.syncId, activeRequestId: null, inventoryState, coverageActive: false };
       this.remote.set(sessionKey, session);
+      this.beginCoveragePlan(session);
+      if (this.failed || this.stopped) return;
       if (this.options.rebroadcastOnPeerInventory !== false) {
         if (this.localSyncId) this.rebroadcastInventoryOnce();
         else this.inventoryRebroadcastPending = true;
@@ -311,7 +322,7 @@ export class SyncCoordinator {
     }
     if (accepted.outcome === "duplicate") return;
     if (!this.retainControl(packet)) return;
-    if (packet.limitReached) this.partial = true;
+    if (packet.limitReached && !this.markIncomplete()) return;
     if (!accepted.complete) return;
     void this.requestMissing(session, accepted.ids);
   }
@@ -366,7 +377,7 @@ export class SyncCoordinator {
     try {
       selector = createWasmMissingIdSelector(peerIds);
       let localChunk: string[] = [];
-      if (current.truncated) this.partial = true;
+      if (current.truncated && !this.markIncomplete()) return;
       for (const id of current.ids) {
         localChunk.push(id);
         if (localChunk.length === MAX_SYNC_SELECTION_CHUNK_IDS) {
@@ -378,7 +389,9 @@ export class SyncCoordinator {
       const missingIds = selector.finish();
       session.inventoryState.setMissingIds(missingIds);
       if (missingIds.length === 0) {
-        this.options.onState?.(this.partial ? "partial" : "complete", this.partial
+        this.finishCoveragePlan(session);
+        const outcome = this.coverageOutcome();
+        this.options.onState?.(outcome, outcome === "partial"
           ? "An inventory exceeded the 4,096 ID limit. This exchange cannot claim complete synchronization."
           : "The peer inventory contains no message IDs missing from this local snapshot.");
         return;
@@ -397,9 +410,12 @@ export class SyncCoordinator {
     if (!session) session = [...this.remote.values()].find((entry) => !this.blockedSenders.has(entry.sender)
       && entry.inventoryState.hasMissingPlan() && entry.inventoryState.hasMissingIdsRemaining());
     if (!session) {
-      this.options.onState?.(this.partial ? "partial" : "complete", this.partial
+      const outcome = this.coverageOutcome();
+      this.options.onState?.(outcome, outcome === "partial"
         ? "Requested pages were verified, but an inventory or page was incomplete. This exchange is partial."
-        : "Requested message pages were received and verified in local storage.");
+        : outcome === "syncing"
+          ? "Peer comparisons are still in progress."
+          : "Requested message pages were received and verified in local storage.");
       return;
     }
     if (!this.isSessionActive(session)) return;
@@ -409,7 +425,10 @@ export class SyncCoordinator {
       if (!session.inventoryState.hasMissingPlan()) return;
       const batch = session.inventoryState.nextMissingBatch();
       ids = batch.ids;
-      if (ids.length === 0) return this.sendNextRequest();
+      if (ids.length === 0) {
+        this.finishCoveragePlan(session);
+        return this.sendNextRequest();
+      }
       if (ids.length > MAX_SYNC_PACKET_IDS) {
         throw new Error("WASM returned an invalid synchronization request batch.");
       }
@@ -549,9 +568,10 @@ export class SyncCoordinator {
       }
       if (!this.retainControl(packet)) return;
       book.finishCompletion(packet.requestId, true);
-      if (incompletePage) this.partial = true;
+      if (incompletePage && !this.markIncomplete()) return;
       session.activeRequestId = null;
       if (incompletePage) this.options.onState?.("partial", "The peer completed only part of a requested page. Available messages were saved; the exchange is partial.");
+      if (!session.inventoryState.hasMissingIdsRemaining()) this.finishCoveragePlan(session);
       this.sendNextRequest();
     } catch {
       try { book.finishCompletion(packet.requestId, false); } catch { /* The run may have already been reset. */ }
@@ -563,7 +583,42 @@ export class SyncCoordinator {
     this.stop();
     this.stopped = true;
     this.failed = false;
-    this.partial = false;
+  }
+
+  private coverageOutcome(): SyncState {
+    try { return this.coverage?.outcome() ?? "complete"; }
+    catch { this.fail("WASM synchronization coverage state was lost. Reconnect to start over."); return "error"; }
+  }
+
+  private markIncomplete(): boolean {
+    try {
+      if (!this.coverage) throw new Error("coverage state unavailable");
+      this.coverage.markIncomplete();
+      return !this.failed && !this.stopped;
+    } catch {
+      this.fail("WASM synchronization coverage state was lost. Reconnect to start over.");
+      return false;
+    }
+  }
+
+  private beginCoveragePlan(session: InventorySession): void {
+    if (session.coverageActive) return;
+    try {
+      this.coverage?.beginPlan();
+      session.coverageActive = true;
+    } catch { this.fail("WASM synchronization coverage state was lost. Reconnect to start over."); }
+  }
+
+  private finishCoveragePlan(session: InventorySession): void {
+    if (!session.coverageActive) return;
+    try { this.coverage?.finishPlan(); session.coverageActive = false; }
+    catch { this.fail("WASM synchronization coverage state was lost. Reconnect to start over."); }
+  }
+
+  private abandonCoveragePlan(session: InventorySession): void {
+    if (!session.coverageActive) return;
+    try { this.coverage?.abandonPlan(); session.coverageActive = false; }
+    catch { this.fail("WASM synchronization coverage state was lost. Reconnect to start over."); }
   }
 
   private markLocalSnapshotReady(): void {

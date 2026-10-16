@@ -31,6 +31,15 @@ export interface SyncRequestState {
   free(): void;
 }
 
+export interface SyncCoverageState {
+  markIncomplete(): void;
+  beginPlan(): void;
+  finishPlan(): void;
+  abandonPlan(): void;
+  outcome(): "syncing" | "partial" | "complete";
+  free(): void;
+}
+
 export interface SyncStagedCompletion {
   outcome: "accepted" | "duplicate" | "unknown";
   requestedIds: string[];
@@ -81,6 +90,14 @@ interface WasmSyncModule {
       free(): void;
     };
   };
+  WasmSyncCoverage: new () => {
+    mark_incomplete(): void;
+    begin_plan(): void;
+    finish_plan(): void;
+    abandon_plan(): void;
+    outcome(): string;
+    free(): void;
+  };
 }
 
 type WasmModule = WasmSyncModule & {
@@ -114,6 +131,8 @@ export function initializeWasmProtocol(): Promise<boolean> {
         ? new wasm.WasmSyncInventoryReceiver() : null;
       const requestProbe = "WasmSyncRequestBook" in wasm && typeof wasm.WasmSyncRequestBook === "function"
         ? new wasm.WasmSyncRequestBook() : null;
+      const coverageProbe = "WasmSyncCoverage" in wasm && typeof wasm.WasmSyncCoverage === "function"
+        ? new wasm.WasmSyncCoverage() : null;
       const inventoryApiReady = inventoryProbe !== null && typeof inventoryProbe.set_missing_ids_json === "function"
         && typeof inventoryProbe.next_missing_batch_json === "function"
         && typeof inventoryProbe.has_missing_plan === "function"
@@ -123,14 +142,19 @@ export function initializeWasmProtocol(): Promise<boolean> {
         && typeof requestProbe.finish_completion_json === "function"
         && typeof requestProbe.verify_durable_messages_json === "function"
         && typeof requestProbe.has_outstanding_message_id === "function";
+      const coverageApiReady = coverageProbe !== null && typeof coverageProbe.mark_incomplete === "function"
+        && typeof coverageProbe.begin_plan === "function" && typeof coverageProbe.finish_plan === "function"
+        && typeof coverageProbe.abandon_plan === "function" && typeof coverageProbe.outcome === "function";
       inventoryProbe?.free();
       requestProbe?.free();
+      coverageProbe?.free();
       wasmSyncModule = "WasmSyncInventoryReceiver" in wasm && "WasmSyncRequestBook" in wasm
-        && "WasmMissingIdSelector" in wasm && "plan_missing_batch_json" in wasm
+        && "WasmMissingIdSelector" in wasm && "WasmSyncCoverage" in wasm && "plan_missing_batch_json" in wasm
         && typeof wasm.WasmSyncInventoryReceiver === "function"
         && typeof wasm.WasmSyncRequestBook === "function"
         && inventoryApiReady
         && requestApiReady
+        && coverageApiReady
         && typeof wasm.WasmMissingIdSelector === "function"
         && typeof wasm.plan_missing_batch_json === "function" ? wasm : null;
       return true;
@@ -143,6 +167,26 @@ export function initializeWasmProtocol(): Promise<boolean> {
     }
   })();
   return initialization;
+}
+
+export function createWasmSyncCoverage(): SyncCoverageState {
+  if (!wasmSyncModule) throw new Error("WASM synchronization coverage state is unavailable.");
+  const coverage = new wasmSyncModule.WasmSyncCoverage();
+  const state = (): "syncing" | "partial" | "complete" => {
+    const value = coverage.outcome();
+    if (value !== "syncing" && value !== "partial" && value !== "complete") {
+      throw new Error("WASM returned an invalid synchronization coverage outcome.");
+    }
+    return value;
+  };
+  return {
+    markIncomplete: () => coverage.mark_incomplete(),
+    beginPlan: () => coverage.begin_plan(),
+    finishPlan: () => coverage.finish_plan(),
+    abandonPlan: () => coverage.abandon_plan(),
+    outcome: state,
+    free: () => coverage.free(),
+  };
 }
 
 export function isWasmProtocolReady(): boolean {

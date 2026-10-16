@@ -78,6 +78,7 @@ describe("WASM protocol validator bridge", () => {
     const initialize = vi.fn(async () => undefined);
     const inventoryFree = vi.fn();
     const requestFree = vi.fn();
+    const coverageFree = vi.fn();
     const selectorFree = vi.fn();
     const acceptPage = vi.fn()
       .mockReturnValueOnce(JSON.stringify({ ok: true, outcome: "accepted", ids: ["a"], complete: true, limitReached: false }))
@@ -100,6 +101,14 @@ describe("WASM protocol validator bridge", () => {
       verify_durable_messages_json = vi.fn(() => JSON.stringify({ ok: true, matches: true }));
       free = requestFree;
     }
+    class WasmSyncCoverage {
+      mark_incomplete = vi.fn();
+      begin_plan = vi.fn();
+      finish_plan = vi.fn();
+      abandon_plan = vi.fn();
+      outcome = vi.fn(() => "syncing");
+      free = coverageFree;
+    }
     const planMissingBatch = vi.fn(() => JSON.stringify({ ok: true, ids: ["b"], nextOffset: 1, hasMore: false }));
     const observeLocalIds = vi.fn(() => JSON.stringify({ ok: true }));
     const finishMissingIds = vi.fn(() => JSON.stringify({ ok: true, missingIds: ["b"] }));
@@ -115,6 +124,7 @@ describe("WASM protocol validator bridge", () => {
       classify_inbound_json: () => JSON.stringify({ ok: true, outcome: "saved" }),
       WasmSyncInventoryReceiver,
       WasmSyncRequestBook,
+      WasmSyncCoverage,
       WasmMissingIdSelector,
       plan_missing_batch_json: planMissingBatch,
     }));
@@ -122,6 +132,13 @@ describe("WASM protocol validator bridge", () => {
 
     expect(await bridge.initializeWasmProtocol()).toBe(true);
     expect(bridge.isWasmSyncStateReady()).toBe(true);
+    const coverage = bridge.createWasmSyncCoverage();
+    coverage.beginPlan();
+    coverage.markIncomplete();
+    expect(coverage.outcome()).toBe("syncing");
+    coverage.finishPlan();
+    coverage.abandonPlan();
+    coverage.free();
     const inventory = bridge.createWasmSyncInventoryReceiver();
     expect(inventory.acceptPage({ type: "sync_inventory_page" } as never)).toEqual({ outcome: "accepted", ids: ["a"], complete: true, limitReached: false });
     expect(() => inventory.acceptPage({ type: "sync_inventory_page" } as never)).toThrow("WASM rejected synchronization inventory state.");
@@ -154,6 +171,7 @@ describe("WASM protocol validator bridge", () => {
     expect(planMissingBatch).toHaveBeenCalledWith('["b"]', 0);
     expect(inventoryFree).toHaveBeenCalledTimes(2);
     expect(requestFree).toHaveBeenCalledTimes(2);
+    expect(coverageFree).toHaveBeenCalledTimes(2);
     expect(selectorFree).toHaveBeenCalledTimes(2);
   });
 });

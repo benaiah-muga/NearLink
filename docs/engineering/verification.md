@@ -84,8 +84,7 @@ staged completion correlation and validation. It selects missing IDs against
 accepted-ID snapshots in bounded chunks. TypeScript keeps WASM handles and
 peer scheduling/async continuation. It owns bounded IndexedDB reads and durable message acceptance, validates
 loaded durable rows, and asks Rust/WASM to compare exact IDs and packets with
-tracked state. TypeScript computes partial/final status and presents it, and
-owns transport sends, timers, and rate budgets. Rust exchange state and the `MessageIndex` are in-memory
+tracked state. TypeScript records storage truncation, partial-page, and bounded-peer conditions through the Rust/WASM coverage aggregator. Rust/WASM reports the aggregate partial/final outcome; TypeScript presents it and owns transport sends, timers, and rate budgets. Rust exchange state and the `MessageIndex` are in-memory
 and are not the browser's persistent source of truth. These APIs do not
 provide peer authentication, encryption, guaranteed-complete synchronization,
 or a native mobile target, and there is no native app in the repository.

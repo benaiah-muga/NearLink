@@ -54,7 +54,7 @@ try {
     `<!doctype html>
 <meta charset="utf-8">
 <script type="module">
-  import init, { validate_json, classify_inbound_json, plan_missing_batch_json, WasmMessageIndex, WasmMissingIdSelector, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
+  import init, { validate_json, classify_inbound_json, plan_missing_batch_json, WasmMessageIndex, WasmMissingIdSelector, WasmSyncCoverage, WasmSyncInventoryReceiver, WasmSyncRequestBook } from "./nearlink_protocol_wasm.js";
 
   const check = (condition, label) => {
     if (!condition) throw new Error(label);
@@ -68,6 +68,16 @@ try {
 
   try {
     await init();
+    const coverage = new WasmSyncCoverage();
+    check(coverage.outcome() === "complete", "coverage initial state mismatch");
+    coverage.begin_plan();
+    coverage.begin_plan();
+    check(coverage.outcome() === "syncing", "coverage did not wait for active peer plans");
+    coverage.finish_plan();
+    check(coverage.outcome() === "syncing", "coverage completed before all peer plans finished");
+    coverage.abandon_plan();
+    check(coverage.outcome() === "partial", "coverage did not preserve incomplete outcome");
+    coverage.free();
     const vectors = await fetch("/vectors.json").then((response) => response.json());
     const syncVectors = await fetch("/sync-state-vectors.json").then((response) => response.json());
     const acceptanceVectors = await fetch("/inbound-acceptance-vectors.json").then((response) => response.json());
