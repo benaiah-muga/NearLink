@@ -973,7 +973,7 @@ export async function reconcileHubReplayOrder(room: string, orderedIds: string[]
 /** Atomically save one verified newest-to-oldest history page before the current oldest row. */
 export async function saveHubHistoryPage(messages: StoredMessage[], cursor: string | null, requestStartOrder: number): Promise<boolean> {
   if (messages.length === 0) return true;
-  if (cursor !== null && messages.length > MAX_HISTORY_PAGE_MESSAGES) {
+  if (messages.length > MAX_HISTORY_PAGE_MESSAGES) {
     throw new RangeError(`A history page cannot contain more than ${MAX_HISTORY_PAGE_MESSAGES} messages.`);
   }
   if (!await initializeWasmProtocol()) throw new Error("Could not initialize protocol acceptance.");
@@ -1112,21 +1112,23 @@ export async function saveHubHistoryPage(messages: StoredMessage[], cursor: stri
     (store, complete, setFailure, transaction) => {
       const tombstones = transaction.objectStore(ROOM_DELETION_STORE);
       const tombstoneRequest = tombstones.get(room);
-      const range = IDBKeyRange.bound([room, ""], [room, "\uffff"]);
-      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
+      const pageIds = new Set(messages.map((item) => item.packet.id));
+      const rowsById = new Map<string, StoredMessage>();
+      let remainingReads = pageIds.size;
       let tombstoneReady = false;
       let deleted = false;
-      let roomMessages: StoredMessage[] | undefined;
-      const maybeSave = () => {
-        if (!tombstoneReady || !roomMessages) return;
+      let cursorStarted = false;
+      const startCursor = () => {
+        if (!tombstoneReady || remainingReads > 0 || cursorStarted) return;
+        cursorStarted = true;
         if (deleted) {
           complete(false);
           return;
         }
-        const byId = new Map(roomMessages.map((item) => [item.packet.id, item]));
+
         const pagePackets = new Map<string, MessagePacket>();
         for (const candidate of messages) {
-          const existing = byId.get(candidate.packet.id)?.packet ?? pagePackets.get(candidate.packet.id);
+          const existing = rowsById.get(candidate.packet.id)?.packet ?? pagePackets.get(candidate.packet.id);
           let decision: ReturnType<typeof classifyInboundAcceptance>;
           try {
             decision = classifyInboundAcceptance(room, deleted, candidate.packet, existing);
@@ -1144,34 +1146,6 @@ export async function saveHubHistoryPage(messages: StoredMessage[], cursor: stri
           pagePackets.set(candidate.packet.id, candidate.packet);
         }
 
-        const pageIds = new Set(messages.map((item) => item.packet.id));
-        if (cursor !== null) {
-          const anchorOrder = byId.get(cursor)?.displayOrder
-            ?? roomMessages.reduce((minimum, item) => Math.min(minimum, Number.isFinite(item.displayOrder) ? item.displayOrder! : 0), 0);
-          for (let index = 0; index < messages.length; index += 1) {
-            const candidate = messages[index];
-            const existing = byId.get(candidate.packet.id);
-            const alreadyOlderThanCursor = existing
-              && Number.isFinite(existing.displayOrder)
-              && existing.displayOrder! < anchorOrder;
-            const displayOrder = alreadyOlderThanCursor ? existing.displayOrder : anchorOrder - (index + 1);
-            const savedMessage: StoredMessage = existing
-              ? { ...existing, transport: "hub", delivery: "sent", displayOrder }
-              : { ...candidate, transport: "hub", delivery: "sent", displayOrder };
-            try {
-              const put = store.put(savedMessage);
-              put.onerror = () => setFailure(put.error ?? new Error("Could not persist the history page order."));
-            } catch (error) {
-              setFailure(error);
-              transaction.abort();
-              return;
-            }
-          }
-          complete(true);
-          return;
-        }
-
-        const rowsById = new Map(roomMessages.map((item) => [item.packet.id, item]));
         const pageOldestFirst = [...messages].reverse();
         const anchors = new Set(pageOldestFirst
           .filter((item) => {
@@ -1179,12 +1153,10 @@ export async function saveHubHistoryPage(messages: StoredMessage[], cursor: stri
             return existing && Number.isFinite(existing.displayOrder) && existing.displayOrder! <= requestStartOrder;
           })
           .map((item) => item.packet.id));
-        const rows = roomMessages
-          .filter((item) => !pageIds.has(item.packet.id) || anchors.has(item.packet.id))
-          .sort(compareDisplayOrder);
         const beforeAnchor = new Map<string, StoredMessage[]>();
         const afterAnchor = new Map<string, StoredMessage[]>();
-        const beforePostRequest = new Map<number, StoredMessage[]>();
+        const beforePostRequest: StoredMessage[] = [];
+        const beforePostRequestIds = new Set<string>();
         let previousAnchor: string | null = null;
         for (let index = 0; index < pageOldestFirst.length; index += 1) {
           const candidate = pageOldestFirst[index];
@@ -1192,7 +1164,13 @@ export async function saveHubHistoryPage(messages: StoredMessage[], cursor: stri
             previousAnchor = candidate.packet.id;
             continue;
           }
-          const nextAnchor = pageOldestFirst.slice(index + 1).find((item) => anchors.has(item.packet.id))?.packet.id;
+          let nextAnchor: string | undefined;
+          for (let next = index + 1; next < pageOldestFirst.length; next += 1) {
+            if (anchors.has(pageOldestFirst[next].packet.id)) {
+              nextAnchor = pageOldestFirst[next].packet.id;
+              break;
+            }
+          }
           const existing = rowsById.get(candidate.packet.id);
           const savedMessage: StoredMessage = existing
             ? { ...existing, transport: "hub", delivery: "sent" }
@@ -1206,42 +1184,166 @@ export async function saveHubHistoryPage(messages: StoredMessage[], cursor: stri
             bucket.push(savedMessage);
             afterAnchor.set(previousAnchor, bucket);
           } else {
-            const insertionIndex = rows.findIndex((item) => Number.isFinite(item.displayOrder) && item.displayOrder! > requestStartOrder);
-            const indexKey = insertionIndex === -1 ? rows.length : insertionIndex;
-            const bucket = beforePostRequest.get(indexKey) ?? [];
-            bucket.push(savedMessage);
-            beforePostRequest.set(indexKey, bucket);
+            beforePostRequest.push(savedMessage);
+            beforePostRequestIds.add(savedMessage.packet.id);
           }
         }
 
-        const merged: StoredMessage[] = [];
-        for (let index = 0; index <= rows.length; index += 1) {
-          merged.push(...(beforePostRequest.get(index) ?? []));
-          if (index === rows.length) break;
-          const row = rows[index];
-          merged.push(...(beforeAnchor.get(row.packet.id) ?? []), row);
-          merged.push(...(afterAnchor.get(row.packet.id) ?? []));
-        }
-        merged.forEach((item, index) => {
-          const candidate = byId.get(item.packet.id) ?? item;
-          const savedMessage = pageIds.has(item.packet.id)
-            ? { ...candidate, transport: "hub" as const, delivery: "sent" as const, displayOrder: index }
-            : { ...candidate, displayOrder: index };
+        let nextDisplayOrder = 0;
+        let insertedBeforePostRequest = false;
+        let cursorRequest: IDBRequest<IDBCursorWithValue | null>;
+        const stage = (item: StoredMessage, pageCandidate: boolean) => {
+          const savedMessage = pageCandidate
+            ? { ...item, transport: "hub" as const, delivery: "sent" as const, pendingDisplayOrder: nextDisplayOrder++ }
+            : { ...item, pendingDisplayOrder: nextDisplayOrder++ };
           try {
             const put = store.put(savedMessage);
             put.onerror = () => setFailure(put.error ?? new Error("Could not persist the history page order."));
           } catch (error) {
             setFailure(error);
             transaction.abort();
+            return false;
+          }
+          return true;
+        };
+        const stageAtCursor = (cursor: IDBCursorWithValue, item: StoredMessage, pageCandidate: boolean) => {
+          const savedMessage = pageCandidate
+            ? { ...item, transport: "hub" as const, delivery: "sent" as const, pendingDisplayOrder: nextDisplayOrder++ }
+            : { ...item, pendingDisplayOrder: nextDisplayOrder++ };
+          try {
+            const update = cursor.update(savedMessage);
+            update.onerror = () => setFailure(update.error ?? new Error("Could not persist the history page order."));
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
+            return false;
+          }
+          return true;
+        };
+        const emitBucket = (bucket: StoredMessage[] | undefined) => {
+          if (!bucket) return true;
+          for (const item of bucket) if (!stage(item, true)) return false;
+          return true;
+        };
+        // Keep each cursor's index key stable while streaming. The staged rank is
+        // removed in the same transaction during the createdAt-index pass.
+        const finalizeStagedOrders = () => {
+          let finalizeRequest: IDBRequest<IDBCursorWithValue | null>;
+          try {
+            finalizeRequest = store.index(ROOM_CREATED_INDEX).openCursor(
+              IDBKeyRange.bound([room, ""], [room, "\uffff"]),
+              "next",
+            );
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
             return;
           }
-        });
-        complete(true);
+          finalizeRequest.onsuccess = () => {
+            const cursor = finalizeRequest.result;
+            if (!cursor) {
+              if (!insertedBeforePostRequest) {
+                for (const item of beforePostRequest) {
+                  try {
+                    const put = store.put({
+                      ...item,
+                      transport: "hub" as const,
+                      delivery: "sent" as const,
+                      displayOrder: nextDisplayOrder++,
+                    });
+                    put.onerror = () => setFailure(put.error ?? new Error("Could not persist the history page order."));
+                  } catch (error) {
+                    setFailure(error);
+                    transaction.abort();
+                    return;
+                  }
+                }
+              }
+              complete(true);
+              return;
+            }
+            const row = cursor.value as StoredMessage & { pendingDisplayOrder?: number };
+            const { pendingDisplayOrder, ...withoutPendingOrder } = row;
+            const finalized = Number.isFinite(pendingDisplayOrder)
+              ? { ...withoutPendingOrder, displayOrder: pendingDisplayOrder }
+              : Number.isFinite(row.displayOrder)
+                ? row
+                : !insertedBeforePostRequest && beforePostRequestIds.has(row.packet.id)
+                  ? row
+                  : { ...row, displayOrder: nextDisplayOrder++ };
+            if (finalized !== row) {
+              try {
+                const update = cursor.update(finalized);
+                update.onerror = () => setFailure(update.error ?? new Error("Could not finalize the history page order."));
+              } catch (error) {
+                setFailure(error);
+                transaction.abort();
+                return;
+              }
+            }
+            cursor.continue();
+          };
+          finalizeRequest.onerror = () => setFailure(finalizeRequest.error ?? new Error("Could not finalize local message order."));
+        };
+        try {
+          cursorRequest = store.index(ROOM_DISPLAY_ORDER_INDEX).openCursor(
+            IDBKeyRange.bound([room], [room, []]),
+            "next",
+          );
+        } catch (error) {
+          setFailure(error);
+          transaction.abort();
+          return;
+        }
+        cursorRequest.onsuccess = () => {
+          const cursor = cursorRequest.result;
+          if (!cursor) {
+            finalizeStagedOrders();
+            return;
+          }
+          const row = cursor.value as StoredMessage;
+          const order = row.displayOrder;
+          if (!Number.isFinite(order)) {
+            cursor.continue();
+            return;
+          }
+          if (!insertedBeforePostRequest && !pageIds.has(row.packet.id)
+            && order! > requestStartOrder) {
+            insertedBeforePostRequest = true;
+            if (!emitBucket(beforePostRequest)) return;
+          }
+          if (pageIds.has(row.packet.id)) {
+            if (anchors.has(row.packet.id)) {
+              if (!emitBucket(beforeAnchor.get(row.packet.id))) return;
+              const anchor = rowsById.get(row.packet.id);
+              if (anchor && !stageAtCursor(cursor, anchor, true)) return;
+              if (!emitBucket(afterAnchor.get(row.packet.id))) return;
+            }
+          } else if (!stageAtCursor(cursor, row, false)) {
+            return;
+          }
+          cursor.continue();
+        };
+        cursorRequest.onerror = () => setFailure(cursorRequest.error ?? new Error("Could not stream local message order."));
       };
-      tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeSave(); };
-      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeSave(); };
+      tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); startCursor(); };
       tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
-      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read local message order."));
+      for (const id of pageIds) {
+        let request: IDBRequest<StoredMessage | undefined>;
+        try {
+          request = store.get([room, id]) as IDBRequest<StoredMessage | undefined>;
+        } catch (error) {
+          setFailure(error);
+          transaction.abort();
+          return;
+        }
+        request.onsuccess = () => {
+          if (request.result) rowsById.set(id, request.result);
+          remainingReads -= 1;
+          startCursor();
+        };
+        request.onerror = () => setFailure(request.error ?? new Error("Could not read history page messages."));
+      }
     },
   );
 }

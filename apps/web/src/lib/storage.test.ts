@@ -730,6 +730,9 @@ describe("local IndexedDB storage", () => {
     await expect(saveHubHistoryPage(page, "boundary", 0)).rejects.toThrow(
       `A history page cannot contain more than ${MAX_HISTORY_PAGE_MESSAGES} messages.`,
     );
+    await expect(saveHubHistoryPage(page, null, 0)).rejects.toThrow(
+      `A history page cannot contain more than ${MAX_HISTORY_PAGE_MESSAGES} messages.`,
+    );
     expect(getSpy).not.toHaveBeenCalled();
     await expect(loadMessages("alpha")).resolves.toEqual([]);
   });
@@ -744,6 +747,123 @@ describe("local IndexedDB storage", () => {
     await expect(saveHubHistoryPage([first, older], null, 1)).resolves.toBe(true);
     const saved = await loadMessages("alpha");
     expect(saved.map((item) => item.packet.id)).toEqual(["older", "first", "second"]);
+  });
+
+  it("streams null-cursor merges in display order, then createdAt and ID tie order", async () => {
+    await seedRawMessages([
+      { ...message("anchor", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub", displayOrder: 2 },
+      { ...message("tie-early", "2026-10-14T08:00:00.000Z", "sent"), transport: "direct", displayOrder: 2 },
+      { ...message("tie-b", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub", displayOrder: 2 },
+      { ...message("tie-a", "2026-10-14T09:00:00.000Z", "sent"), transport: "direct", displayOrder: 2 },
+      { ...message("later", "2026-10-14T11:00:00.000Z", "sent"), transport: "hub", displayOrder: 7 },
+    ]);
+    const originalGetAll = IDBIndex.prototype.getAll;
+    const originalOpenCursor = IDBIndex.prototype.openCursor;
+    const getAllSpy = vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+      if (this.name === "roomCreatedAt") throw new Error("Null-cursor history must not materialize the room.");
+      return originalGetAll.apply(this, args);
+    });
+    const cursorIndexes: string[] = [];
+    vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["openCursor"]>) {
+      if (this.name === "roomDisplayOrder" || this.name === "roomCreatedAt") cursorIndexes.push(this.name);
+      return originalOpenCursor.apply(this, args);
+    });
+
+    const inserted = { ...message("inserted", "2026-10-14T06:00:00.000Z", "sent"), transport: "hub" as const };
+    const anchor = { ...message("anchor", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub" as const };
+    await expect(saveHubHistoryPage([anchor, inserted], null, 2)).resolves.toBe(true);
+    expect(getAllSpy).not.toHaveBeenCalled();
+    expect(cursorIndexes).toEqual(["roomDisplayOrder", "roomCreatedAt"]);
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => row.packet.id)).toEqual([
+      "tie-early", "tie-a", "tie-b", "inserted", "anchor", "later",
+    ]);
+    expect((await loadMessages("alpha")).map((row) => row.displayOrder)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("places a missing-anchor null-cursor page before messages newer than request start", async () => {
+    await seedRawMessages([
+      { ...message("older", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub", displayOrder: -7 },
+      { ...message("concurrent-newer", "2026-10-14T12:00:00.000Z", "sent"), transport: "hub", displayOrder: 3 },
+      { ...message("later", "2026-10-14T13:00:00.000Z", "sent"), transport: "direct", displayOrder: 12 },
+    ]);
+    const page = [
+      { ...message("page-newest", "2026-10-14T06:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("page-oldest", "2026-10-14T05:00:00.000Z", "sent"), transport: "hub" as const },
+    ];
+
+    await expect(saveHubHistoryPage(page, null, 0)).resolves.toBe(true);
+    expect((await loadMessages("alpha")).map((row) => row.packet.id)).toEqual([
+      "older", "page-oldest", "page-newest", "concurrent-newer", "later",
+    ]);
+    expect((await loadMessages("alpha")).map((row) => row.displayOrder)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("orders non-finite null-cursor rows by createdAt before trailing page candidates", async () => {
+    await seedRawMessages([
+      { ...message("finite-old", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub", displayOrder: 0 },
+      { ...message("legacy-infinity", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub", displayOrder: Number.POSITIVE_INFINITY },
+      { ...message("legacy-missing", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub" },
+      { ...message("legacy-nan", "2026-10-14T09:00:00.000Z", "sent"), transport: "direct", displayOrder: Number.NaN },
+    ]);
+    const page = [
+      { ...message("page-newest", "2026-10-14T06:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("page-oldest", "2026-10-14T05:00:00.000Z", "sent"), transport: "hub" as const },
+    ];
+
+    await expect(saveHubHistoryPage(page, null, 0)).resolves.toBe(true);
+    const saved = await loadMessages("alpha");
+    expect(saved.map((row) => row.packet.id)).toEqual([
+      "finite-old", "legacy-missing", "legacy-nan", "legacy-infinity", "page-oldest", "page-newest",
+    ]);
+    expect(saved.map((row) => row.displayOrder)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("aborts a null-cursor page on candidate content conflicts", async () => {
+    const existing = { ...message("null-conflict", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const, displayOrder: 4 };
+    await seedRawMessages([existing]);
+    const conflict = { ...existing, packet: { ...existing.packet, body: "changed null-cursor content" } };
+    const newCandidate = { ...message("null-conflict-new", "2026-10-14T06:00:00.000Z", "sent"), transport: "hub" as const };
+
+    await expect(saveHubHistoryPage([newCandidate, conflict], null, 0)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("conflicts with saved message content"),
+    });
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([["null-conflict", 4]]);
+  });
+
+  it("aborts a null-cursor merge on candidate lookup and staged write failures", async () => {
+    await seedRawMessages([
+      { ...message("existing", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub", displayOrder: 0 },
+    ]);
+    const page = { ...message("candidate", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub" as const };
+    const originalGet = IDBObjectStore.prototype.get;
+    vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["get"]>) {
+      if (this.name === "messages" && JSON.stringify(args[0]) === JSON.stringify(["alpha", "candidate"])) {
+        throw new DOMException("Injected null-cursor lookup failure.", "UnknownError");
+      }
+      return originalGet.apply(this, args);
+    });
+    await expect(saveHubHistoryPage([page], null, 0)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("Injected null-cursor lookup failure"),
+    });
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([["existing", 0]]);
+
+    const originalPut = IDBObjectStore.prototype.put;
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["put"]>) {
+      if (this.name === "messages" && (args[0] as StoredMessage).packet?.id === "candidate") {
+        throw new DOMException("Injected null-cursor write failure.", "QuotaExceededError");
+      }
+      return originalPut.apply(this, args);
+    });
+    await expect(saveHubHistoryPage([page], null, 0)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("Injected null-cursor write failure"),
+    });
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([["existing", 0]]);
   });
 
   it("honors a room deletion tombstone when committing a history page", async () => {
