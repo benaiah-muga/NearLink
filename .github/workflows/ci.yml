@@ -89,12 +89,11 @@ jobs:
           mkdir -p ~/.cargo
           cp research/openmls-compat-spike/audit.toml ~/.cargo/audit.toml
           echo "Research lock exceptions: RUSTSEC-2026-0330, RUSTSEC-2026-0331"
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+      - run: cargo +stable install cargo-audit --version 0.22.2 --locked
+      - name: Audit the complete OpenMLS research lockfile
         env:
           RUSTUP_TOOLCHAIN: stable
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: research/openmls-compat-spike
+        run: node scripts/audit-openmls-rustsec.mjs
       - name: Install mls-rs research RustSec config
         run: |
           mkdir -p ~/.cargo

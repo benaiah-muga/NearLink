@@ -1,0 +1,34 @@
+{
+  "settings": {
+    "ignore": ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331"]
+  },
+  "vulnerabilities": {
+    "found": false,
+    "count": 0,
+    "list": []
+  },
+  "warnings": {
+    "unmaintained": [
+      {
+        "advisory": {
+          "id": "RUSTSEC-2026-0173"
+        },
+        "package": {
+          "name": "proc-macro-error2",
+          "version": "2.0.1"
+        }
+      },
+      {
+        "advisory": {
+          "id": "RUSTSEC-2026-0999"
+        },
+        "package": {
+          "name": "new-warning-package",
+          "version": "1.0.0"
+        }
+      }
+    ],
+    "unsound": [],
+    "yanked": []
+  }
+}
