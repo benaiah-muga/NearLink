@@ -64,14 +64,16 @@ and [MLS threat assumptions](mls-architecture.md#threat-assumptions-and-limits).
 
 ## Candidate evidence and status
 
-Candidate facts below incorporate the upstream revalidation recorded in the
-[architecture investigation](mls-architecture.md#nl-60-upstream-revalidation-2026-10-16).
+Candidate facts below incorporate the upstream revalidation and isolated
+compatibility evidence recorded in the
+[architecture investigation](mls-architecture.md#nl-60-upstream-revalidation-2026-10-16)
+and [NL-61 spike](mls-architecture.md#nl-61-isolated-mls-rs-compatibility-spike-2026-10-16).
 They must be revalidated again against upstream before any later selection
 decision. No candidate is selected.
 
 | Candidate evidence | Exact reviewed revision | Status and blockers recorded |
 | --- | --- | --- |
-| `mls-rs` release 0.56.0 | Tag commit `8f1b43f447a792ff9307f1c2c7f54da63914870e`; revalidated 2026-10-16 | Core manifest declares Rust 1.82.0, within the product's 1.84.1 pin, but the exact WebCrypto feature graph and named browser runtime remain unverified. WebCrypto is experimental for suites 2, 5, and 7; there is no IndexedDB adapter or atomic state evidence; exact dependency/license/advisory review is incomplete; upstream says no full third-party audit. Official CI activity does not establish exact-profile cross-implementation evidence. |
+| `mls-rs` release 0.56.0 | Tag commit `8f1b43f447a792ff9307f1c2c7f54da63914870e`; revalidated 2026-10-16 | The isolated WebCrypto graph passes the tested group flow in Chromium 148 with Rust 1.91.0. Product-pinned Rust 1.84.1 fails before compilation on the exact lock; other named browsers remain unverified. The WebCrypto provider is experimental for suites 2, 5, and 7. RustSec found no known advisory in the full lock as of 2026-10-16, but active target-graph review and license compatibility review remain open. There is no IndexedDB adapter or atomic state evidence; upstream says no full third-party audit. Official CI activity does not establish exact-profile cross-implementation evidence. |
 | OpenMLS 0.9.0 | Release tag `openmls-v0.9.0`, commit `3a3e35de3feeca8f6605143c464d5452ae584d43` | Research spike only. Upstream labels `wasm32-unknown-unknown` unsupported and its WASM package experimental; Rust 1.91.0 exceeds product Rust 1.84.1; synchronous storage does not establish safe asynchronous IndexedDB transactions; the 2026-10-15 lock snapshot includes RustSec findings and an active unmaintained dependency warning requiring disposition. |
 | `ts-mls` v1.6.4 | Stable tag commit `ddff62aa15d3064fff5d77dda35b3cdf2970870d`; current main is `2.0.0-rc.16` | Newly screened browser-oriented lead only. The project advertises browser use and RFC 9420 support, but says it has no formal security audit. Atomic IndexedDB persistence, NearLink identity and owner policy, exact-profile cross-implementation evidence, native counterpart behavior, and exact dependency/license/advisory review are unproven. |
 

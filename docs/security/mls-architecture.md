@@ -52,8 +52,11 @@ lockfile and must be resolved or independently dispositioned before selection.
 The same active graph includes the informational unmaintained
 `proc-macro-error2` warning. Cargo metadata records declared license expressions
 for the 198 resolved spike packages; this is only an inventory, not a license
-compatibility decision. The spike's workflow does not rerun RustSec, so the
-audit is a dated snapshot and not continuous coverage.
+compatibility decision. The OpenMLS workflow does not rerun RustSec, so that
+audit is a dated snapshot. The repository security workflow now scans the
+isolated `mls-rs` lockfile without advisory exceptions. It covers the complete
+lockfile; target-specific active dependency graphs still require separate
+review.
 
 Assessment: `mls-rs` is the more plausible next research candidate because its
 README advertises WASM builds and configurable storage, but its experimental
@@ -125,10 +128,11 @@ additional research lead only, not a selected or qualified candidate.
 | Hard gate | `mls-rs` 0.56.0 revalidation | OpenMLS 0.9.0 | `ts-mls` v1.6.4 screen |
 | --- | --- | --- | --- |
 | Exact release and source | Tag `0.56.0`, commit `8f1b43f447a792ff9307f1c2c7f54da63914870e` | Tag `openmls-v0.9.0`, commit `3a3e35de3feeca8f6605143c464d5452ae584d43` | Stable tag `v1.6.4`, commit `ddff62aa15d3064fff5d77dda35b3cdf2970870d`; main is RC `2.0.0-rc.16` |
-| MSRV and targets | Core manifest says Rust 1.82.0; exact provider feature graph and named-browser runtime remain unverified | Rust 1.91.0; WASM target marked unsupported despite compile CI | Browser use advertised; exact stable release target matrix and required native counterpart remain unverified |
+| MSRV and targets | Exact spike graph passes in Chromium 148 with Rust 1.91.0; Rust 1.84.1 fails before compilation on `zeroize_derive`; other named browsers and support with an updated lock or compatible product toolchain remain unverified | Rust 1.91.0; WASM target marked unsupported despite compile CI | Browser use advertised; exact stable release target matrix and required native counterpart remain unverified |
 | Provider and persistence | WebCrypto experimental; no IndexedDB adapter or atomicity evidence | RustCrypto/native evidence only; sync storage API does not establish IndexedDB safety | Browser oriented; no NearLink-ready provider or atomic IndexedDB transaction evidence found |
-| Dependencies, licensing, advisories | Exact NearLink feature graph not inventoried or reviewed | Spike lock audit dated 2026-10-15 and still requires disposition | Exact v1.6.4 lock, licenses, and advisories not reviewed |
-| Maintenance, audit, interoperability | Upstream CI exists; no full third-party audit; exact-profile cross-implementation result not established | Active upstream, but no resolution of target/MSRV/storage blockers or independent audit | Official implementation inventory lists it; project says no formal security audit; repo interop material is not proof for the NearLink profile |
+| Dependencies, licensing, advisories | RustSec scan of 147 lock entries, including the local root crate, is clean as of 2026-10-16; CI scans without exceptions; active target graphs and license compatibility remain under review | Spike lock audit dated 2026-10-15 and still requires disposition | Exact v1.6.4 lock, licenses, and advisories not reviewed |
+| Maintenance, audit, interoperability | Upstream CI exists; exact-profile cross-implementation result not established | Active upstream, but no resolution of target/MSRV/storage blockers | Official implementation inventory lists it; repo interop material is not proof for the NearLink profile |
+| Full third-party security audit | Not completed; hard selection gate | Not completed; hard selection gate | Not completed; hard selection gate |
 
 None of these rows is an overall pass. In particular, the core `mls-rs`
 MSRV result and the existence of a browser-oriented TypeScript project do not
@@ -140,6 +144,38 @@ implementation audit, first freeze a reviewed implementation and its release
 artifact as described in the [cryptography design review packet](cryptographic-review-packet.md#preconditions-before-a-third-party-implementation-audit).
 
 Sources checked on 2026-10-16: [mls-rs 0.56.0 release](https://github.com/awslabs/mls-rs/releases/tag/0.56.0), [mls-rs 0.56.0 manifest](https://docs.rs/crate/mls-rs/0.56.0/source/Cargo.toml.orig), [mls-rs 0.56.0 README](https://github.com/awslabs/mls-rs/blob/0.56.0/mls-rs/README.md), [WebCrypto provider manifest](https://github.com/awslabs/mls-rs/blob/0.56.0/mls-rs-crypto-webcrypto/Cargo.toml), [mls-rs audit workflow](https://github.com/awslabs/mls-rs/actions/workflows/audit.yml), [mls-rs interop workflow](https://github.com/awslabs/mls-rs/blob/main/.github/workflows/interop_tests.yml), [MLS implementation inventory](https://github.com/mlswg/mls-implementations/blob/main/implementation_list.md), [ts-mls stable release](https://github.com/LukaJCB/ts-mls/releases/tag/v1.6.4), [ts-mls exact release commit](https://github.com/LukaJCB/ts-mls/commit/ddff62aa15d3064fff5d77dda35b3cdf2970870d), [ts-mls README](https://github.com/LukaJCB/ts-mls/tree/v1.6.4), and [ts-mls current package manifest](https://github.com/LukaJCB/ts-mls/blob/main/package.json).
+
+## NL-61 isolated `mls-rs` compatibility spike, 2026-10-16
+
+An isolated research crate now pins `mls-rs` 0.56.0, the WebCrypto provider
+0.15.0, and the RustCrypto provider 0.22.1. It exercises the P-256 AES-128
+suite in both a native RustCrypto run and headless Chromium using WebCrypto.
+Both runs pass a two-member flow that creates and adds a member, processes a
+Welcome, exchanges an application message, handles an Update proposal, reloads
+memory-backed state, and processes removal. The removed member observes the
+removal effect. This is browser feasibility evidence, not app identity or
+authorization policy, cross-provider interoperability, durable storage, or
+security approval.
+
+Measured raw MLS objects range from 215 to 886 bytes in the native run and 215
+to 892 bytes in Chromium for this two-member group and short body. The Add
+Commit is 573 bytes native and 579 bytes in Chromium. These omit NearLink
+envelopes and framing, larger groups, and maximum message bodies, so they do
+not close the profile size or page budget gates. Rust 1.84.1 fails before
+compilation on both targets because the locked `zeroize_derive` 1.5.0 manifest
+requires Cargo's `edition2024` support. Rust 1.91.0 runs the compatibility
+spike. The lock contains 147 entries including the local root crate; 146
+registry package rows have declared license
+expressions; compatibility review is still required. Active target graphs
+include `zeroize_derive` through the selected crypto providers. No MLS
+candidate is selected, and the external third-party security audit remains a
+hard gate.
+
+RustSec loaded 1,329 advisories and found no known advisory in the pinned
+147-entry lock on 2026-10-16. The repository workflow now repeats this
+scan without advisory exceptions. That full-lock scan is distinct from active
+target graph review and from the external audit. The OpenMLS-only exceptions
+remain scoped to the separate OpenMLS lockfile.
 
 ## Upstream and toolchain revalidation
 
@@ -195,13 +231,16 @@ active path for the spike's selected `OpenMlsRustCrypto` provider and tested
 targets; RustSec still reports packages present in the full lockfile. The
 `proc-macro-error2` warning is in the active selected graph through
 `hax-lib-macros`, `libcrux-sha3`, and `hpke-rs`, which is used by
-`openmls_rust_crypto`. The current research workflow checks formatting, native
-tests, and WASM compilation only; it does not rerun RustSec. Treat these audit
-results as a snapshot, not ongoing audit coverage. Any lockfile or dependency
-feature-graph change requires a fresh RustSec review of the complete lockfile
-and the active selected graph, followed by independent review before candidate
-selection. Keep OpenMLS unselected until that review and the other adoption
-gates are satisfied. References: [RUSTSEC-2026-0330](https://rustsec.org/advisories/RUSTSEC-2026-0330),
+`openmls_rust_crypto`. The OpenMLS workflow still checks formatting, native
+tests, and WASM compilation without rerunning RustSec, so its audit results are
+a dated snapshot. The isolated `mls-rs` lockfile is scanned by RustSec in the
+repository security workflow without advisory exceptions. That automated scan
+covers the complete lockfile; target-specific active dependency graphs still
+require separate review. Any lockfile or dependency feature-graph change
+requires a fresh RustSec review of the complete lockfile and the active
+selected graph, followed by independent review before candidate selection.
+Keep OpenMLS unselected until that review and the other adoption gates are
+satisfied. References: [RUSTSEC-2026-0330](https://rustsec.org/advisories/RUSTSEC-2026-0330),
 [RUSTSEC-2026-0331](https://rustsec.org/advisories/RUSTSEC-2026-0331), and
 [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173).
 

@@ -95,3 +95,13 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: research/openmls-compat-spike
+      - name: Install mls-rs research RustSec config
+        run: |
+          mkdir -p ~/.cargo
+          cp research/mls-rs-compat-spike/audit.toml ~/.cargo/audit.toml
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: research/mls-rs-compat-spike

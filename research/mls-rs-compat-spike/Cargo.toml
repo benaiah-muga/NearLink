@@ -1,0 +1,17 @@
+[package]
+name = "nearlink-mls-rs-compat-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mls-rs = { version = "=0.56.0", features = ["test_util"] }
+mls-rs-crypto-webcrypto = "=0.15.0"
+mls-rs-crypto-rustcrypto = "=0.22.1"
+
+[dev-dependencies]
+futures = "=0.3.34"
+wasm-bindgen-test = "=0.3.79"
+web-sys = { version = "=0.3.106", features = ["console"] }
+
+[workspace]
