@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { MessagePacket } from "@nearlink/protocol";
+import { MAX_HISTORY_PAGE_MESSAGES, type MessagePacket } from "@nearlink/protocol";
 import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadQueuedMessagePage, loadRequestedMessages, MAX_HUB_REPLAY_ORDER_IDS, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const classifierGate = vi.hoisted(() => ({ failNext: false }));
@@ -65,6 +65,23 @@ async function seedLargeRoom(rowCount: number, includeLegacyRow = false): Promis
       store.put({ ...message(`large-${String(index).padStart(4, "0")}`, "2026-10-14T09:00:00.000Z"), transport: "hub", displayOrder: index });
     }
     if (includeLegacyRow) store.put(message("legacy-no-order", "2026-10-14T09:00:01.000Z"));
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error);
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
+async function seedRawMessages(rows: StoredMessage[]): Promise<void> {
+  await saveIdentity({ sender: "device-1", senderName: "Ada" });
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = openRequest();
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+  });
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction("messages", "readwrite");
+    for (const row of rows) transaction.objectStore("messages").put(row);
     transaction.oncomplete = () => resolve();
     transaction.onabort = () => reject(transaction.error);
     transaction.onerror = () => reject(transaction.error);
@@ -546,6 +563,175 @@ describe("local IndexedDB storage", () => {
     const saved = await loadMessages("alpha");
     expect(saved.map((item) => item.packet.id)).toEqual(["page-oldest", "page-newest", "boundary"]);
     expect(saved.map((item) => item.displayOrder)).toEqual([-2, -1, 0]);
+  });
+
+  it("reads only page IDs and the cursor for an older history page", async () => {
+    await seedRawMessages([
+      { ...message("boundary", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub", displayOrder: 4 },
+      { ...message("page-newest", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub", displayOrder: -2 },
+      { ...message("unrelated", "2026-10-14T11:00:00.000Z", "sent"), transport: "direct", displayOrder: 9 },
+      { ...message("other-room", "2026-10-14T12:00:00.000Z", "sent"), packet: packet("other-room", "2026-10-14T12:00:00.000Z", "beta"), transport: "hub", displayOrder: 0 },
+    ]);
+    const page = [
+      { ...message("page-newest", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("page-oldest", "2026-10-14T23:00:00.000Z", "sent"), transport: "hub" as const },
+    ];
+    const messageKeyReads: IDBValidKey[] = [];
+    const broadReads: string[] = [];
+    const originalGet = IDBObjectStore.prototype.get;
+    const originalGetAll = IDBIndex.prototype.getAll;
+    const originalOpenCursor = IDBIndex.prototype.openCursor;
+    vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["get"]>) {
+      if (this.name === "messages") messageKeyReads.push(args[0] as IDBValidKey);
+      return originalGet.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+      if (this.name === "roomCreatedAt") broadReads.push("roomCreatedAt.getAll");
+      return originalGetAll.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["openCursor"]>) {
+      if (this.name === "roomDisplayOrder" || this.name === "roomCreatedAt") broadReads.push(`${this.name}.openCursor`);
+      return originalOpenCursor.apply(this, args);
+    });
+
+    await expect(saveHubHistoryPage(page, "boundary", 4)).resolves.toBe(true);
+    expect(messageKeyReads).toEqual([["alpha", "page-newest"], ["alpha", "page-oldest"], ["alpha", "boundary"]]);
+    expect(broadReads).toEqual([]);
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["page-newest", -2],
+      ["page-oldest", 2],
+      ["boundary", 4],
+      ["unrelated", 9],
+    ]);
+    expect((await loadMessages("beta")).map((row) => row.packet.id)).toEqual(["other-room"]);
+  });
+
+  it.each([
+    { name: "positive oldest order", oldestOrder: 5, expected: [-1, -2] },
+    { name: "negative oldest order", oldestOrder: -8, expected: [-9, -10] },
+  ])("uses the zero-clamped oldest order when a history cursor is missing with $name", async ({ oldestOrder, expected }) => {
+    await seedRawMessages([
+      { ...message("oldest", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub", displayOrder: oldestOrder },
+      { ...message("newer", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub", displayOrder: oldestOrder + 4 },
+    ]);
+    const oldestRanges: IDBKeyRange[] = [];
+    const broadReads: string[] = [];
+    const originalOpenCursor = IDBIndex.prototype.openCursor;
+    const originalGetAll = IDBIndex.prototype.getAll;
+    vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["openCursor"]>) {
+      if (this.name === "roomDisplayOrder") oldestRanges.push(args[0] as IDBKeyRange);
+      if (this.name === "roomCreatedAt") broadReads.push("roomCreatedAt.openCursor");
+      return originalOpenCursor.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+      if (this.name === "roomCreatedAt") broadReads.push("roomCreatedAt.getAll");
+      return originalGetAll.apply(this, args);
+    });
+    const page = [
+      { ...message("fallback-newest", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("fallback-oldest", "2026-10-14T06:00:00.000Z", "sent"), transport: "hub" as const },
+    ];
+
+    await expect(saveHubHistoryPage(page, "expired-cursor", 20)).resolves.toBe(true);
+    expect(oldestRanges).toHaveLength(1);
+    expect(oldestRanges[0]).toMatchObject({ lower: ["alpha"], upper: ["alpha", []], lowerOpen: false, upperOpen: false });
+    expect(broadReads).toEqual([]);
+    vi.restoreAllMocks();
+    const saved = await loadMessages("alpha");
+    expect(["fallback-newest", "fallback-oldest"].map((id) => saved.find((row) => row.packet.id === id)?.displayOrder)).toEqual(expected);
+  });
+
+  it("checks existing history candidates for content conflicts before writing", async () => {
+    const existing = { ...message("conflicting-page", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const, displayOrder: 2 };
+    const boundary = { ...message("conflict-boundary", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub" as const, displayOrder: 4 };
+    await seedRawMessages([existing, boundary]);
+    const conflicting = { ...existing, packet: { ...existing.packet, body: "changed history content" } };
+    const newPageMessage = { ...message("conflict-page-new", "2026-10-14T06:00:00.000Z", "sent"), transport: "hub" as const };
+
+    await expect(saveHubHistoryPage([newPageMessage, conflicting], "conflict-boundary", 4)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("conflicts with saved message content"),
+    });
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["conflicting-page", 2],
+      ["conflict-boundary", 4],
+    ]);
+  });
+
+  it("rejects conflicting duplicate IDs inside an older history page", async () => {
+    await saveMessage({ ...message("duplicate-boundary", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub" });
+    const first = { ...message("duplicate-page", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const };
+    const conflict = { ...first, packet: { ...first.packet, body: "different duplicate content" } };
+
+    await expect(saveHubHistoryPage([first, conflict], "duplicate-boundary", 0)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("conflicts with saved message content"),
+    });
+    await expect(loadMessages("alpha")).resolves.toHaveLength(1);
+  });
+
+  it("honors the room tombstone for a non-null history cursor", async () => {
+    await beginRoomDeletion("alpha");
+    const page = { ...message("tombstoned-page", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const };
+
+    await expect(saveHubHistoryPage([page], "missing-boundary", 0)).resolves.toBe(false);
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
+  });
+
+  it("aborts an older history page when an exact lookup fails", async () => {
+    const boundary = { ...message("lookup-boundary", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub" as const, displayOrder: 4 };
+    await seedRawMessages([boundary]);
+    const originalGet = IDBObjectStore.prototype.get;
+    vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["get"]>) {
+      if (this.name === "messages" && JSON.stringify(args[0]) === JSON.stringify(["alpha", "lookup-page"])) {
+        throw new DOMException("Injected history lookup failure.", "UnknownError");
+      }
+      return originalGet.apply(this, args);
+    });
+    const page = { ...message("lookup-page", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const };
+
+    await expect(saveHubHistoryPage([page], "lookup-boundary", 4)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("Injected history lookup failure"),
+    });
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([["lookup-boundary", 4]]);
+  });
+
+  it("aborts an older history page when a message write fails", async () => {
+    await saveMessage({ ...message("write-boundary", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub" });
+    const originalPut = IDBObjectStore.prototype.put;
+    let messageWrites = 0;
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["put"]>) {
+      if (this.name === "messages" && ++messageWrites === 2) throw new DOMException("Injected history write failure.", "QuotaExceededError");
+      return originalPut.apply(this, args);
+    });
+    const page = [
+      { ...message("write-page-one", "2026-10-14T07:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("write-page-two", "2026-10-14T06:00:00.000Z", "sent"), transport: "hub" as const },
+    ];
+
+    await expect(saveHubHistoryPage(page, "write-boundary", 0)).rejects.toMatchObject({
+      name: "LocalStorageError",
+      message: expect.stringContaining("Injected history write failure"),
+    });
+    expect(messageWrites).toBe(2);
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([["write-boundary", 0]]);
+  });
+
+  it("caps older history page exact reads at the protocol page size", async () => {
+    const page = Array.from({ length: MAX_HISTORY_PAGE_MESSAGES + 1 }, (_, index) => ({
+      ...message(`oversized-history-${index}`, "2026-10-14T07:00:00.000Z", "sent"),
+      transport: "hub" as const,
+    }));
+    const getSpy = vi.spyOn(IDBObjectStore.prototype, "get");
+
+    await expect(saveHubHistoryPage(page, "boundary", 0)).rejects.toThrow(
+      `A history page cannot contain more than ${MAX_HISTORY_PAGE_MESSAGES} messages.`,
+    );
+    expect(getSpy).not.toHaveBeenCalled();
+    await expect(loadMessages("alpha")).resolves.toEqual([]);
   });
 
   it("merges a null-cursor retry around known rows without moving them by timestamp", async () => {

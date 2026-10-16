@@ -1,5 +1,5 @@
 import type { MessagePacket } from "@nearlink/protocol";
-import { isProtocolIdentifier } from "@nearlink/protocol";
+import { isProtocolIdentifier, MAX_HISTORY_PAGE_MESSAGES } from "@nearlink/protocol";
 import type { AcceptedMessageIdSnapshot, ConversationStore } from "./conversationStore";
 import { classifyInboundAcceptance, initializeWasmProtocol } from "./wasmProtocol";
 
@@ -973,10 +973,136 @@ export async function reconcileHubReplayOrder(room: string, orderedIds: string[]
 /** Atomically save one verified newest-to-oldest history page before the current oldest row. */
 export async function saveHubHistoryPage(messages: StoredMessage[], cursor: string | null, requestStartOrder: number): Promise<boolean> {
   if (messages.length === 0) return true;
+  if (cursor !== null && messages.length > MAX_HISTORY_PAGE_MESSAGES) {
+    throw new RangeError(`A history page cannot contain more than ${MAX_HISTORY_PAGE_MESSAGES} messages.`);
+  }
   if (!await initializeWasmProtocol()) throw new Error("Could not initialize protocol acceptance.");
   const room = messages[0].packet.room;
   if (messages.some((message) => message.packet.room !== room)) {
     throw new Error("A history page must contain messages from one room.");
+  }
+
+  if (cursor !== null) {
+    return withTransaction<boolean>(
+      "Could not save the local history page",
+      [MESSAGE_STORE, ROOM_DELETION_STORE],
+      "readwrite",
+      (store, complete, setFailure, transaction) => {
+        const tombstoneRequest = transaction.objectStore(ROOM_DELETION_STORE).get(room);
+        const pageIds = new Set(messages.map((item) => item.packet.id));
+        const lookupIds = [...new Set([...pageIds, cursor])];
+        const rowsById = new Map<string, StoredMessage>();
+        let remainingReads = lookupIds.length;
+        let tombstoneReady = false;
+        let deleted = false;
+        let fallbackReady = false;
+        let fallbackOrder = 0;
+
+        const maybeSave = () => {
+          if (!tombstoneReady || remainingReads > 0 || !fallbackReady) return;
+          if (deleted) {
+            complete(false);
+            return;
+          }
+
+          const pagePackets = new Map<string, MessagePacket>();
+          for (const candidate of messages) {
+            const existing = rowsById.get(candidate.packet.id)?.packet ?? pagePackets.get(candidate.packet.id);
+            let decision: ReturnType<typeof classifyInboundAcceptance>;
+            try {
+              decision = classifyInboundAcceptance(room, deleted, candidate.packet, existing);
+            } catch (error) {
+              setFailure(error);
+              transaction.abort();
+              return;
+            }
+            if (decision === "room_deleted") { complete(false); return; }
+            if (decision === "conflict") {
+              setFailure(new Error("A history page ID conflicts with saved message content."));
+              transaction.abort();
+              return;
+            }
+            pagePackets.set(candidate.packet.id, candidate.packet);
+          }
+
+          const cursorRow = rowsById.get(cursor);
+          const anchorOrder = Number.isFinite(cursorRow?.displayOrder) ? cursorRow!.displayOrder! : fallbackOrder;
+          for (let index = 0; index < messages.length; index += 1) {
+            const candidate = messages[index];
+            const existing = rowsById.get(candidate.packet.id);
+            const alreadyOlderThanCursor = existing
+              && Number.isFinite(existing.displayOrder)
+              && existing.displayOrder! < anchorOrder;
+            const displayOrder = alreadyOlderThanCursor ? existing.displayOrder : anchorOrder - (index + 1);
+            const savedMessage: StoredMessage = existing
+              ? { ...existing, transport: "hub", delivery: "sent", displayOrder }
+              : { ...candidate, transport: "hub", delivery: "sent", displayOrder };
+            try {
+              const put = store.put(savedMessage);
+              put.onerror = () => setFailure(put.error ?? new Error("Could not persist the history page order."));
+            } catch (error) {
+              setFailure(error);
+              transaction.abort();
+              return;
+            }
+          }
+          complete(true);
+        };
+
+        const maybeReadFallback = () => {
+          if (remainingReads > 0) return;
+          const cursorRow = rowsById.get(cursor);
+          if (Number.isFinite(cursorRow?.displayOrder)) {
+            fallbackReady = true;
+            maybeSave();
+            return;
+          }
+
+          let oldestRequest: IDBRequest<IDBCursorWithValue | null>;
+          try {
+            oldestRequest = store.index(ROOM_DISPLAY_ORDER_INDEX).openCursor(
+              IDBKeyRange.bound([room], [room, []]),
+              "next",
+            );
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
+            return;
+          }
+          oldestRequest.onsuccess = () => {
+            const oldestOrder = oldestRequest.result?.value?.displayOrder;
+            fallbackOrder = Math.min(0, Number.isFinite(oldestOrder) ? oldestOrder : 0);
+            fallbackReady = true;
+            maybeSave();
+          };
+          oldestRequest.onerror = () => setFailure(oldestRequest.error ?? new Error("Could not read the oldest local message order."));
+        };
+
+        tombstoneRequest.onsuccess = () => {
+          tombstoneReady = true;
+          deleted = Boolean(tombstoneRequest.result);
+          maybeSave();
+        };
+        tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
+
+        for (const id of lookupIds) {
+          let request: IDBRequest<StoredMessage | undefined>;
+          try {
+            request = store.get([room, id]) as IDBRequest<StoredMessage | undefined>;
+          } catch (error) {
+            setFailure(error);
+            transaction.abort();
+            return;
+          }
+          request.onsuccess = () => {
+            if (request.result) rowsById.set(id, request.result);
+            remainingReads -= 1;
+            maybeReadFallback();
+          };
+          request.onerror = () => setFailure(request.error ?? new Error("Could not read history page messages."));
+        }
+      },
+    );
   }
 
   return withTransaction<boolean>(
