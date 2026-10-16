@@ -289,6 +289,103 @@ test("loads older hub history in accepted order and retries the same cursor", as
   await expectAccessible(page, "the loaded and retried history page");
 });
 
+test("rebuilds the sync inventory after reload and does not complete when a sync message cannot be saved", async ({ page }) => {
+  test.setTimeout(60_000);
+  const room = "chromium-sync-reload-check";
+  const acceptedId = "e2e-sync-reload-accepted";
+  const failingId = "e2e-sync-reload-storage-failure";
+  const acceptedMessage = {
+    version: 1, type: "message", id: acceptedId, room,
+    sender: "station-b", senderName: "Bea", createdAt: "2026-10-14T10:00:00.000Z", body: "Accepted before reload",
+  };
+  const failingMessage = {
+    version: 1, type: "message", id: failingId, room,
+    sender: "station-b", senderName: "Bea", createdAt: "2026-10-14T11:00:00.000Z", body: "This sync message cannot be persisted",
+  };
+  const inventories: Array<{ connection: number; packet: Record<string, unknown> }> = [];
+  const outgoingCompletions: Array<Record<string, unknown>> = [];
+  let connection = 0;
+  let secondPeerInventorySent = false;
+
+  await page.addInitScript((storageFailureId) => {
+    const originalPut = IDBObjectStore.prototype.put;
+    const originalAdd = IDBObjectStore.prototype.add;
+    const failTargetedRow = (value: unknown) => {
+      const packet = (value as { packet?: { id?: string } } | null)?.packet;
+      if (packet?.id === storageFailureId) throw new DOMException("Injected persistence failure.", "QuotaExceededError");
+    };
+    IDBObjectStore.prototype.put = function (value: unknown, key?: IDBValidKey) {
+      failTargetedRow(value);
+      return key === undefined ? originalPut.call(this, value) : originalPut.call(this, value, key);
+    };
+    IDBObjectStore.prototype.add = function (value: unknown, key?: IDBValidKey) {
+      failTargetedRow(value);
+      return key === undefined ? originalAdd.call(this, value) : originalAdd.call(this, value, key);
+    };
+  }, failingId);
+
+  await page.routeWebSocket("ws://127.0.0.1:8000/ws", (socket) => {
+    const thisConnection = ++connection;
+    socket.onMessage((raw) => {
+      const packet = JSON.parse(String(raw)) as Record<string, unknown>;
+      if (packet.type === "join") {
+        socket.send(JSON.stringify({ version: 1, type: "joined", room: packet.room, peers: 1 }));
+        socket.send(JSON.stringify({ version: 1, type: "presence", room: packet.room, peers: 1 }));
+      }
+      if (packet.type === "sync_inventory_page") {
+        inventories.push({ connection: thisConnection, packet });
+        if (thisConnection === 1) {
+          socket.send(JSON.stringify(acceptedMessage));
+        } else if (thisConnection === 2 && packet.cursor === null && !secondPeerInventorySent) {
+          secondPeerInventorySent = true;
+          socket.send(JSON.stringify({
+            version: 1, type: "sync_inventory_page", room, syncId: "e2e-reload-peer-session",
+            sender: "station-b", cursor: null, messageIds: [failingId], nextCursor: failingId,
+            hasMore: false, limitReached: false,
+          }));
+        }
+      }
+      if (packet.type === "sync_missing_request" && thisConnection === 2) {
+        socket.send(JSON.stringify(failingMessage));
+        socket.send(JSON.stringify({
+          version: 1, type: "sync_page_complete", room, syncId: packet.syncId,
+          requestId: packet.requestId, sender: "station-b", targetSender: packet.sender,
+          messageIds: [failingId],
+        }));
+      }
+      if (packet.type === "sync_page_complete") outgoingCompletions.push(packet);
+    });
+  });
+
+  await page.goto("/");
+  await waitForSetupReady(page);
+  await page.getByLabel("Your call sign").fill("Reload Tester");
+  await page.getByLabel("Room frequency").fill(room);
+  await page.getByLabel("Hub address").fill("ws://127.0.0.1:8000/ws");
+  await page.getByRole("button", { name: "Save and join room" }).click();
+
+  const messageLog = page.getByRole("log", { name: `Messages in ${room}` });
+  await expect(messageLog.getByText(acceptedMessage.body)).toBeVisible();
+  await expect.poll(() => inventories.filter((item) => item.connection === 1).length).toBeGreaterThan(0);
+  expect((inventories.find((item) => item.connection === 1)!.packet.messageIds as string[])).not.toContain(acceptedId);
+
+  await page.reload();
+  await expect(page.getByLabel("Your call sign")).toHaveValue("Reload Tester");
+  await expect(page.getByLabel("Room frequency")).toHaveValue(room);
+  await expect(page.getByRole("log", { name: `Messages in ${room}` }).getByText(acceptedMessage.body)).toBeVisible();
+  await page.getByRole("button", { name: "Save and join room" }).click();
+
+  await expect.poll(() => inventories.filter((item) => item.connection === 2).length).toBeGreaterThan(0);
+  const reloadedInventory = inventories.find((item) => item.connection === 2)!.packet;
+  expect(reloadedInventory.messageIds).toEqual([acceptedId]);
+  expect(reloadedInventory.syncId).not.toBe(inventories.find((item) => item.connection === 1)!.packet.syncId);
+
+  const syncStatus = page.locator(".sync-status");
+  await expect(syncStatus).toContainText("A requested sync message could not be saved. Reconnect to restart synchronization.");
+  expect(outgoingCompletions).toEqual([]);
+  await expect(page.getByRole("log", { name: `Messages in ${room}` }).getByText(failingMessage.body)).toBeHidden();
+});
+
 test("reconciles a persisted message over a confirmed direct Chromium session", async ({ browser }) => {
   test.setTimeout(60_000);
   const left = await browser.newPage();
