@@ -386,6 +386,100 @@ test("rebuilds the sync inventory after reload and does not complete when a sync
   await expect(page.getByRole("log", { name: `Messages in ${room}` }).getByText(failingMessage.body)).toBeHidden();
 });
 
+test("restarts sync from the durable inventory after the peer completion is lost", async ({ page }) => {
+  test.setTimeout(60_000);
+  const room = "chromium-sync-lost-completion";
+  const acceptedId = "e2e-sync-durable-after-lost-completion";
+  const acceptedMessage = {
+    version: 1, type: "message", id: acceptedId, room,
+    sender: "station-b", senderName: "Bea", createdAt: "2026-10-14T10:00:00.000Z", body: "Saved before the sync completion was lost",
+  };
+  const localInventories: Array<{ connection: number; packet: Record<string, unknown> }> = [];
+  const peerRequests: Array<{ connection: number; packet: Record<string, unknown> }> = [];
+  const connections = new Set<number>();
+  const peerInventorySent = new Set<number>();
+  let connection = 0;
+
+  await page.routeWebSocket("ws://127.0.0.1:8000/ws", (socket) => {
+    const thisConnection = ++connection;
+    connections.add(thisConnection);
+    socket.onMessage((raw) => {
+      const packet = JSON.parse(String(raw)) as Record<string, unknown>;
+      if (packet.type === "join") {
+        socket.send(JSON.stringify({ version: 1, type: "joined", room: packet.room, peers: 1 }));
+        socket.send(JSON.stringify({ version: 1, type: "presence", room: packet.room, peers: 1 }));
+      }
+      if (packet.type === "sync_inventory_page") {
+        localInventories.push({ connection: thisConnection, packet });
+        if (packet.cursor === null && !peerInventorySent.has(thisConnection)) {
+          peerInventorySent.add(thisConnection);
+          socket.send(JSON.stringify({
+            version: 1, type: "sync_inventory_page", room,
+            syncId: thisConnection === 1 ? "e2e-lost-completion-peer-first" : "e2e-lost-completion-peer-restart",
+            sender: "station-b", cursor: null, messageIds: [acceptedId], nextCursor: acceptedId,
+            hasMore: false, limitReached: false,
+          }));
+        }
+      }
+      if (packet.type === "sync_missing_request") {
+        peerRequests.push({ connection: thisConnection, packet });
+        if (thisConnection === 1 && (packet.messageIds as string[]).includes(acceptedId)) {
+          socket.send(JSON.stringify(acceptedMessage));
+          // Intentionally omit sync_page_complete to model a lost peer completion.
+        }
+      }
+    });
+  });
+
+  await page.goto("/");
+  await waitForSetupReady(page);
+  await page.getByLabel("Your call sign").fill("Reload Tester");
+  await page.getByLabel("Room frequency").fill(room);
+  await page.getByLabel("Hub address").fill("ws://127.0.0.1:8000/ws");
+  await page.getByRole("button", { name: "Save and join room" }).click();
+
+  const firstLog = page.getByRole("log", { name: `Messages in ${room}` });
+  await expect(firstLog.getByText(acceptedMessage.body)).toBeVisible();
+  await expect.poll(() => peerRequests.filter((item) => item.connection === 1).length).toBeGreaterThan(0);
+  expect((peerRequests.find((item) => item.connection === 1)!.packet.messageIds as string[])).toEqual([acceptedId]);
+  expect((await page.evaluate(async (messageId) => {
+    const request = indexedDB.open("nearlink-local");
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    try {
+      return await new Promise<boolean>((resolve, reject) => {
+        const transaction = database.transaction("messages", "readonly");
+        const lookup = transaction.objectStore("messages").get(["chromium-sync-lost-completion", messageId]);
+        lookup.onsuccess = () => resolve(Boolean(lookup.result));
+        lookup.onerror = () => reject(lookup.error);
+        transaction.onabort = () => reject(transaction.error);
+      });
+    } finally {
+      database.close();
+    }
+  }, acceptedId))).toBe(true);
+  expect(localInventories.some((item) => item.connection === 1 && (item.packet.messageIds as string[]).includes(acceptedId))).toBe(false);
+  await expect(page.locator(".sync-status")).toContainText("Exchanging bounded local message inventories");
+
+  await page.reload();
+  await expect(page.getByLabel("Your call sign")).toHaveValue("Reload Tester");
+  await expect(page.getByLabel("Room frequency")).toHaveValue(room);
+  const restoredLog = page.getByRole("log", { name: `Messages in ${room}` });
+  await expect(restoredLog.getByText(acceptedMessage.body)).toBeVisible();
+  await page.getByRole("button", { name: "Save and join room" }).click();
+
+  await expect.poll(() => localInventories.some((item) => item.connection === 2 && (item.packet.messageIds as string[]).includes(acceptedId))).toBe(true);
+  const firstInventory = localInventories.find((item) => item.connection === 1)!;
+  const restartedInventory = localInventories.find((item) => item.connection === 2 && (item.packet.messageIds as string[]).includes(acceptedId))!;
+  expect(restartedInventory.packet.syncId).not.toBe(firstInventory.packet.syncId);
+  expect(peerRequests.filter((item) => item.connection === 2 && (item.packet.messageIds as string[]).includes(acceptedId))).toEqual([]);
+  await expect(page.locator(".sync-status")).toContainText("The peer inventory contains no message IDs missing from this local snapshot.");
+  await expect(restoredLog.getByText(acceptedMessage.body)).toHaveCount(1);
+  expect(connections).toEqual(new Set([1, 2]));
+});
+
 test("reconciles a persisted message over a confirmed direct Chromium session", async ({ browser }) => {
   test.setTimeout(60_000);
   const left = await browser.newPage();

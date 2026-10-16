@@ -1963,7 +1963,7 @@ describe("browser app messaging flow", () => {
     }));
     await seedRoomMessages(localRows);
     render(<App />);
-    const socket = await connectTestHub();
+    const socket = await connectTestHub(false);
     await screen.findByText("Bounded local 59", {}, { timeout: 5000 });
     expect(screen.queryByText("Bounded local 0")).toBeNull();
 
@@ -2088,7 +2088,7 @@ describe("browser app messaging flow", () => {
 
   it("serializes history completion with live traffic and retries a failed page at the same cursor", async () => {
     render(<App />);
-    const socket = await connectTestHub();
+    const socket = await connectTestHub(false);
     const boundary = hubMessage("overlap-boundary", "2026-10-14T10:00:00.000Z");
     act(() => socket.receive(boundary));
     await screen.findByText(boundary.body);
