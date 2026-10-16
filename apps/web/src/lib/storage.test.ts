@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagePacket } from "@nearlink/protocol";
-import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadQueuedMessagePage, loadRequestedMessages, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
+import { acceptInboundMessage, AcceptedMessageIdCollector, beginRoomDeletion, cancelRoomDeletion, deleteRoomMessages, isRoomMessagesDeleted, loadAcceptedMessageIds, loadIdentity, loadMessagePage, loadMessages, loadQueuedMessagePage, loadRequestedMessages, MAX_HUB_REPLAY_ORDER_IDS, MAX_SYNC_STORAGE_IDS, MAX_SYNC_STORAGE_ROWS_SCANNED, reconcileHubReplayOrder, resumeRoomMessages, saveHubHistoryPage, saveIdentity, saveMessage, updateDelivery, type StoredMessage } from "./storage";
 
 const classifierGate = vi.hoisted(() => ({ failNext: false }));
 
@@ -802,6 +802,144 @@ describe("local IndexedDB storage", () => {
       "hub-accepted-first", "direct-between", "hub-accepted-later",
     ]);
     expect(reconciled.find((item) => item.packet.id === "direct-between")).toMatchObject({ transport: "direct", displayOrder: 1 });
+  });
+
+  it("reads only the bounded replay IDs and preserves stable slots around missing and filtered rows", async () => {
+    const replayRows = [
+      { ...message("hub-later", "2026-10-14T08:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("direct-between", "2026-10-14T09:00:00.000Z", "sent"), transport: "direct" as const },
+      { ...message("hub-first", "2026-10-14T22:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("hub-queued", "2026-10-14T23:00:00.000Z"), transport: "hub" as const },
+      { ...message("hub-failed", "2026-10-15T00:00:00.000Z", "failed"), transport: "hub" as const },
+      { ...message("other-room", "2026-10-15T01:00:00.000Z", "sent"), transport: "hub" as const, packet: packet("other-room", "2026-10-15T01:00:00.000Z", "beta") },
+    ];
+    for (const row of replayRows) await saveMessage(row);
+    const orderedIds = ["hub-first", "missing-row", "hub-later", "direct-between", "hub-queued", "hub-failed"];
+    const messageKeyReads: IDBValidKey[] = [];
+    const roomIndexReads: string[] = [];
+    const originalGet = IDBObjectStore.prototype.get;
+    const originalGetAll = IDBIndex.prototype.getAll;
+    const originalOpenCursor = IDBIndex.prototype.openCursor;
+    vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["get"]>) {
+      if (this.name === "messages") messageKeyReads.push(args[0] as IDBValidKey);
+      return originalGet.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "getAll").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["getAll"]>) {
+      if (this.name === "roomCreatedAt") roomIndexReads.push("getAll");
+      return originalGetAll.apply(this, args);
+    });
+    vi.spyOn(IDBIndex.prototype, "openCursor").mockImplementation(function (this: IDBIndex, ...args: Parameters<IDBIndex["openCursor"]>) {
+      if (this.name === "roomCreatedAt") roomIndexReads.push("openCursor");
+      return originalOpenCursor.apply(this, args);
+    });
+
+    await expect(reconcileHubReplayOrder("alpha", orderedIds)).resolves.toBe(true);
+    vi.restoreAllMocks();
+    expect(messageKeyReads).toEqual(orderedIds.map((id) => ["alpha", id]));
+    expect(roomIndexReads).toEqual([]);
+    const reconciled = await loadMessages("alpha");
+    expect(reconciled.map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["hub-first", 0],
+      ["direct-between", 1],
+      ["hub-later", 2],
+      ["hub-queued", 3],
+      ["hub-failed", 4],
+    ]);
+    expect((await loadMessages("beta")).map((row) => [row.packet.id, row.displayOrder])).toEqual([["other-room", 0]]);
+  });
+
+  it("uses createdAt and code-unit ID ordering to break replay slot ties", async () => {
+    await saveIdentity({ sender: "device-1", senderName: "Ada" });
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = openRequest();
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction("messages", "readwrite");
+      const store = transaction.objectStore("messages");
+      store.put({ ...message("a_", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub", displayOrder: undefined });
+      store.put({ ...message("a-", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub", displayOrder: Number.MAX_SAFE_INTEGER });
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    database.close();
+
+    await expect(reconcileHubReplayOrder("alpha", ["a_", "a-"])).resolves.toBe(true);
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["a-", 1],
+      ["a_", Number.MAX_SAFE_INTEGER],
+    ]);
+  });
+
+  it("rejects replay order lists above the local hub replay bound before reading rows", async () => {
+    const rows = [
+      { ...message("bounded-first", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub" as const },
+      { ...message("bounded-second", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub" as const },
+    ];
+    for (const row of rows) await saveMessage(row);
+    const getSpy = vi.spyOn(IDBObjectStore.prototype, "get");
+
+    await expect(reconcileHubReplayOrder("alpha", Array(MAX_HUB_REPLAY_ORDER_IDS + 1).fill("bounded-first")))
+      .rejects.toThrow(`Hub replay order cannot contain more than ${MAX_HUB_REPLAY_ORDER_IDS} message IDs.`);
+    expect(getSpy).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["bounded-first", 0],
+      ["bounded-second", 1],
+    ]);
+  });
+
+  it("does not reorder on a deletion tombstone and ignores missing replay IDs", async () => {
+    await saveMessage({ ...message("tombstone-first", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub" });
+    await saveMessage({ ...message("tombstone-second", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub" });
+    await beginRoomDeletion("alpha");
+    await expect(reconcileHubReplayOrder("alpha", ["tombstone-second", "missing", "tombstone-first"])).resolves.toBe(false);
+    await cancelRoomDeletion("alpha");
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["tombstone-first", 0],
+      ["tombstone-second", 1],
+    ]);
+  });
+
+  it("aborts replay-order reconciliation when an exact key read fails", async () => {
+    await saveMessage({ ...message("read-fail-first", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub" });
+    await saveMessage({ ...message("read-fail-second", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub" });
+    const originalGet = IDBObjectStore.prototype.get;
+    vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["get"]>) {
+      if (this.name === "messages" && JSON.stringify(args[0]) === JSON.stringify(["alpha", "read-fail-second"])) {
+        throw new DOMException("Injected replay lookup failure.", "UnknownError");
+      }
+      return originalGet.apply(this, args);
+    });
+
+    await expect(reconcileHubReplayOrder("alpha", ["read-fail-second", "read-fail-first"]))
+      .rejects.toMatchObject({ name: "LocalStorageError", message: expect.stringContaining("Injected replay lookup failure") });
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["read-fail-first", 0],
+      ["read-fail-second", 1],
+    ]);
+  });
+
+  it("aborts replay-order reconciliation when a slot write fails", async () => {
+    await saveMessage({ ...message("write-fail-first", "2026-10-14T09:00:00.000Z", "sent"), transport: "hub" });
+    await saveMessage({ ...message("write-fail-second", "2026-10-14T10:00:00.000Z", "sent"), transport: "hub" });
+    const originalPut = IDBObjectStore.prototype.put;
+    let messageWrites = 0;
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore["put"]>) {
+      if (this.name === "messages" && ++messageWrites === 2) throw new DOMException("Injected replay order write failure.", "QuotaExceededError");
+      return originalPut.apply(this, args);
+    });
+
+    await expect(reconcileHubReplayOrder("alpha", ["write-fail-second", "write-fail-first"]))
+      .rejects.toMatchObject({ name: "LocalStorageError", message: expect.stringContaining("Injected replay order write failure") });
+    expect(messageWrites).toBe(2);
+    vi.restoreAllMocks();
+    expect((await loadMessages("alpha")).map((row) => [row.packet.id, row.displayOrder])).toEqual([
+      ["write-fail-first", 0],
+      ["write-fail-second", 1],
+    ]);
   });
 
   it("reports a quota-style write failure and leaves existing messages intact", async () => {

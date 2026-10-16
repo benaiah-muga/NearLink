@@ -58,6 +58,7 @@ const LOCAL_MESSAGE_PAGE_SIZE = 50;
 export const MAX_SYNC_STORAGE_IDS = 4096;
 export const MAX_SYNC_STORAGE_ROWS_SCANNED = 16384;
 export const MAX_SYNC_REQUESTED_STORAGE_IDS = 100;
+export const MAX_HUB_REPLAY_ORDER_IDS = 100;
 
 /** Stateful cap logic shared by the IndexedDB cursor and deterministic boundary tests. */
 export class AcceptedMessageIdCollector {
@@ -107,6 +108,16 @@ function compareDisplayOrder(left: StoredMessage, right: StoredMessage): number 
   const leftOrder = Number.isFinite(left.displayOrder) ? left.displayOrder! : Number.MAX_SAFE_INTEGER;
   const rightOrder = Number.isFinite(right.displayOrder) ? right.displayOrder! : Number.MAX_SAFE_INTEGER;
   return leftOrder - rightOrder;
+}
+
+function compareCodeUnitStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareReplaySlotOrder(left: StoredMessage, right: StoredMessage): number {
+  return compareDisplayOrder(left, right)
+    || compareCodeUnitStrings(left.packet.createdAt, right.packet.createdAt)
+    || compareCodeUnitStrings(left.packet.id, right.packet.id);
 }
 
 function ensureStore(
@@ -891,6 +902,9 @@ export async function acceptInboundMessage(message: StoredMessage): Promise<Inbo
 
 /** Reorder replayed hub rows into the order their packets arrived, keeping other rows in their current slots. */
 export async function reconcileHubReplayOrder(room: string, orderedIds: string[]): Promise<boolean> {
+  if (orderedIds.length > MAX_HUB_REPLAY_ORDER_IDS) {
+    throw new RangeError(`Hub replay order cannot contain more than ${MAX_HUB_REPLAY_ORDER_IDS} message IDs.`);
+  }
   if (orderedIds.length < 2) return true;
   return withTransaction<boolean>(
     "Could not reconcile replayed hub message order",
@@ -898,21 +912,20 @@ export async function reconcileHubReplayOrder(room: string, orderedIds: string[]
     "readwrite",
     (store, complete, setFailure, transaction) => {
       const tombstoneRequest = transaction.objectStore(ROOM_DELETION_STORE).get(room);
-      const range = IDBKeyRange.bound([room, ""], [room, "\uffff"]);
-      const roomMessagesRequest = store.index(ROOM_CREATED_INDEX).getAll(range) as IDBRequest<StoredMessage[]>;
       let tombstoneReady = false;
       let deleted = false;
-      let roomMessages: StoredMessage[] | undefined;
+      let remainingReads = orderedIds.length;
+      const replayRowsById = new Map<string, StoredMessage>();
       const maybeReconcile = () => {
-        if (!tombstoneReady || !roomMessages) return;
+        if (!tombstoneReady || remainingReads > 0) return;
         if (deleted) {
           complete(false);
           return;
         }
         const orderedSet = new Set(orderedIds);
-        const replayedRows = roomMessages
+        const replayedRows = [...replayRowsById.values()]
           .filter((item) => orderedSet.has(item.packet.id) && item.transport === "hub" && item.delivery === "sent")
-          .sort(compareDisplayOrder);
+          .sort(compareReplaySlotOrder);
         if (replayedRows.length < 2) {
           complete(true);
           return;
@@ -935,9 +948,24 @@ export async function reconcileHubReplayOrder(room: string, orderedIds: string[]
         complete(true);
       };
       tombstoneRequest.onsuccess = () => { tombstoneReady = true; deleted = Boolean(tombstoneRequest.result); maybeReconcile(); };
-      roomMessagesRequest.onsuccess = () => { roomMessages = roomMessagesRequest.result; maybeReconcile(); };
       tombstoneRequest.onerror = () => setFailure(tombstoneRequest.error ?? new Error("Could not check whether the local conversation was cleared."));
-      roomMessagesRequest.onerror = () => setFailure(roomMessagesRequest.error ?? new Error("Could not read replayed hub message order."));
+      for (const id of orderedIds) {
+        let request: IDBRequest<StoredMessage | undefined>;
+        try {
+          request = store.get([room, id]) as IDBRequest<StoredMessage | undefined>;
+        } catch (error) {
+          setFailure(error);
+          transaction.abort();
+          return;
+        }
+        request.onsuccess = () => {
+          const row = request.result;
+          if (row) replayRowsById.set(id, row);
+          remainingReads -= 1;
+          maybeReconcile();
+        };
+        request.onerror = () => setFailure(request.error ?? new Error("Could not read replayed hub message order."));
+      }
     },
   );
 }
